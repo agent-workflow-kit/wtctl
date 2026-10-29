@@ -1,6 +1,6 @@
 [project]
 name = "wtctl"
-version = "0.0.0"
+version = "0.0.1"
 description = "Git worktrees, throwaway checkouts, and repo id to local clone mapping"
 readme = "README.md"
 requires-python = ">=3.12"
