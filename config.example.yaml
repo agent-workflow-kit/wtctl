@@ -1,2 +1,157 @@
-# Example config for wtctl. Location: ~/.config/wtctl/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
-hooks: {}
+# wtctl configuration: every key with its built-in default.
+# Location: ~/.config/wtctl/config.yaml, plus drop-ins in ~/.config/wtctl/config.d/*.yaml.
+# Rules: docs/interface.md (sections Config, Locations, Clone resolution, Bootstrap, Hooks).
+
+me:
+  # The <user> in the default actor human:<user>. null: the OS username.
+  name: null
+
+# Base of the default worktree, throwaway and clone roots. Paths are absolute
+# or start with ~/. root, worktree_root and throwaway_root must not be $HOME
+# or an ancestor of it, a directory on PATH, inside a hidden $HOME/.<name>
+# directory or inside an XDG config/data/state home, so isolated Claude
+# sessions can run in them (docs/interface.md, Locations, Path rules).
+root: ~/wtctl
+# Root for worktrees. null: <root>/worktrees.
+worktree_root: null
+# Root for throwaway checkouts (mode 0700). null: <root>/throwaway.
+throwaway_root: null
+# Worktree path template. Variables: {root} {host} {path} {name} {id}.
+# NOTE: {root} is the WORKTREE root (worktree_root, default <root>/worktrees),
+# not the root key above: write "{root}/{host}/...", never "{root}/worktrees/...".
+# Must start with {root}/ and contain {name} or {id}.
+worktree_path: "{root}/{host}/{path}/{name}"
+# Branch name when --branch is not given. Variables: {name} {id} {date}.
+branch_template: "wt/{name}"
+# Prepended to template-built branch names only (never to an explicit --branch).
+branch_prefix: ""
+
+# Directories searched for existing clones. Empty: discovery is off.
+search_roots: []
+# Example:
+#   search_roots: [~/dev]
+search_depth: 3
+# Clone a repo automatically when no clone is configured or discovered.
+auto_clone: false
+# Root for auto-clones. null: <root>/clones.
+clone_root: null
+# Wall-clock limit of mirror refreshes after the first, ls-remote --symref and shallow throwaway fetches.
+network_timeout: 120s
+# Wall-clock limit of clones, a mirror's first refresh, base-commit tree fetches and --depth 0 throwaway fetches.
+clone_timeout: 30m
+# How long a command waits for a lease another wtctl process holds before it
+# exits busy (12), or, for reconcile and prune, already_running.
+lease_wait: 10m
+
+# Per git host: URL template and HTTPS token source. wtctl never uses git
+# credential helpers: private HTTPS repos need token_env, token_command or an
+# SSH URL (SSH uses your ssh-agent through SSH_AUTH_SOCK).
+# Hosts not listed use these defaults.
+hosts: {}
+# Example:
+#   hosts:
+#     github.com:
+#       clone_url: "https://{host}/{path}.git"
+#       token_env: null          # e.g. GH_TOKEN; used when set and non-empty
+#       token_command: null      # e.g. [gh, auth, token, --hostname, "{host}"]
+#       token_user: x-access-token
+
+create:
+  # Filter drivers (e.g. lfs) whose definition is taken from your global git
+  # config for worktree checkouts; honored only if the global config defines
+  # filter.<name>.process. Empty: every filter is disabled.
+  allow_filters: []
+
+baseline:
+  # Config keys left out of the repo-config baseline (section.key,
+  # section.*.key or section.<subsection>.key). Global config only.
+  ignore_config_keys: []
+
+throwaway:
+  # Default --depth for throwaway fetches from a remote. 0: full history.
+  # A local source (the clone) copies the full history unless --depth 1.
+  depth: 50
+  # Default age for `prune --throwaways` (e.g. 30d). null: no age-based pruning
+  # (the cron prune then only retries partial throwaways, and throwaways leaked
+  # by crashed callers stay). Set it longer than any consumer keeps a throwaway
+  # (e.g. a pending confirmation).
+  max_age: null
+
+remove:
+  # Delete a branch wtctl created when its tip is pushed or equals --merged-head.
+  delete_branch: true
+  # Ignored paths that never block removal (gitignore syntax).
+  # Drop-ins replace this list rather than extend it.
+  disposable:
+    - __pycache__/
+    - .pytest_cache/
+    - .mypy_cache/
+    - .ruff_cache/
+    - node_modules/
+    - .venv/
+    - dist/
+    - build/
+    - target/
+    - coverage/
+    - .coverage
+    - "*.pyc"
+    - .DS_Store
+  # Retries of the pre-removal fetch on ref-lock contention.
+  fetch_retries: 3
+  # Entries walked by the nested-repo check (beyond it the check fails) and the in-use walk, and listed per baseline computation.
+  nested_scan_limit: 2000000
+
+extract:
+  max_file_bytes: 1048576
+  max_total_bytes: 52428800
+  max_files: 1000
+
+prune:
+  # Labels (key or key=value) that exempt a throwaway from `prune`.
+  protect_labels: []
+
+reconcile:
+  # How long a record stays missing before reconcile deletes its admin entry.
+  missing_grace: 24h
+
+# Days tombstones (removed, gone, forgotten records) are kept.
+tombstone_days: 30
+# Absolute path of git. null: git in the first absolute PATH entry that has it
+# (wtctl trusts the caller's PATH; set this in automation whose PATH may hold
+# agent-writable directories).
+git_bin: null
+# Env vars whose values are masked in bootstrap output tails.
+mask_env: []
+
+# Per-repo settings, keyed by repo id (host/<full project path>).
+repos: {}
+# Example:
+#   repos:
+#     github.com/example/app:
+#       clone: ~/dev/app
+#       clone_url: null          # overrides the host's template
+#       remote: origin
+#       worktree_root: null
+#       auto_clone: null         # null: inherit
+#       base: null               # null: the remote's default branch
+#       branch_template: null
+#       copy_env: [.env.local]
+#       bootstrap:
+#         auto: true
+#         env: {}
+#         pass_env: []           # token_env variables steps may see (stripped by default)
+#         steps:
+#           - {argv: [pnpm, install, --frozen-lockfile], sh: false, timeout: 600}
+#       remove:
+#         disposable: null       # null: the global list
+#       create:
+#         allow_filters: null    # null: the global list
+
+# Hooks: lists of {cmd, timeout, async}. Configured hooks append across drop-ins.
+hooks:
+  pre-create: []
+  post-create: []
+  pre-remove: []
+  post-remove: []
+  post-reconcile: []
+  post-baseline-accept: []
