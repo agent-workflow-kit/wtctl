@@ -121,3 +121,20 @@ def test_ps_fallback_parses_pins_tz_and_locale_and_reports_missing() -> None:
     assert ident.start_time(7) is None  # zombie
     assert seen[0][:3] == ["env", "TZ=UTC", "LC_ALL=C"]
     assert seen[0][3:] == ["ps", "-o", "stat=,lstart=", "-p", "5"]
+
+
+def test_ps_fallback_treats_unexecutable_ps_as_unreadable() -> None:
+    import subprocess
+
+    import pytest
+
+    def make(code: int):
+        def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, code, "", "")
+
+        return fake
+
+    for code in (126, 127):
+        with pytest.raises(gateway.ProcessUnreadable):
+            gateway.PsProcessIdentity(runner=make(code)).start_time(5)
+    assert gateway.PsProcessIdentity(runner=make(1)).start_time(5) is None

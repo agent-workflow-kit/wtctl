@@ -113,6 +113,8 @@ class PsProcessIdentity:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ProcessUnreadable(f"cannot run ps: {exc}") from exc
+        if r.returncode in (126, 127):  # env could not exec ps: unknown, not "gone"
+            raise ProcessUnreadable(f"cannot run ps (exit {r.returncode})")
         out = r.stdout.strip()
         if r.returncode != 0 or not out:
             return None
