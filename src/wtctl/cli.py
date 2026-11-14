@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import traceback
-from typing import NoReturn
+from typing import NoReturn, TextIO
 
 from . import __version__, gateway
 from .actor import ActorError, parse_actor, resolve_actor
 from .context import Context, Result, Runtime
 from .errors import UsageError, WtctlError
-from .output import escape_control, render_error, render_json
+from .output import escape_text_lines, render_error, render_json
 from .registry import BY_KEY, COMMANDS, HUMAN_ONLY_FLAGS, is_human_only, load_handler
 
 PROG = "wtctl"
@@ -67,7 +68,9 @@ def _global_flags(*, top: bool) -> _Parser:
         action="append",
         type=_decision_id_arg,
         metavar="ID",
-        default=default([]) if top else argparse.SUPPRESS,
+        # The subcommand's values go to their own dest; `main` appends them to the top-level ones.
+        dest="decision_id" if top else "decision_id_after",
+        default=[] if top else argparse.SUPPRESS,
         help="repeatable",
     )
     return p
@@ -105,6 +108,8 @@ def _check_usage(args: argparse.Namespace, actor_is_human: bool) -> None:
     cmd = BY_KEY[args._key]
     if args.dry_run and not cmd.dry_run:
         raise UsageError(f"--dry-run is not accepted by `{PROG} {' '.join(cmd.path)}`")
+    if args.verbose and args.quiet:
+        raise UsageError("--verbose and --quiet cannot be used together")
     if len(args.decision_id) > MAX_DECISION_IDS:
         raise UsageError(f"at most {MAX_DECISION_IDS} --decision-id values are allowed")
     if not actor_is_human:
@@ -115,15 +120,32 @@ def _check_usage(args: argparse.Namespace, actor_is_human: bool) -> None:
                 )
 
 
+class _OutputClosed(BaseException):
+    """Our own write to stdout or stderr hit a broken pipe (BaseException: not an `internal`)."""
+
+
+def _write(stream: TextIO | None, text: str) -> None:
+    if stream is None:  # a detached stream (sys.stdout is None) is skipped
+        return
+    try:
+        stream.write(text)
+    except BrokenPipeError:
+        raise _OutputClosed from None
+
+
 def _emit_error(err: WtctlError, *, as_json: bool, verbose: bool = False) -> int:
-    out, errtext = render_error(err, as_json=as_json)
+    try:
+        out, errtext = render_error(err, as_json=as_json)
+    except (TypeError, ValueError):  # e.g. a NaN or a set in `details`
+        err = WtctlError("internal", f"could not render the {err.code} error")
+        out, errtext = render_error(err, as_json=as_json)
     if isinstance(err, UsageError) and err.usage and not as_json:
-        errtext = escape_control(err.usage) + errtext
+        errtext = escape_text_lines(err.usage) + errtext
     if out:
-        sys.stdout.write(out + "\n")
-    sys.stderr.write(errtext)
+        _write(sys.stdout, out + "\n")
+    _write(sys.stderr, errtext)
     if verbose and err.__cause__ is not None:
-        sys.stderr.write(escape_control(_trace(err.__cause__)))
+        _write(sys.stderr, escape_text_lines(_trace(err.__cause__)))
     return err.exit_code
 
 
@@ -133,25 +155,88 @@ def _trace(exc: BaseException) -> str:
 
 def _emit_result(result: Result, ctx: Context) -> None:
     if ctx.json:
-        sys.stdout.write(render_json(result.data) + "\n")
+        _write(sys.stdout, render_json(result.data) + "\n")
     elif result.human:
-        sys.stdout.write(result.human.rstrip("\n") + "\n")
+        _write(sys.stdout, escape_text_lines(result.human.rstrip("\n")) + "\n")
     if result.stderr and not ctx.quiet:
-        sys.stderr.write(result.stderr.rstrip("\n") + "\n")
+        _write(sys.stderr, escape_text_lines(result.stderr.rstrip("\n")) + "\n")
+
+
+_VALUE_FLAGS = frozenset({"--config", "--actor", "--decision-id"})
+
+
+def _prescan(argv: list[str]) -> tuple[bool, bool]:
+    """``(--json, --verbose)`` present, for errors raised before parsing succeeds. Tokens after a
+    bare ``--`` and the values of the flags that take one are not flags."""
+    as_json = verbose = False
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+        elif token == "--":
+            break
+        elif token in _VALUE_FLAGS:
+            skip = True
+        elif token == "--json":
+            as_json = True
+        elif token == "--verbose":
+            verbose = True
+    return as_json, verbose
+
+
+def _parse(argv: list[str]) -> argparse.Namespace:
+    parser = build_parser()
+    try:
+        return parser.parse_args(argv)
+    except UsageError as err:
+        # argparse reports the missing command before the unknown argument; name the latter.
+        if "required: <command>" in str(err):
+            try:
+                _, extra = parser.parse_known_args([*argv, "list"])
+            except UsageError:
+                extra = []
+            if extra:
+                raise UsageError(
+                    f"unrecognized arguments: {' '.join(extra)}", usage=err.usage
+                ) from None
+        raise
+
+
+def _silence_stdout() -> None:
+    """After a broken pipe, point stdout at /dev/null so the exit-time flush cannot fail too."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (AttributeError, ValueError, OSError):
+        pass
 
 
 def main(argv: list[str] | None = None, *, runtime: Runtime | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    runtime = runtime or Runtime()
-    gateway.disable_dumpable()
-    # Before parsing succeeds we cannot read --json from the namespace.
-    as_json = "--json" in argv
-    verbose = "--verbose" in argv
     try:
-        args = build_parser().parse_args(argv)
+        code = _run(list(sys.argv[1:] if argv is None else argv), runtime or Runtime())
+        for stream in (sys.stdout, sys.stderr):
+            if stream is not None:
+                stream.flush()
+        return code
+    except (_OutputClosed, BrokenPipeError):  # BrokenPipeError: from the flush
+        _silence_stdout()
+        return 1
+
+
+def _needs_me_name(args: argparse.Namespace, runtime: Runtime) -> bool:
+    return args.actor is None and runtime.stdin_isatty
+
+
+def _run(argv: list[str], runtime: Runtime) -> int:
+    gateway.disable_dumpable()
+    as_json, verbose = _prescan(argv)
+    try:
+        args = _parse(argv)
         as_json, verbose = args.json, args.verbose
+        args.decision_id = [*args.decision_id, *getattr(args, "decision_id_after", [])]
         actor = resolve_actor(
-            args.actor, stdin_isatty=runtime.stdin_isatty, me_name=runtime.me_name
+            args.actor,
+            stdin_isatty=runtime.stdin_isatty,
+            me_name=runtime.resolve_me_name(args.config) if _needs_me_name(args, runtime) else "",
         )
         _check_usage(args, actor.is_human)
         cmd = BY_KEY[args._key]

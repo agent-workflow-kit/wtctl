@@ -203,7 +203,7 @@ COMMANDS: tuple[Command, ...] = (
         "#18",
         _forget,
         dry_run=True,
-        human_only=lambda a: a.holder is None,
+        human_only=lambda a: not a.holder,
     ),
     Command("locate", ("locate",), "resolve a repo id to its clone", "#11", _repo),
     Command("clone", ("clone",), "clone a repo", "#11", _repo, dry_run=True),

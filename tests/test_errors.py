@@ -45,7 +45,7 @@ def test_mapping_covers_exactly_the_schema_error_codes() -> None:
 
 
 # Fields the schema requires for a code (handlers supply them; the skeleton only carries them).
-REQUIRED_FIELDS: dict[str, dict[str, object] | None] = {
+REQUIRED_FIELDS: dict[str, dict[str, object]] = {
     "refused": {"reason": "dirty"},
     "ambiguous": {
         "candidates": [
@@ -64,18 +64,20 @@ REQUIRED_FIELDS: dict[str, dict[str, object] | None] = {
     "unsafe_repo_config": {"details": {"keys": ["core.fsmonitor"]}},
     "extract_invalid": {"details": {"paths": [{"path": "a", "error": "invalid_path"}]}},
     # bootstrap_failed needs a full record object; its golden test belongs to the bootstrap issue.
-    "bootstrap_failed": None,
+    "bootstrap_failed": {"details": {"record": {}, "step": "steps"}},
 }
+# Codes whose object is built but not validated against the schema here (see above).
+UNVALIDATED = {"bootstrap_failed"}
 
 
 @pytest.mark.parametrize(("code", "exit_code"), sorted(DOCUMENTED.items()))
 def test_exit_code_and_golden_object(code: str, exit_code: int) -> None:
     extra = REQUIRED_FIELDS.get(code, {})
-    err = WtctlError(code, "something happened", **(extra or {}))
+    err = WtctlError(code, "something happened", **extra)
     assert err.exit_code == exit_code
     obj = err.to_object()
     assert obj["error"]["code"] == code
-    if extra is not None:
+    if code not in UNVALIDATED:
         validate("wtctl/cli/error.json", obj)
 
 
@@ -101,3 +103,88 @@ def test_optional_fields_are_serialized() -> None:
         candidates=[{"id": "wt-aaaaaaaa", "path": "/x/a"}, {"id": None, "path": "/x/b"}],
     )
     validate("wtctl/cli/error.json", err.to_object())
+
+
+# --- conditional rules of schemas/cli/error.json ------------------------------------------------
+
+CAND = [{"id": "wt-aaaaaaaa", "path": "/x/a"}, {"id": None, "path": "/x/b"}]
+
+
+@pytest.mark.parametrize(
+    ("code", "fields"),
+    [
+        ("refused", {"reason": "not_a_reason"}),
+        ("not_found", {"reason": "dirty"}),
+        ("not_found", {"checks": {}}),
+        ("ambiguous", {}),
+        ("ambiguous", {"candidates": CAND[:1]}),
+        ("not_found", {"candidates": CAND}),
+        ("escalated", {"hook": "h", "hook_stderr": ""}),
+        ("escalated", {"hook": "h", "hook_stderr": "", "escalated_hooks": []}),
+        ("vetoed", {"hook": "h"}),
+        ("vetoed", {"hook_stderr": "x"}),
+        ("not_found", {"hook": "h"}),
+        ("not_found", {"hook_stderr": "h"}),
+        ("vetoed", {"hook": "h", "hook_stderr": "", "escalated_hooks": ["h"]}),
+        ("refused", {"reason": "dirty", "holder_path": "/x"}),
+        ("refused", {"reason": "dirty", "holder_id": None}),
+        ("refused", {"reason": "dirty", "processes": [{"pid": 1}]}),
+        ("refused", {"reason": "dirty", "items": [{}]}),
+        ("refused", {"reason": "branch_in_use", "holder_id": None}),
+        ("refused", {"reason": "branch_in_use", "holder_path": "/x"}),
+        ("refused", {"reason": "in_use"}),
+        ("refused", {"reason": "repo_config_changed", "items": [{}]}),
+        ("refused", {"reason": "held", "details": {}}),
+        ("refused", {"reason": "branch_exists", "details": {}}),
+        ("refused", {"reason": "locked"}),
+        ("partial", {}),
+        ("partial", {"details": {}}),
+        ("io_error", {"details": {"path": "a"}}),
+        ("unsafe_repo_config", {"details": {}}),
+        ("extract_invalid", {}),
+        ("bootstrap_failed", {"details": {"record": {}}}),
+        ("create_failed", {"details": {"cause": "timeout"}}),
+        ("create_failed", {"details": {"cause": "anchor_changed"}}),
+        ("not_found", {"details": {"state": "removed"}}),
+        ("not_found", {"details": {"state": "weird", "removed_at": "t"}}),
+        ("refused", {"reason": "dirty", "details": {"cause": "fuse_anchor", "anchors": []}}),
+    ],
+)
+def test_schema_conditional_rules_are_enforced(code: str, fields: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        WtctlError(code, "x", **fields)
+
+
+@pytest.mark.parametrize(
+    ("code", "fields"),
+    [
+        ("refused", {"reason": "dirty", "checks": {}}),
+        ("refused", {"reason": "branch_in_use", "holder_path": "/x", "holder_id": None}),
+        ("refused", {"reason": "path_exists", "holder_id": "wt-aaaaaaaa"}),
+        ("refused", {"reason": "path_exists"}),
+        ("refused", {"reason": "in_use", "processes": [{"pid": 1}]}),
+        (
+            "refused",
+            {
+                "reason": "repo_config_changed",
+                "items": [{}],
+                "details": {"digest": "d", "recorded_digest": "r", "changed_classes": []},
+            },
+        ),
+        ("refused", {"reason": "held", "details": {"holders": [{}]}}),
+        ("refused", {"reason": "branch_exists", "details": {"tip": "a" * 40}}),
+        ("refused", {"reason": "locked", "details": {"lock_reason": "x"}}),
+        ("create_failed", {"details": {"cause": "object_format"}}),
+        ("create_failed", {"details": {"cause": "anchor_changed", "anchors": [{}]}}),
+        ("not_found", {"details": {"state": "removed", "removed_at": "t"}}),
+        ("not_found", {}),
+        ("vetoed", {"hook": "h", "hook_stderr": ""}),
+        ("fetch_failed", {"details": {"cause": "prune_incomplete"}}),
+        (
+            "refused",
+            {"reason": "unlinked", "details": {"cause": "fuse_anchor", "anchors": [{}]}},
+        ),
+    ],
+)
+def test_valid_combinations_construct(code: str, fields: dict[str, object]) -> None:
+    WtctlError(code, "x", **fields)

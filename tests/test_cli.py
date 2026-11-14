@@ -5,7 +5,8 @@ import pytest
 from tests.helpers import Result, install_handler, run_cli
 from tests.schemacheck import validate
 from wtctl import __version__
-from wtctl.context import Context
+from wtctl.cli import main
+from wtctl.context import Context, Runtime
 from wtctl.errors import WtctlError
 from wtctl.registry import COMMANDS
 
@@ -375,3 +376,270 @@ def test_process_hardening_runs_at_startup(
     monkeypatch.setattr(gateway, "disable_dumpable", lambda: calls.append(1) or True)
     run_cli(capsys, "list")
     assert calls == [1]
+
+
+# --- review round 1 -----------------------------------------------------------------------------
+
+
+def _capture_ctx(monkeypatch: pytest.MonkeyPatch, key: str = "list") -> list[Context]:
+    seen: list[Context] = []
+    install_handler(monkeypatch, key, lambda ctx: (seen.append(ctx), Result({}))[1])
+    return seen
+
+
+def test_decision_ids_before_and_after_the_command_are_merged_in_order(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _capture_ctx(monkeypatch)
+    r = run_cli(capsys, "--decision-id", "a", "--decision-id", "b", "list", "--decision-id", "c")
+    assert r.code == 0
+    assert seen[0].decision_ids == ["a", "b", "c"]
+
+
+def test_decision_id_limit_applies_to_the_merged_list(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _capture_ctx(monkeypatch)
+    before = [x for i in range(20) for x in ("--decision-id", f"b{i}")]
+    after = [x for i in range(20) for x in ("--decision-id", f"a{i}")]
+    r = run_cli(capsys, "--json", *before, "list", *after)
+    assert r.code == 2
+    assert r.json()["error"]["code"] == "usage"
+
+
+def test_bad_decision_id_after_the_command_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
+    assert run_cli(capsys, "list", "--decision-id", "a b").code == 2
+
+
+def test_usage_block_keeps_its_line_breaks(capsys: pytest.CaptureFixture[str]) -> None:
+    r = run_cli(capsys, "show")
+    assert r.code == 2
+    assert "\\x0a" not in r.err
+    assert r.err.splitlines()[0].startswith("usage: ")
+    assert len(r.err.splitlines()) >= 2
+
+
+def test_verbose_traceback_keeps_its_line_breaks(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(ctx: Context) -> Result:
+        raise RuntimeError("boom")
+
+    install_handler(monkeypatch, "show", handler)
+    r = run_cli(capsys, "--verbose", "show", SID)
+    assert "\\x0a" not in r.err
+    assert any(line.startswith("Traceback") for line in r.err.splitlines())
+    assert len(r.err.splitlines()) > 3
+
+
+def test_json_with_nan_falls_back_to_internal_error(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_handler(monkeypatch, "export", lambda ctx: Result({"x": float("nan")}))
+    r = run_cli(capsys, "--json", "export")
+    assert r.code == 1
+    obj = r.json()
+    validate("wtctl/cli/error.json", obj)
+    assert obj["error"]["code"] == "internal"
+    assert "Traceback" not in r.err
+
+
+def test_json_with_unserializable_result_falls_back_to_internal_error(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_handler(monkeypatch, "export", lambda ctx: Result({"x": {1, 2}}))
+    r = run_cli(capsys, "--json", "export")
+    assert r.code == 1 and r.out.count("\n") == 1
+    assert r.json()["error"]["code"] == "internal"
+    assert "Traceback" not in r.err
+
+
+def test_error_object_that_cannot_be_serialized_becomes_internal(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(ctx: Context) -> Result:
+        raise WtctlError("partial", "x", details={"remaining_path": "/a", "n": float("nan")})
+
+    install_handler(monkeypatch, "remove", handler)
+    r = run_cli(capsys, "--json", "--actor", "human:a", "remove", SID)
+    assert r.code == 1
+    validate("wtctl/cli/error.json", r.json())
+    assert r.json()["error"]["code"] == "internal"
+
+
+def test_handler_human_and_stderr_text_is_escaped_but_keeps_newlines(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_handler(
+        monkeypatch,
+        "locate",
+        lambda ctx: Result({}, human="a\x1b[31m‮\nsecond", stderr="e\x1b[2J\nline2"),
+    )
+    r = run_cli(capsys, "locate", "example.com/o/r")
+    assert r.out == "a\\x1b[31m\\u202e\nsecond\n"
+    assert r.err == "e\\x1b[2J\nline2\n"
+
+
+def test_forget_with_empty_holder_is_still_human_only(capsys: pytest.CaptureFixture[str]) -> None:
+    r = run_cli(capsys, "--json", "forget", SID, "--holder", "")
+    assert r.code == 13
+
+
+def test_json_prescan_ignores_tokens_after_double_dash_and_flag_values(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert run_cli(capsys, "bogus", "--", "--json").out == ""
+    assert run_cli(capsys, "--config", "--json", "bogus").out == ""
+    assert run_cli(capsys, "--actor", "--json", "bogus").out == ""
+    assert run_cli(capsys, "--decision-id", "--json", "bogus").out == ""
+    assert run_cli(capsys, "--json", "bogus").json()["error"]["code"] == "usage"
+
+
+def test_verbose_prescan_ignores_flag_values(capsys: pytest.CaptureFixture[str]) -> None:
+    r = run_cli(capsys, "--config", "--verbose", "bogus")
+    assert r.code == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--verbose", "list", "--quiet"],
+        ["--quiet", "list", "--verbose"],
+        ["list", "--verbose", "--quiet"],
+    ],
+)
+def test_verbose_with_quiet_on_any_sides_is_usage(
+    capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    assert run_cli(capsys, "--json", *argv).code == 2
+
+
+class _BrokenStream:
+    def __init__(self) -> None:
+        self.writes = 0
+
+    def write(self, text: str) -> int:
+        self.writes += 1
+        raise BrokenPipeError
+
+    def flush(self) -> None:
+        raise BrokenPipeError
+
+
+def test_broken_pipe_on_stdout_is_a_quiet_exit(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    install_handler(monkeypatch, "export", lambda ctx: Result({"a": 1}))
+    broken = _BrokenStream()
+    monkeypatch.setattr(sys, "stdout", broken)
+    code = main(["--json", "export"], runtime=Runtime(stdin_isatty=False))
+    assert code == 1
+    assert broken.writes == 1
+    assert capsys.readouterr().err == ""
+
+
+def test_broken_pipe_on_flush_is_a_quiet_exit(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+    import sys
+
+    class FlushBroken(io.StringIO):
+        def flush(self) -> None:
+            raise BrokenPipeError
+
+    install_handler(monkeypatch, "export", lambda ctx: Result({"a": 1}))
+    monkeypatch.setattr(sys, "stdout", FlushBroken())
+    assert main(["--json", "export"], runtime=Runtime(stdin_isatty=False)) == 1
+    assert capsys.readouterr().err == ""
+
+
+def test_closed_stdout_does_not_raise(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    install_handler(monkeypatch, "export", lambda ctx: Result({"a": 1}, human="x"))
+    monkeypatch.setattr(sys, "stdout", None)
+    assert main(["export"], runtime=Runtime(stdin_isatty=False)) == 0
+    monkeypatch.setattr(sys, "stdout", None)
+    assert main(["--json", "bogus"], runtime=Runtime(stdin_isatty=False)) == 2
+
+
+def test_unknown_flag_is_named_when_the_command_is_missing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    r = run_cli(capsys, "--json", "-x")
+    assert r.code == 2
+    assert "-x" in r.json()["error"]["message"]
+    assert "unrecognized" in r.json()["error"]["message"]
+    assert "required" in run_cli(capsys, "--json").json()["error"]["message"]
+
+
+# --- config / state / default-actor seams -----------------------------------------------------
+
+
+def test_config_and_state_are_lazy_and_cached(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def loader(path: str | None) -> object:
+        calls.append(f"config:{path}")
+        return {"cfg": 1}
+
+    def opener(ctx: Context) -> object:
+        calls.append("state")
+        return {"db": 1}
+
+    def handler(ctx: Context) -> Result:
+        assert calls == []  # not built by main
+        assert ctx.config is ctx.config and ctx.state is ctx.state
+        return Result({})
+
+    install_handler(monkeypatch, "list", handler)
+    rt = Runtime(stdin_isatty=False, config_loader=loader, state_opener=opener)
+    assert main(["--config", "/c.yaml", "list"], runtime=rt) == 0
+    assert calls == ["config:/c.yaml", "state"]
+
+
+def test_default_seams_raise_not_implemented_internal(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(ctx: Context) -> Result:
+        return Result({"c": ctx.config})
+
+    install_handler(monkeypatch, "list", handler)
+    r = run_cli(capsys, "--json", "list")
+    assert r.code == 1
+    assert "not implemented yet (see #3)" in r.json()["error"]["message"]
+
+    install_handler(monkeypatch, "list", lambda ctx: Result({"s": ctx.state}))
+    r = run_cli(capsys, "--json", "list")
+    assert "not implemented yet (see #4)" in r.json()["error"]["message"]
+
+
+def test_default_actor_name_comes_from_the_seam_only_with_a_tty(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _capture_ctx(monkeypatch)
+    asked: list[str | None] = []
+
+    def source(path: str | None) -> str:
+        asked.append(path)
+        return "carol"
+
+    main(["--config", "/c", "list"], runtime=Runtime(stdin_isatty=True, me_name_source=source))
+    main(["list"], runtime=Runtime(stdin_isatty=False, me_name_source=source))
+    assert [c.actor.value for c in seen] == ["human:carol", "auto:unknown"]
+    assert asked == ["/c"]
+
+
+def test_dry_run_flag_later_one_wins_and_repeated_flags_are_fine(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _capture_ctx(monkeypatch, "reconcile")
+    run_cli(capsys, "--config", "/a", "reconcile", "--config", "/b")
+    assert seen[0].config_path == "/b"

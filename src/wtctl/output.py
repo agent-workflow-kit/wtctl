@@ -16,13 +16,24 @@ def _escape_char(ch: str) -> str:
         return f"\\x{ord(ch):02x}"
     # Line/paragraph separators, bidi and other format characters, lone surrogates.
     if cat in ("Zl", "Zp", "Cf", "Cs"):
-        return f"\\u{ord(ch):04x}"
+        return f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}"
     return ch
 
 
 def escape_control(text: str) -> str:
-    """Escape control and terminal-spoofing characters of untrusted text."""
+    """Escape control and terminal-spoofing characters of untrusted text.
+
+    Control characters (Cc) become ``\\xNN``; line/paragraph separators, format characters
+    (bidi overrides) and lone surrogates (Zl, Zp, Cf, Cs) become ``\\uNNNN``, or ``\\UNNNNNNNN``
+    above U+FFFF. A literal backslash is not doubled, so the output is not injective (a literal
+    ``\\x1b`` reads like an escaped ESC); it is for display, never for parsing back.
+    """
     return "".join(_escape_char(ch) for ch in text)
+
+
+def escape_text_lines(text: str) -> str:
+    """Like :func:`escape_control` but keeps ``\\n`` as the line break (multi-line text)."""
+    return "\n".join(escape_control(line) for line in text.split("\n"))
 
 
 def render_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
@@ -35,7 +46,7 @@ def render_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> st
 
 def render_json(data: Any) -> str:
     """One line of JSON (ASCII only, so no raw control or surrogate ever reaches the terminal)."""
-    return json.dumps(data, separators=(",", ":"), sort_keys=False)
+    return json.dumps(data, separators=(",", ":"), sort_keys=False, allow_nan=False)
 
 
 def render_error(err: WtctlError, *, as_json: bool) -> tuple[str, str]:

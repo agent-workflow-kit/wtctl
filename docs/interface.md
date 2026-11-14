@@ -394,6 +394,7 @@ Every command runs these stages in order; a failing stage ends the command:
 
 1. Usage and config (exit 2; `config_invalid`).
 2. git version where git is needed (exit 12, `git_too_old`).
+   - 2a. **Actor gate:** `bootstrap`, `baseline accept` and `forget` without `--holder` are human-only whatever the target; a non-human exits 13 before record resolution (so it learns nothing about records, and a throwaway or unknown id gives 13, not 2, 10 or 21). Usage errors (stage 1, including human-only flags) still win.
 3. Record resolution (exit 2, 10 or 21) and clone resolution (exit 10, 12 or 21).
 4. The command's own steps ([Create order](#create-order), [Remove order](#remove-order), …).
 
@@ -403,11 +404,13 @@ Every command runs these stages in order; a failing stage ends the command:
 
 **Dry runs.** `--dry-run` is accepted by `create`, `bootstrap`, `extract`, `baseline accept`, `adopt`, `forget`, `label add`, `label remove`, `clone`, `reconcile`, `prune`, `cron install`, `cron uninstall` and `remove`. It performs every check, prints what the command would do with `"dry_run": true`, and changes nothing (no hooks run, no prompt). `create --dry-run` runs the [Create order](#create-order) step 8 [mirror](#mirror) refresh (its only change, as for `status`) but never copies a base commit into the clone, so `branch_action` and `base_sha` are current; `create --throwaway --dry-run` fetches nothing, so it cannot detect a `ref_not_found` from a remote. `remove --dry-run` is identical to [`status`](#status) with the same arguments (it accepts `--merged-head` and `--holder`): it prints the status object with `"dry_run": true` and exits 0 whatever it found; it changes nothing except the mirror refresh and runs no hooks or confirmation. Human-only flags (`--force`, `--override-escalation`) still exit 2 without a human actor under `--dry-run`; otherwise `remove --dry-run` ignores `--force` (`force_overrides` shows its effect) and also ignores `--keep-branch`, `--yes` and `--hook`.
 
-**Human output** escapes control characters in names, paths and output tails as `\xNN`.
+**Global flags** are accepted before or after the command; when given on both sides the later one wins, except `--decision-id`, whose values concatenate (those before the command, then those after) and are checked as one list. `--verbose` with `--quiet` (on any side) exits 2. `--dry-run` on a command not in the list above exits 2.
+
+**Human output** escapes control characters in names, paths and output tails (Cc as `\xNN`; line and paragraph separators, bidi and other format characters and lone surrogates as `\uNNNN`, or `\UNNNNNNNN` above U+FFFF). Multi-line text (usage, tracebacks) keeps its line breaks and escapes each line. A literal backslash is not doubled, so escaped output is not injective (a literal `\x1b` reads like an escaped ESC); it is for display, not for parsing back.
 
 ### Commands by record state
 
-What each single-target command does with a record in each state (exit code and outcome). A state-dependent condition exits 20 (or 10 for a tombstone), never 2; exit 2 is reserved for usage, including a command applied to the wrong object type: `bootstrap`, `baseline check|accept`, `forget` and `adopt` (a path in the throwaway root) refuse throwaways, and `extract` refuses worktrees, with exit 2 in every live state (a full id naming a tombstone exits 10 first, since record resolution comes before the command's own checks).
+What each single-target command does with a record in each state (exit code and outcome). A state-dependent condition exits 20 (or 10 for a tombstone), never 2; exit 2 is reserved for usage, including a command applied to the wrong object type (except that a non-human running `bootstrap`, `baseline accept` or `forget` without `--holder` exits 13 first, at the [actor gate](#check-order), whatever the target): `bootstrap`, `baseline check|accept`, `forget` and `adopt` (a path in the throwaway root) refuse throwaways, and `extract` refuses worktrees, with exit 2 in every live state (a full id naming a tombstone exits 10 first, since record resolution comes before the command's own checks).
 
 | State | `show` | `status` | `remove` | `bootstrap` | `extract` | `baseline check` / `accept` | `adopt` (its path) | `forget` | `label` |
 |---|---|---|---|---|---|---|---|---|---|

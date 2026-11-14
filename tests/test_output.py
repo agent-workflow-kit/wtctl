@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tests.schemacheck import validate
 from wtctl.errors import WtctlError
-from wtctl.output import escape_control, render_error, render_json, render_table
+from wtctl.output import escape_control, escape_text_lines, render_error, render_json, render_table
 
 
 def test_escape_control_characters() -> None:
@@ -57,3 +59,23 @@ def test_render_error_human_has_no_stdout() -> None:
     out, errtext = render_error(WtctlError("not_found", "no such record"), as_json=False)
     assert out == ""
     assert errtext.strip() == "wtctl: error: no such record"
+
+
+def test_escape_astral_code_points_use_eight_digits() -> None:
+    assert escape_control("a\U000e0001b") == "a\\U000e0001b"  # tag character (Cf)
+
+
+def test_escape_does_not_double_backslashes() -> None:
+    # Documented: escaped output is not injective.
+    assert escape_control("\\x1b") == "\\x1b"
+    assert escape_control("\x1b") == "\\x1b"
+
+
+def test_escape_text_lines_keeps_newlines() -> None:
+    assert escape_text_lines("a\x1b[1m\nb\tc‮\n") == "a\\x1b[1m\nb\\x09c\\u202e\n"
+    assert escape_text_lines(escape_text_lines("x\ny\x1b")) == "x\ny\\x1b"
+
+
+def test_render_json_rejects_nan() -> None:
+    with pytest.raises(ValueError):
+        render_json({"a": float("nan")})

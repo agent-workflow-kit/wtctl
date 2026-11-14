@@ -115,6 +115,8 @@ Git worktrees, throwaway checkouts, and the mapping from repo ids to local clone
 | `audit` | `log.jsonl`, `audit.jsonl` |
 | `output` | human tables and `--json` rendering |
 
+**Seams for config, state and the default actor.** `Context.config` and `Context.state` are lazy, cached properties over `Runtime.config_loader(config_path)` and `Runtime.state_opener(ctx)`, and the default actor's name comes from `Runtime.me_name_source(config_path)` (asked only for a TTY without `--actor`). Their defaults call `wtctl.config.load_config`, `wtctl.state.open_state` and (optionally) `wtctl.config.me_name` when those modules define them, and otherwise raise the `internal` "not implemented yet" error, so the config and state issues only add functions in their own modules and edit neither `cli.py` nor `Context`.
+
 Data flow for `remove`: `cli` → `config` → `state` (resolve, leases) → `checks` (integrity via `fsafe`, baseline via `baseline`, in-use via `gateway`) → `mirror` (refresh) → `hardgit` (status, `ls-files`) → `checks` (content, pushed check in the mirror) → `cli` (confirmation) → `hooks` → `remove` (re-check, fd-based delete of the tree and the admin entry via `fsafe`, verify, branch) → `state` → `audit` → `hooks` → `output`.
 
 **Data model** (`state.db`, schema version 1):
