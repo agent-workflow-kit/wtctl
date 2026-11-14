@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import ctypes
 import datetime as dt
+import os
+import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -35,7 +37,59 @@ def run(
     )
 
 
-# TODO(#9): the hardened git runner (clean environment, overrides) builds on ``run``.
+@dataclass(frozen=True)
+class GitResult:
+    """Outcome of one git process: raw bytes (git output is not always text) and a timeout flag."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+
+    @property
+    def out(self) -> str:
+        return self.stdout.decode("utf-8", "replace")
+
+    @property
+    def err(self) -> str:
+        return self.stderr.decode("utf-8", "replace")
+
+
+def run_git(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    cwd: str,
+    stdin: bytes | None = None,
+    timeout: float | None = None,
+) -> GitResult:
+    """Run git with exactly ``env`` (nothing is inherited) in its own process group.
+
+    The group is the one this call created (the child is its leader), so on expiry the whole
+    group is killed through the leader's pid captured at launch, never by pattern.
+    """
+    proc = subprocess.Popen(
+        argv,
+        env=dict(env),
+        cwd=cwd,
+        stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    pgid = proc.pid
+    try:
+        out, err = proc.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, err = proc.communicate()
+        return GitResult(proc.returncode, out, err, timed_out=True)
+    return GitResult(proc.returncode, out, err)
+
+
 # TODO(#16): the step runner (process groups, timeouts) is added here.
 
 
@@ -86,9 +140,14 @@ class Gateway:
     clock: Clock = field(default_factory=SystemClock)
     scanner: ProcessScanner = field(default_factory=UnavailableScanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
+    git_runner: Callable[..., GitResult] = run_git
 
     def run(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return self.runner(argv, **kwargs)
+
+    def git(self, argv: list[str], **kwargs: object) -> GitResult:
+        """Run a fully built git command line (see ``wtctl.hardgit``, the only caller)."""
+        return self.git_runner(argv, **kwargs)
 
 
 _PR_SET_DUMPABLE = 4

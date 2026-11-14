@@ -1,0 +1,749 @@
+"""The hardened git invocation (architecture section 13.2 rule 10; docs/interface.md, Hardened git).
+
+Every git command wtctl runs goes through :meth:`Git.run` (and so through ``gateway``). The
+environment is built from scratch, never inherited; the override set rides on every command line;
+filter drivers and repository extra headers are neutralized by name; the protocol allowlist is
+``none`` unless the command is meant to contact the network, and lazy fetching is switched off.
+
+This module also holds the pure helpers around those calls: porcelain parsing and the
+classification of a fetch outcome.
+"""
+
+from __future__ import annotations
+
+import enum
+import os
+import re
+import shlex
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .errors import WtctlError
+from .gateway import Gateway, GitResult
+
+MIN_GIT_VERSION = (2, 34)
+
+# The only schemes a command meant to contact a remote may allow (local paths are addressed by
+# plain path and reach git as "file"; see interface.md, Hardened git).
+NETWORK_SCHEMES = frozenset({"https", "ssh", "file"})
+
+# The subcommands wtctl runs. A name outside this set is a programming error, not a request:
+# adding a command here is a conscious, reviewed step.
+SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "branch",
+        "cat-file",
+        "check-ref-format",
+        "clone",
+        "commit",
+        "commit-tree",
+        "config",
+        "count-objects",
+        "diff",
+        "diff-files",
+        "diff-index",
+        "diff-tree",
+        "fetch",
+        "for-each-ref",
+        "hash-object",
+        "index-pack",
+        "init",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge-base",
+        "pack-objects",
+        "push",
+        "read-tree",
+        "remote",
+        "rev-list",
+        "rev-parse",
+        "show",
+        "show-ref",
+        "status",
+        "symbolic-ref",
+        "update-index",
+        "update-ref",
+        "version",
+        "worktree",
+        "write-tree",
+    }
+)
+DIFF_FAMILY = frozenset({"diff", "diff-files", "diff-index", "diff-tree", "log", "show"})
+# Subcommands that print patches and so can run a textconv driver.
+TEXTCONV_FAMILY = frozenset({"diff", "log", "show"})
+
+# The override set of the recipe, on every call. ``core.alternateRefsCommand=true`` is the safety
+# check's addition (SAFE-3): an alternate's ref listing runs it through a shell during fetch
+# negotiation, and an empty value prints an error instead of disabling it.
+OVERRIDES: tuple[tuple[str, str], ...] = (
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", "ssh -o BatchMode=yes"),
+    ("credential.helper", ""),
+    ("core.askPass", ""),
+    ("core.pager", "cat"),
+    ("diff.external", ""),
+    ("core.attributesFile", "/dev/null"),
+    ("log.showSignature", "false"),
+    ("fetch.recurseSubmodules", "false"),
+    ("submodule.recurse", "false"),
+    ("gc.auto", "0"),
+    ("maintenance.auto", "false"),
+    ("core.useReplaceRefs", "false"),
+    ("core.commitGraph", "false"),
+    ("http.followRedirects", "false"),
+    ("core.alternateRefsCommand", "true"),
+    # An explicit --show-signature (or a caller's verify) would run the repository's gpg program;
+    # wtctl never verifies signatures, so every program setting points at a command that fails.
+    ("gpg.program", "/bin/false"),
+    ("gpg.openpgp.program", "/bin/false"),
+    ("gpg.x509.program", "/bin/false"),
+    ("gpg.ssh.program", "/bin/false"),
+)
+NETWORK_OVERRIDES: tuple[tuple[str, str], ...] = (
+    ("http.lowSpeedLimit", "1000"),
+    ("http.lowSpeedTime", "60"),
+)
+
+_FILTER_KEYS = ("clean", "smudge", "process")
+
+
+class UnsafePathError(ValueError):
+    """A path wtctl would hand to git contains a newline (or is not absolute)."""
+
+
+class PorcelainError(ValueError):
+    """Git output did not have the documented shape; callers treat the check as failed."""
+
+
+# --------------------------------------------------------------------------------------------
+# Binaries and version
+# --------------------------------------------------------------------------------------------
+
+
+def resolve_binary(name: str, path_env: str, explicit: str | None = None) -> str | None:
+    """``explicit`` (must be absolute) else the first absolute ``PATH`` entry with an executable.
+
+    Relative and empty ``PATH`` entries are ignored (they would depend on the cwd; D49).
+    """
+    if explicit is not None:
+        if not os.path.isabs(explicit) or "\n" in explicit:
+            return None
+        return explicit if _is_executable(explicit) else None
+    for entry in path_env.split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        candidate = os.path.join(entry, name)
+        if _is_executable(candidate):
+            return candidate
+    return None
+
+
+def _is_executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def parse_git_version(text: str) -> tuple[int, int, int]:
+    m = re.match(r"git version (\d+)\.(\d+)(?:\.(\d+))?", text.strip())
+    if not m:
+        raise PorcelainError(f"unrecognized git version output: {text.strip()[:80]!r}")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+
+
+# --------------------------------------------------------------------------------------------
+# Environment
+# --------------------------------------------------------------------------------------------
+
+
+def _dedupe(items: Iterable[str]) -> list[str]:
+    seen: dict[str, None] = {}
+    for item in items:
+        seen.setdefault(item, None)
+    return list(seen)
+
+
+def build_env(
+    *,
+    git_bin: str,
+    home: str,
+    scheme: str | None = None,
+    extra_path: Sequence[str] = (),
+    config: Sequence[tuple[str, str]] = (),
+    ssh_auth_sock: str | None = None,
+    ceiling: str | None = None,
+) -> dict[str, str]:
+    """The complete environment of one git process. Nothing of the caller's reaches git."""
+    if scheme is not None and scheme not in NETWORK_SCHEMES:
+        raise ValueError(f"scheme {scheme!r} is not one of {sorted(NETWORK_SCHEMES)}")
+    path = _dedupe([os.path.dirname(git_bin), "/usr/bin", "/bin", *extra_path])
+    env = {
+        "PATH": os.pathsep.join(path),
+        "HOME": home,
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": scheme if scheme is not None else "none",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null/none",
+        "GIT_SSH_VARIANT": "ssh",
+    }
+    if ssh_auth_sock is not None and scheme == "ssh":
+        env["SSH_AUTH_SOCK"] = ssh_auth_sock
+    if ceiling is not None:
+        env["GIT_CEILING_DIRECTORIES"] = ceiling
+    if config:
+        env["GIT_CONFIG_COUNT"] = str(len(config))
+        for i, (key, value) in enumerate(config):
+            env[f"GIT_CONFIG_KEY_{i}"] = key
+            env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env
+
+
+# --------------------------------------------------------------------------------------------
+# Config listing, filters and extra headers
+# --------------------------------------------------------------------------------------------
+
+
+def parse_config_list(data: bytes) -> list[tuple[str, str | None]]:
+    """``git config --list -z`` output: ``key\\nvalue\\0`` (a key without ``\\n`` has no value)."""
+    entries: list[tuple[str, str | None]] = []
+    for record in data.split(b"\0"):
+        if not record:
+            continue
+        text = record.decode("utf-8", "replace")
+        key, sep, value = text.partition("\n")
+        entries.append((key, value if sep else None))
+    return entries
+
+
+def filter_names(entries: Iterable[tuple[str, str | None]]) -> list[str]:
+    """Every driver name ``filter.<name>.<var>`` defined (name case-preserved, may hold dots)."""
+    names: dict[str, None] = {}
+    for key, _ in entries:
+        if key.startswith("filter.") and key.count(".") >= 2:
+            names.setdefault(key[len("filter.") : key.rindex(".")], None)
+    return list(names)
+
+
+def extra_header_keys(entries: Iterable[tuple[str, str | None]]) -> list[str]:
+    """Exact names of every ``http.*extraheader`` key (URL-scoped and wildcard ones included)."""
+    keys: dict[str, None] = {}
+    for key, _ in entries:
+        if key.lower().startswith("http.") and key.rsplit(".", 1)[-1].lower() == "extraheader":
+            keys.setdefault(key, None)
+    return list(keys)
+
+
+@dataclass(frozen=True)
+class FilterPolicy:
+    """Honored filter drivers (``create.allow_filters``) with their trusted definitions."""
+
+    drivers: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    path_dirs: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+def filter_config(
+    names: Iterable[str], honored: Mapping[str, Mapping[str, str]]
+) -> list[tuple[str, str]]:
+    """``GIT_CONFIG_COUNT`` entries blanking every driver, then restoring the honored ones.
+
+    A later entry for the same key wins, so a honored driver is blanked first (a repository
+    ``smudge`` must not survive next to the trusted ``process``) and then given its definition.
+    """
+    entries: list[tuple[str, str]] = []
+    for name in _dedupe([*names, *honored]):
+        for var in _FILTER_KEYS:
+            entries.append((f"filter.{name}.{var}", ""))
+        entries.append((f"filter.{name}.required", "false"))
+    for name, definition in honored.items():
+        for var, value in definition.items():
+            entries.append((f"filter.{name}.{var}", value))
+    return entries
+
+
+# --------------------------------------------------------------------------------------------
+# The runner
+# --------------------------------------------------------------------------------------------
+
+
+def _check_path(path: str | os.PathLike[str], what: str) -> str:
+    text = os.fspath(path)
+    if "\n" in text or "\0" in text:
+        raise UnsafePathError(f"{what} contains a newline")
+    if not os.path.isabs(text):
+        raise UnsafePathError(f"{what} must be absolute")
+    return text
+
+
+@dataclass(frozen=True)
+class GitCommand:
+    argv: list[str]
+    env: dict[str, str]
+    cwd: str
+
+
+@dataclass(frozen=True)
+class Git:
+    """A hardened git: the binary, the home directory and the honored filter drivers."""
+
+    gateway: Gateway
+    git_bin: str
+    home: str
+    filters: FilterPolicy = field(default_factory=FilterPolicy)
+
+    # -- building ------------------------------------------------------------------------------
+
+    def _list_config(self, git_dir: str, work_tree: str | None, cwd: str) -> list:
+        cmd = self._assemble(
+            ["config", "--list", "-z"],
+            git_dir=git_dir,
+            work_tree=work_tree,
+            cwd=cwd,
+            scheme=None,
+            config=(),
+            ssh_auth_sock=None,
+            ceiling=None,
+            extra_path=(),
+        )
+        r = self.gateway.git(cmd.argv, env=cmd.env, cwd=cmd.cwd, timeout=30)
+        if r.returncode != 0 or r.timed_out:
+            # Failing closed: without the listing the drivers and headers cannot be blanked.
+            raise WtctlError(
+                "internal", f"could not read repository config of {git_dir}: {r.err.strip()[:200]}"
+            )
+        return parse_config_list(r.stdout)
+
+    def _assemble(
+        self,
+        args: Sequence[str],
+        *,
+        git_dir: str | None,
+        work_tree: str | None,
+        cwd: str,
+        scheme: str | None,
+        config: Sequence[tuple[str, str]],
+        ssh_auth_sock: str | None,
+        ceiling: str | None,
+        extra_path: Sequence[str],
+    ) -> GitCommand:
+        if not args or not re.fullmatch(r"[a-z][a-z-]*", args[0]) or args[0] not in SUBCOMMANDS:
+            raise ValueError(f"not a git subcommand wtctl runs: {args[:1]!r}")
+        sub = args[0]
+        rest = list(args[1:])
+        if sub in DIFF_FAMILY and "--no-ext-diff" not in rest:
+            rest.insert(0, "--no-ext-diff")
+        if sub in TEXTCONV_FAMILY and "--no-textconv" not in rest:
+            rest.insert(0, "--no-textconv")
+        if sub == "status" and not any(a.startswith("--ignore-submodules") for a in rest):
+            rest.insert(0, "--ignore-submodules=all")
+        argv = [self.git_bin, "--no-pager"]
+        overrides = OVERRIDES + (NETWORK_OVERRIDES if scheme is not None else ())
+        for key, value in overrides:
+            argv += ["-c", f"{key}={value}"]
+        if git_dir is not None:
+            argv.append(f"--git-dir={git_dir}")
+        if work_tree is not None:
+            argv.append(f"--work-tree={work_tree}")
+        argv += [sub, *rest]
+        env = build_env(
+            git_bin=self.git_bin,
+            home=self.home,
+            scheme=scheme,
+            extra_path=extra_path,
+            config=config,
+            ssh_auth_sock=ssh_auth_sock,
+            ceiling=ceiling,
+        )
+        return GitCommand(argv, env, cwd)
+
+    def build(
+        self,
+        args: Sequence[str],
+        *,
+        git_dir: str | os.PathLike[str] | None = None,
+        work_tree: str | os.PathLike[str] | None = None,
+        cwd: str | os.PathLike[str] | None = None,
+        private_dir: str | os.PathLike[str] | None = None,
+        scheme: str | None = None,
+        extra_config: Sequence[tuple[str, str]] = (),
+        ssh_auth_sock: str | None = None,
+        honor_filters: bool = False,
+    ) -> GitCommand:
+        """Build the argv, environment and cwd of one command (``run`` runs the result).
+
+        ``git_dir`` (and ``work_tree`` for commands in a worktree) are always explicit when the
+        command runs in a repository. A command outside any repository passes ``private_dir``, a
+        fresh wtctl-private directory; ``GIT_CEILING_DIRECTORIES`` is its parent so git never
+        discovers an ancestor repository. ``extra_config`` (token headers, owned by credentials)
+        comes after the blanking, so it wins.
+        """
+        gd = _check_path(git_dir, "git dir") if git_dir is not None else None
+        wt = _check_path(work_tree, "work tree") if work_tree is not None else None
+        pd = _check_path(private_dir, "private dir") if private_dir is not None else None
+        if wt is not None and gd is None:
+            raise ValueError("work_tree needs git_dir")
+        ceiling = None
+        if gd is not None:
+            run_cwd = _check_path(cwd, "cwd") if cwd is not None else (wt or gd)
+        else:
+            if pd is None:
+                raise ValueError("a command outside a repository needs a private_dir")
+            run_cwd = pd
+            ceiling = os.path.dirname(pd.rstrip("/"))
+        config: list[tuple[str, str]] = []
+        extra_path: tuple[str, ...] = ()
+        if gd is not None:
+            entries = self._list_config(gd, wt, run_cwd)
+            honored = self.filters.drivers if honor_filters else {}
+            config += filter_config(filter_names(entries), honored)
+            config += [(k, "") for k in extra_header_keys(entries)]
+            if honor_filters:
+                extra_path = self.filters.path_dirs
+        for key, value in extra_config:
+            if "." not in key or "\0" in key or "\0" in value:
+                raise ValueError(f"bad config entry {key!r}")
+            config.append((key, value))
+        return self._assemble(
+            args,
+            git_dir=gd,
+            work_tree=wt,
+            cwd=run_cwd,
+            scheme=scheme,
+            config=config,
+            ssh_auth_sock=ssh_auth_sock,
+            ceiling=ceiling,
+            extra_path=extra_path,
+        )
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        stdin: bytes | None = None,
+        timeout: float | None = None,
+        scheme: str | None = None,
+        **kwargs: object,
+    ) -> GitResult:
+        """Run one hardened git command through the gateway.
+
+        A command meant to contact a remote passes ``scheme`` and must pass a ``timeout``
+        (network calls always run under a wall-clock limit that kills their process group).
+        """
+        if scheme is not None and timeout is None:
+            raise ValueError("a network git command needs a timeout")
+        cmd = self.build(args, scheme=scheme, **kwargs)  # type: ignore[arg-type]
+        return self.gateway.git(cmd.argv, env=cmd.env, cwd=cmd.cwd, stdin=stdin, timeout=timeout)
+
+
+# --------------------------------------------------------------------------------------------
+# Setup helpers: version check and allowed filters
+# --------------------------------------------------------------------------------------------
+
+
+def check_version(gateway: Gateway, git_bin: str, home: str, private_dir: str) -> tuple[int, ...]:
+    """The binary's version; ``git_too_old`` (exit 12) below 2.34."""
+    env = build_env(git_bin=git_bin, home=home)
+    r = gateway.git([git_bin, "--version"], env=env, cwd=private_dir, timeout=15)
+    if r.returncode != 0:
+        raise WtctlError("internal", f"{git_bin} --version failed")
+    version = parse_git_version(r.out)
+    if version[:2] < MIN_GIT_VERSION:
+        raise WtctlError(
+            "git_too_old", f"git {'.'.join(map(str, version))} is too old; need 2.34 or newer"
+        )
+    return version
+
+
+def load_filter_policy(
+    gateway: Gateway,
+    git_bin: str,
+    *,
+    home: str,
+    xdg_config_home: str | None,
+    allow: Sequence[str],
+    path_env: str,
+    private_dir: str,
+) -> FilterPolicy:
+    """Honored drivers: listed in ``allow``, and defined with a ``process`` in the global config.
+
+    Definitions come from ``$XDG_CONFIG_HOME/git/config`` then ``~/.gitconfig`` (the latter
+    wins), read with ``--file`` and without includes. A listed driver that the global config
+    does not define with a ``process`` (a repository-planted ``process`` would beat a trusted
+    ``smudge``), or whose command cannot be resolved on ``path_env``, stays blanked with a
+    warning.
+    """
+    if not allow:
+        return FilterPolicy()
+    xdg = xdg_config_home or os.path.join(home, ".config")
+    values: dict[str, str] = {}
+    for cfg in (os.path.join(xdg, "git", "config"), os.path.join(home, ".gitconfig")):
+        if not os.path.isfile(cfg):
+            continue
+        env = build_env(git_bin=git_bin, home=home)
+        r = gateway.git(
+            [git_bin, "config", "--file", cfg, "--no-includes", "--list", "-z"],
+            env=env,
+            cwd=private_dir,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            continue
+        for key, value in parse_config_list(r.stdout):
+            if key.startswith("filter.") and key.count(".") >= 2 and value is not None:
+                values[key] = value
+    drivers: dict[str, dict[str, str]] = {}
+    dirs: list[str] = []
+    warnings: list[str] = []
+    for name in allow:
+        process = values.get(f"filter.{name}.process", "")
+        if not process.strip():
+            warnings.append(f"filter driver {name!r} has no global 'process'; it stays blanked")
+            continue
+        try:
+            first = shlex.split(process)[0]
+        except (ValueError, IndexError):
+            warnings.append(f"filter driver {name!r}: unparsable process command; stays blanked")
+            continue
+        resolved = resolve_binary(os.path.basename(first), path_env) if "/" not in first else None
+        if "/" in first:
+            resolved = first if os.path.isabs(first) and _is_executable(first) else None
+        if resolved is None:
+            warnings.append(f"filter driver {name!r}: command {first!r} not found; stays blanked")
+            continue
+        drivers[name] = {
+            var: values[f"filter.{name}.{var}"]
+            for var in (*_FILTER_KEYS, "required")
+            if f"filter.{name}.{var}" in values
+        }
+        dirs.append(os.path.dirname(resolved))
+    return FilterPolicy(drivers, tuple(_dedupe(dirs)), tuple(warnings))
+
+
+# --------------------------------------------------------------------------------------------
+# Fetch outcome classification (D15, interface.md Remove order step 5)
+# --------------------------------------------------------------------------------------------
+
+AUTH_MARKERS = (
+    "could not read Username",
+    "terminal prompts disabled",
+    "Authentication failed",
+    "Permission denied (publickey",
+    "Host key verification failed",
+    "The requested URL returned error: 401",
+)
+LOCK_MARKERS = ("cannot lock ref", "unable to update local ref")
+
+
+class FetchKind(enum.Enum):
+    OK = "ok"
+    LOCK_CONTENTION = "lock_contention"
+    AUTH_REQUIRED = "auth_required"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class FetchOutcome:
+    kind: FetchKind
+    cause: str | None = None  # "timeout" or "prune_incomplete" with FAILED
+
+    @property
+    def ok(self) -> bool:
+        return self.kind is FetchKind.OK
+
+
+def classify_fetch(result: GitResult) -> FetchOutcome:
+    """Classify one network git call by exit status and stderr (``LC_ALL=C`` is set)."""
+    if result.timed_out:
+        return FetchOutcome(FetchKind.FAILED, "timeout")
+    err = result.err
+    if result.returncode == 0:
+        if any(line.startswith("error:") for line in err.splitlines()):
+            return FetchOutcome(FetchKind.FAILED, "prune_incomplete")
+        return FetchOutcome(FetchKind.OK)
+    if result.returncode == 1:
+        if any(marker in err for marker in LOCK_MARKERS):
+            return FetchOutcome(FetchKind.LOCK_CONTENTION)
+        return FetchOutcome(FetchKind.FAILED)
+    if result.returncode == 128:
+        if any(marker in err for marker in AUTH_MARKERS):
+            return FetchOutcome(FetchKind.AUTH_REQUIRED)
+        return FetchOutcome(FetchKind.FAILED)
+    return FetchOutcome(FetchKind.FAILED)
+
+
+def fetch_with_retries(
+    attempt: Callable[[], GitResult],
+    *,
+    retries: int,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[GitResult, FetchOutcome]:
+    """Run ``attempt``; ref-lock contention is retried ``retries`` times, 1 second apart.
+
+    Contention that outlasts the retries is a plain failure.
+    """
+    result = attempt()
+    outcome = classify_fetch(result)
+    for _ in range(max(retries, 0)):
+        if outcome.kind is not FetchKind.LOCK_CONTENTION:
+            return result, outcome
+        sleep(1.0)
+        result = attempt()
+        outcome = classify_fetch(result)
+    if outcome.kind is FetchKind.LOCK_CONTENTION:
+        outcome = FetchOutcome(FetchKind.FAILED)
+    return result, outcome
+
+
+def outcome_error(
+    outcome: FetchOutcome, result: GitResult, *, failure_code: str = "fetch_failed"
+) -> WtctlError | None:
+    """The error for a failed outcome (``None`` when it succeeded).
+
+    ``failure_code`` is ``fetch_failed`` or ``clone_failed`` (a clone's timeout has the cause
+    ``timeout`` too; ``prune_incomplete`` only exists for fetches).
+    """
+    if outcome.ok:
+        return None
+    if outcome.kind is FetchKind.AUTH_REQUIRED:
+        return WtctlError("auth_required", "the remote asked for credentials wtctl does not have")
+    if failure_code not in ("fetch_failed", "clone_failed"):
+        raise ValueError(failure_code)
+    cause = outcome.cause
+    if failure_code == "clone_failed" and cause == "prune_incomplete":
+        cause = None
+    tail = result.err.strip().splitlines()[-1][:200] if result.err.strip() else "no output"
+    details = {"cause": cause} if cause else None
+    message = f"git failed ({'timed out' if cause == 'timeout' else tail})"
+    if details:
+        return WtctlError(failure_code, message, details=details)
+    return WtctlError(failure_code, message)
+
+
+# --------------------------------------------------------------------------------------------
+# Porcelain parsing (git 2.34: newline-separated; paths with newlines are refused elsewhere)
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StatusEntry:
+    kind: str  # "1" ordinary, "2" renamed or copied, "u" unmerged, "?" untracked, "!" ignored
+    path: str
+    xy: str = ""
+    submodule: str = ""
+    orig_path: str | None = None
+
+
+def parse_status_v2(data: bytes) -> list[StatusEntry]:
+    """``git status --porcelain=v2 -z``. Branch headers (``# ...``) are skipped."""
+    fields = data.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    out: list[StatusEntry] = []
+    i = 0
+    while i < len(fields):
+        rec = fields[i].decode("utf-8", "surrogateescape")
+        i += 1
+        if rec.startswith("# "):
+            continue
+        kind = rec[:1]
+        if kind in ("?", "!") and rec[1:2] == " ":
+            out.append(StatusEntry(kind, rec[2:]))
+        elif kind == "1":
+            parts = rec.split(" ", 8)
+            if len(parts) != 9:
+                raise PorcelainError(f"malformed status record: {rec[:60]!r}")
+            out.append(StatusEntry("1", parts[8], parts[1], parts[2]))
+        elif kind == "2":
+            parts = rec.split(" ", 9)
+            if len(parts) != 10 or i >= len(fields):
+                raise PorcelainError(f"malformed status record: {rec[:60]!r}")
+            orig = fields[i].decode("utf-8", "surrogateescape")
+            i += 1
+            out.append(StatusEntry("2", parts[9], parts[1], parts[2], orig))
+        elif kind == "u":
+            parts = rec.split(" ", 10)
+            if len(parts) != 11:
+                raise PorcelainError(f"malformed status record: {rec[:60]!r}")
+            out.append(StatusEntry("u", parts[10], parts[1], parts[2]))
+        else:
+            raise PorcelainError(f"unknown status record: {rec[:60]!r}")
+    return out
+
+
+def parse_ls_files_tagged(data: bytes) -> list[tuple[str, str]]:
+    """``git ls-files -v -z``: ``(tag, path)`` pairs."""
+    out: list[tuple[str, str]] = []
+    for rec in data.split(b"\0"):
+        if not rec:
+            continue
+        text = rec.decode("utf-8", "surrogateescape")
+        if len(text) < 3 or text[1] != " ":
+            raise PorcelainError(f"malformed ls-files record: {text[:60]!r}")
+        out.append((text[0], text[2:]))
+    return out
+
+
+def hidden_index_flag(tag: str) -> bool:
+    """An assume-unchanged (lowercase tag) or skip-worktree (``S``) entry hides edits (D53)."""
+    return tag.islower() or tag == "S"
+
+
+@dataclass(frozen=True)
+class WorktreeEntry:
+    path: str
+    head: str | None = None
+    branch: str | None = None
+    detached: bool = False
+    bare: bool = False
+    locked: str | None = None  # None: not locked; "" locked without a reason
+    prunable: str | None = None
+
+
+def parse_worktree_list(data: bytes) -> list[WorktreeEntry]:
+    """``git worktree list --porcelain`` (no ``-z`` before 2.36): blocks split by blank lines.
+
+    Any line that is not one of the documented attributes fails closed: it is how a path with a
+    newline would show up.
+    """
+    entries: list[WorktreeEntry] = []
+    for block in data.decode("utf-8", "surrogateescape").split("\n\n"):
+        lines = [ln for ln in block.split("\n") if ln != ""]
+        if not lines:
+            continue
+        if not lines[0].startswith("worktree "):
+            raise PorcelainError(f"malformed worktree record: {lines[0][:60]!r}")
+        attrs: dict[str, object] = {"path": lines[0][len("worktree ") :]}
+        for ln in lines[1:]:
+            word, _, value = ln.partition(" ")
+            if word == "HEAD":
+                attrs["head"] = value
+            elif word == "branch":
+                attrs["branch"] = value
+            elif word == "detached":
+                attrs["detached"] = True
+            elif word == "bare":
+                attrs["bare"] = True
+            elif word == "locked":
+                attrs["locked"] = value
+            elif word == "prunable":
+                attrs["prunable"] = value
+            else:
+                raise PorcelainError(f"unknown worktree attribute: {ln[:60]!r}")
+        entries.append(WorktreeEntry(**attrs))  # type: ignore[arg-type]
+    return entries
+
+
+def refuse_newline_path(path: str | Path) -> str:
+    """Paths with a newline are refused (git 2.34's porcelain is newline-separated)."""
+    text = os.fspath(path)
+    if "\n" in text or "\r" in text:
+        raise UnsafePathError("path contains a newline")
+    return text
