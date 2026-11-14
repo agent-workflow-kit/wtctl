@@ -840,3 +840,51 @@ def test_env_file_in_a_group_writable_directory_shared_with_others_is_refused(
     monkeypatch.setattr(cron, "_group_members", lambda gid: ["someone-else"])
     r = go(capsys, FakeCrontab(None), "--json", "cron", "install", "--env-file", str(f))
     assert r.code == 2 and "chmod g-w" in r.json()["error"]["message"]
+
+
+class _Pw:
+    def __init__(self, name: str, gid: int) -> None:
+        self.pw_name, self.pw_gid = name, gid
+
+
+def test_group_members_include_accounts_whose_primary_group_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Grp:
+        gr_mem: list[str] = []
+
+    monkeypatch.setattr(cron.grp, "getgrgid", lambda gid: _Grp())
+    monkeypatch.setattr(cron.pwd, "getpwall", lambda: [_Pw("me", 100), _Pw("other", 100)])
+    assert sorted(cron._group_members(100)) == ["me", "other"]
+    shared = cron.unsafe_directory(
+        _Info(0o40775, ME, 100),  # type: ignore[arg-type]
+        "/d",
+        immediate=False,
+        uid=ME,
+        gid=100,
+        user="me",
+        members=cron._group_members,
+    )
+    assert shared is not None and "chmod g-w /d" in shared
+
+
+def test_group_with_no_other_primary_account_stays_private(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Grp:
+        gr_mem: list[str] = []
+
+    monkeypatch.setattr(cron.grp, "getgrgid", lambda gid: _Grp())
+    monkeypatch.setattr(cron.pwd, "getpwall", lambda: [_Pw("me", 100), _Pw("other", 200)])
+    assert (
+        cron.unsafe_directory(
+            _Info(0o40775, ME, 100),  # type: ignore[arg-type]
+            "/d",
+            immediate=False,
+            uid=ME,
+            gid=100,
+            user="me",
+            members=cron._group_members,
+        )
+        is None
+    )

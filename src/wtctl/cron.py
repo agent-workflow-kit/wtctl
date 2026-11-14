@@ -179,10 +179,17 @@ def _home(environ: Mapping[str, str]) -> str:
 
 
 def _group_members(gid: int) -> list[str]:
+    """Everyone in the group: the supplementary members (``gr_mem``) plus every account whose
+    primary gid it is, which ``gr_mem`` does not list."""
     try:
-        return list(grp.getgrgid(gid).gr_mem)
+        names = list(grp.getgrgid(gid).gr_mem)
     except KeyError:
         return ["?"]  # unknown group: assume it is shared
+    try:
+        names += [entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == gid]
+    except OSError:
+        return ["?"]
+    return names
 
 
 def unsafe_directory(
@@ -197,7 +204,8 @@ def unsafe_directory(
 ) -> str | None:
     """Why other users could replace what is in this directory, or None. The group-write bit is
     ignored when root owns the directory (e.g. ``root:admin 775 /usr/local``) or the user owns
-    it, its group is the user's primary group and no one else is a member of that group. A
+    it, its group is the user's primary group and no one else is in that group (as a supplementary
+    member or through their own primary gid). A
     world-writable directory is refused unless it is sticky and not the file's own parent."""
     shown = _clean(path)
     if info.st_uid not in (uid, 0):
