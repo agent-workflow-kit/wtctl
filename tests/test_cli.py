@@ -540,6 +540,18 @@ def test_broken_pipe_on_stdout_is_a_quiet_exit(
     assert capsys.readouterr().err == ""
 
 
+def test_broken_pipe_on_stderr_alone_is_a_quiet_exit(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    broken = _BrokenStream()
+    monkeypatch.setattr(sys, "stderr", broken)
+    assert main(["--json", "bogus"], runtime=Runtime(stdin_isatty=False)) == 1
+    assert broken.writes >= 1
+    assert capsys.readouterr().err == ""
+
+
 def test_broken_pipe_on_flush_is_a_quiet_exit(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -32,7 +32,11 @@ def escape_control(text: str) -> str:
 
 
 def escape_text_lines(text: str) -> str:
-    """Like :func:`escape_control` but keeps ``\\n`` as the line break (multi-line text)."""
+    """Like :func:`escape_control` but keeps ``\\n`` as the line break (multi-line text).
+
+    Only ``\\n`` is kept: tabs and carriage returns are escaped (``\\x09``, ``\\x0d``) on purpose,
+    so handlers must not rely on them in human or stderr text.
+    """
     return "\n".join(escape_control(line) for line in text.split("\n"))
 
 

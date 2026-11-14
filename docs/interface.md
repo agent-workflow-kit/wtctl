@@ -406,7 +406,7 @@ Every command runs these stages in order; a failing stage ends the command:
 
 **Global flags** are accepted before or after the command; when given on both sides the later one wins, except `--decision-id`, whose values concatenate (those before the command, then those after) and are checked as one list. `--verbose` with `--quiet` (on any side) exits 2. `--dry-run` on a command not in the list above exits 2.
 
-**Human output** escapes control characters in names, paths and output tails (Cc as `\xNN`; line and paragraph separators, bidi and other format characters and lone surrogates as `\uNNNN`, or `\UNNNNNNNN` above U+FFFF). Multi-line text (usage, tracebacks) keeps its line breaks and escapes each line. A literal backslash is not doubled, so escaped output is not injective (a literal `\x1b` reads like an escaped ESC); it is for display, not for parsing back.
+**Human output** escapes control characters in names, paths and output tails (Cc as `\xNN`; line and paragraph separators, bidi and other format characters and lone surrogates as `\uNNNN`, or `\UNNNNNNNN` above U+FFFF). Multi-line text (usage, tracebacks) keeps its line breaks and escapes each line: only `\n` is kept; tabs and carriage returns are escaped (`\x09`, `\x0d`), so handlers must not rely on them. A literal backslash is not doubled, so escaped output is not injective (a literal `\x1b` reads like an escaped ESC); it is for display, not for parsing back.
 
 ### Commands by record state
 

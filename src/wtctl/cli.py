@@ -123,6 +123,10 @@ def _check_usage(args: argparse.Namespace, actor_is_human: bool) -> None:
 class _OutputClosed(BaseException):
     """Our own write to stdout or stderr hit a broken pipe (BaseException: not an `internal`)."""
 
+    def __init__(self, stream: TextIO | None = None) -> None:
+        super().__init__()
+        self.stream = stream
+
 
 def _write(stream: TextIO | None, text: str) -> None:
     if stream is None:  # a detached stream (sys.stdout is None) is skipped
@@ -130,7 +134,7 @@ def _write(stream: TextIO | None, text: str) -> None:
     try:
         stream.write(text)
     except BrokenPipeError:
-        raise _OutputClosed from None
+        raise _OutputClosed(stream) from None
 
 
 def _emit_error(err: WtctlError, *, as_json: bool, verbose: bool = False) -> int:
@@ -202,10 +206,12 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         raise
 
 
-def _silence_stdout() -> None:
-    """After a broken pipe, point stdout at /dev/null so the exit-time flush cannot fail too."""
+def _silence(stream: TextIO | None) -> None:
+    """After a broken pipe, point the failing stream at /dev/null (no exit-time noise)."""
+    if stream is None:
+        return
     try:
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
     except (AttributeError, ValueError, OSError):
         pass
 
@@ -215,10 +221,14 @@ def main(argv: list[str] | None = None, *, runtime: Runtime | None = None) -> in
         code = _run(list(sys.argv[1:] if argv is None else argv), runtime or Runtime())
         for stream in (sys.stdout, sys.stderr):
             if stream is not None:
-                stream.flush()
+                try:
+                    stream.flush()
+                except BrokenPipeError:
+                    _silence(stream)
+                    raise _OutputClosed(stream) from None
         return code
-    except (_OutputClosed, BrokenPipeError):  # BrokenPipeError: from the flush
-        _silence_stdout()
+    except _OutputClosed as closed:
+        _silence(closed.stream)
         return 1
 
 

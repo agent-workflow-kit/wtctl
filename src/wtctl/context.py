@@ -30,6 +30,10 @@ def _os_user() -> str:
         return "unknown"
 
 
+# Seams looked up by name (exact names and signatures):
+#   wtctl.config.load_config(config_path)
+#   wtctl.config.me_name(config_path)
+#   wtctl.state.open_state(ctx)
 def _seam(module: str, attr: str) -> Callable[..., Any] | None:
     """``wtctl.<module>.<attr>`` if that module defines it, else None.
 
