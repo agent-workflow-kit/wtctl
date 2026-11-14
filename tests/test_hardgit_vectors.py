@@ -626,6 +626,39 @@ def test_control_caller_flags_would_reopen_the_nested_repo(
     assert hostile_sub.nested_hits(), f"{extra} no longer reopens the nested repo"
 
 
+RECURSE_CASES = [
+    ("status", ["--ignore-sub=none"]),
+    ("status", ["--ignore-submodules=none"]),
+    ("read-tree", ["-u", "--reset", "--recurse-submodules", "HEAD"]),
+]
+
+
+@pytest.mark.parametrize("sub,extra", RECURSE_CASES, ids=[f"{s}{e[0]}" for s, e in RECURSE_CASES])
+def test_control_caller_flags_would_reopen_the_nested_repo_elsewhere(
+    hostile_sub: Hostile, sub: str, extra: list[str]
+) -> None:
+    _modify(hostile_sub)
+    plain_git([*TAME, "log.showSignature=false", "status", "--ignore-submodules=all"],
+              cwd=hostile_sub.clone, home=hostile_sub.home)  # fmt: skip
+    assert hostile_sub.nested_hits() == []
+    plain_git([*TAME, "log.showSignature=false", sub, *extra], cwd=hostile_sub.clone,
+              home=hostile_sub.home)  # fmt: skip
+    assert hostile_sub.nested_hits(), f"{sub} {extra} no longer reopens the nested repo"
+
+
+@pytest.mark.parametrize("sub,extra", RECURSE_CASES, ids=[f"{s}{e[0]}" for s, e in RECURSE_CASES])
+def test_reopening_flags_are_refused_and_run_nothing(
+    hostile_sub: Hostile, git: Git, sub: str, extra: list[str]
+) -> None:
+    _modify(hostile_sub)
+    with pytest.raises(ValueError):
+        git.run([sub, *extra], **_kwargs(hostile_sub, False))  # type: ignore[arg-type]
+    assert hostile_sub.nested_hits() == []
+    r = git.run(["status", "--porcelain=v2"], **_kwargs(hostile_sub, False))  # type: ignore[arg-type]
+    assert r.returncode == 0, r.err
+    assert hostile_sub.hits() == [] and hostile_sub.nested_hits() == []
+
+
 # -- guards the caller cannot turn off (items 4, 5) ---------------------------------------------
 
 

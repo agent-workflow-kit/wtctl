@@ -167,8 +167,8 @@ def test_diff_works_with_the_empty_external_override(git: Git, repo: Path) -> No
 
 def test_status_ignores_submodules_unless_told(git: Git, repo: Path) -> None:
     assert "--ignore-submodules=all" in git.build(["status"], git_dir=repo / ".git", cwd=repo).argv
-    argv = git.build(["status", "--ignore-submodules=none"], git_dir=repo / ".git", cwd=repo).argv
-    assert "--ignore-submodules=all" not in argv
+    argv = git.build(["status", "--ignore-submodules=all"], git_dir=repo / ".git", cwd=repo).argv
+    assert "--ignore-submodules=all" in argv
 
 
 @pytest.mark.parametrize("bad", ["/tmp/a\nb", "relative/path"])
@@ -303,6 +303,8 @@ def test_check_version_on_the_installed_git(private_home: Path, tmp_path: Path) 
         (res(128, "fatal: terminal prompts disabled"), FetchKind.AUTH_REQUIRED, None),
         (res(128, "fatal: Authentication failed for 'https://h/'"), FetchKind.AUTH_REQUIRED, None),
         (res(128, "remote: Authentication failed"), FetchKind.FAILED, None),
+        (res(128, "fatal: remote error: Authentication failed"), FetchKind.FAILED, None),
+        (res(128, "fatal: protocol error: terminal prompts disabled"), FetchKind.FAILED, None),
         (res(128, "remote: Host key verification failed.\nfatal: boom"), FetchKind.FAILED, None),
         (res(128, "git@h: Permission denied (publickey)."), FetchKind.AUTH_REQUIRED, None),
         (res(128, "Host key verification failed."), FetchKind.AUTH_REQUIRED, None),
@@ -508,6 +510,13 @@ def _no_sleep(seconds: float) -> None:
         ("diff-files", ["--ignore-submodules=untracked"]), ("diff", ["--ignore-submodules"]),
         ("show", ["--ignore-sub=none"]), ("diff", ["--no-ext-diff", "--ext-diff"]),
         ("diff", ["x", "--ext-diff", "--", "y"]),
+        ("status", ["--ignore-submodules=none"]), ("status", ["--ignore-sub=none"]),
+        ("status", ["--ig=dirty"]), ("status", ["--ignore-submodules"]),
+        ("status", ["--ignore-submodules=untracked"]),
+        ("status", ["--recurse-submodules"]), ("status", ["--recurse-sub"]),
+        ("status", ["--rec"]), ("status", ["--recurse-submodules=yes"]),
+        ("diff", ["--recurse-submodules"]), ("fetch", ["--recurse-submodules=on-demand"]),
+        ("ls-files", ["--recurse-submodules"]), ("grep", ["--recurse-sub", "x"]),
     ],
 )  # fmt: skip
 def test_options_that_undo_the_guards_are_rejected(
@@ -525,6 +534,8 @@ def test_options_that_undo_the_guards_are_rejected(
         ("diff", ["--", "--ext-diff"]), ("diff", ["x", "--", "--textconv", "--submodule=log"]),
         ("cat-file", ["--filters", "HEAD:x"]), ("diff", ["--exit-code", "--stat"]),
         ("rev-list", ["--submodule=diff", "x"]), ("status", ["--untracked-files=no"]),
+        ("status", ["--ignore-submodules=all"]), ("status", ["--no-recurse-submodules"]),
+        ("status", ["--", "--recurse-submodules", "--ignore-submodules=none"]),
     ],
 )  # fmt: skip
 def test_harmless_options_are_accepted(git: Git, repo: Path, sub: str, args: list[str]) -> None:

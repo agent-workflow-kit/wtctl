@@ -331,14 +331,17 @@ def _guard_options(sub: str, args: Sequence[str]) -> None:
             continue
         if _abbreviates(name, "textconv") and name != "text":
             raise ValueError(f"{arg!r} would run a textconv driver; wtctl never allows it")
+        if _abbreviates(name, "recurse-submodules"):
+            raise ValueError(f"{arg!r} would recurse into nested repositories")
+        if _abbreviates(name, "ignore-submodules") and arg != "--ignore-submodules=all":
+            if sub in DIFF_FAMILY or sub == "status":
+                raise ValueError(f"{arg!r}: only --ignore-submodules=all is allowed")
         if sub not in DIFF_FAMILY:
             continue
         if name.startswith("no-no-") or _abbreviates(name, "ext-diff"):
             raise ValueError(f"{arg!r} would undo --no-ext-diff or --no-textconv")
         if _abbreviates(name, "submodule") and arg != "--submodule=short":
             raise ValueError(f"{arg!r}: only --submodule=short is allowed (nested repository)")
-        if _abbreviates(name, "ignore-submodules") and arg != "--ignore-submodules=all":
-            raise ValueError(f"{arg!r}: only --ignore-submodules=all is allowed")
 
 
 def _passes_untracked_files(args: Sequence[str]) -> bool:
@@ -435,8 +438,7 @@ class Git:
         if sub in TEXTCONV_FAMILY:
             guards.append("--no-textconv")
         if sub == "status":
-            if not any(a.startswith("--ignore-submodules") for a in rest):
-                guards.append("--ignore-submodules=all")
+            guards.append("--ignore-submodules=all")
             # status.showUntrackedFiles=no in the repository would hide untracked files.
             if not _passes_untracked_files(rest):
                 guards.append("--untracked-files=all")
@@ -677,10 +679,13 @@ class FetchOutcome:
         return self.kind is FetchKind.OK
 
 
+_SERVER_TEXT_PREFIXES = ("remote:", "fatal: remote error:", "fatal: protocol error:")
+
+
 def _auth_lines(err: str) -> list[str]:
     """Lines that may carry an authentication marker: never a ``remote:`` line, which is text
     the server chose (a malicious remote could print any marker)."""
-    return [ln for ln in err.splitlines() if not ln.startswith("remote:")]
+    return [ln for ln in err.splitlines() if not ln.startswith(_SERVER_TEXT_PREFIXES)]
 
 
 def classify_fetch(result: GitResult) -> FetchOutcome:
