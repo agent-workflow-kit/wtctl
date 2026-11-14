@@ -620,6 +620,9 @@ def test_config_and_state_are_lazy_and_cached(
 def test_default_seams_raise_not_implemented_internal(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Whatever modules exist now, behave as if config and state defined no seam functions.
+    monkeypatch.setattr("wtctl.context._seam", lambda module, attr: None)
+
     def handler(ctx: Context) -> Result:
         return Result({"c": ctx.config})
 

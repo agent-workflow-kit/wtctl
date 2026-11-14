@@ -81,9 +81,65 @@ class UnavailableScanner:
         raise ScannerUnavailable("process scanning is not implemented yet")
 
 
+class ProcessUnreadable(Exception):
+    """Whether a process exists could not be determined (as opposed to: it does not exist)."""
+
+
+class ProcessIdentity(Protocol):
+    def start_time(self, pid: int) -> str | None:
+        """An opaque string that, with the PID, identifies one process for its lifetime.
+
+        None when no such process runs (a zombie counts as not running); raises
+        ``ProcessUnreadable`` when that cannot be told.
+        """
+        ...
+
+
+class PsProcessIdentity:
+    """Start time from ``ps -o lstart=`` (macOS and anywhere without ``/proc``)."""
+
+    def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = run) -> None:
+        self._runner = runner
+
+    def start_time(self, pid: int) -> str | None:
+        try:
+            r = self._runner(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ProcessUnreadable(f"cannot run ps: {exc}") from exc
+        out = r.stdout.strip()
+        if r.returncode != 0 or not out:
+            return None
+        return out
+
+
+class ProcProcessIdentity:
+    """Start time from ``/proc/<pid>/stat`` field 22 (clock ticks since boot; Linux)."""
+
+    def start_time(self, pid: int) -> str | None:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                raw = f.read().decode("utf-8", "replace")
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except OSError as exc:
+            raise ProcessUnreadable(f"cannot read /proc/{pid}/stat: {exc}") from exc
+        # The command name (field 2) is in parentheses and may itself contain spaces or ')'.
+        rest = raw[raw.rfind(")") + 2 :].split()
+        if len(rest) < 20:
+            raise ProcessUnreadable(f"unexpected /proc/{pid}/stat format")
+        if rest[0] in ("Z", "X"):  # zombie or dead: not running
+            return None
+        return rest[19]
+
+
+def system_process_identity() -> ProcessIdentity:
+    return ProcProcessIdentity() if sys.platform.startswith("linux") else PsProcessIdentity()
+
+
 @dataclass
 class Gateway:
     clock: Clock = field(default_factory=SystemClock)
+    procs: ProcessIdentity = field(default_factory=system_process_identity)
     scanner: ProcessScanner = field(default_factory=UnavailableScanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
 
