@@ -12,6 +12,7 @@ Seams used by ``context.py`` (exact names): ``load_config(config_path)`` and
 
 from __future__ import annotations
 
+import errno
 import getpass
 import os
 import re
@@ -38,6 +39,8 @@ from .errors import WtctlError
 
 MAX_FILE_BYTES = 1024 * 1024
 MAX_YAML_DEPTH = 64
+MAX_YAML_EVENTS = 10_000
+MAX_DROPINS = 100
 MAX_ERRORS_SHOWN = 5
 
 # ---------------------------------------------------------------- types
@@ -394,8 +397,13 @@ def _env_overrides() -> list[tuple[str, str, Any]]:
 # ---------------------------------------------------------------- files
 
 
+def _printable(text: str) -> str:
+    """Escape control characters and undecodable path bytes (lone surrogates) for display."""
+    return "".join(ch if ch.isprintable() else ascii(ch)[1:-1] for ch in text)
+
+
 def _invalid(message: str) -> WtctlError:
-    return WtctlError("config_invalid", message)
+    return WtctlError("config_invalid", _printable(message))
 
 
 def _home() -> str:
@@ -416,7 +424,8 @@ def _read_file(path: str, *, follow: bool) -> str:
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        what = "is a symlink (not followed)" if exc.errno == 40 and not follow else exc.strerror
+        symlink = exc.errno == errno.ELOOP and not follow
+        what = "is a symlink (not followed)" if symlink else exc.strerror
         raise _invalid(f"{path}: cannot read: {what}") from exc
     try:
         st = os.fstat(fd)
@@ -440,26 +449,75 @@ def _read_file(path: str, *, follow: bool) -> str:
         raise _invalid(f"{path}: not valid UTF-8") from exc
 
 
+_PLAIN_INT = re.compile(r"^-?(?:0|[1-9][0-9]*)$")
+
+
+class _KeyProblem(yaml.constructor.ConstructorError):
+    """A mapping-key problem whose message is safe to show (it never quotes a value)."""
+
+
 class _Loader(yaml.SafeLoader):
-    """SafeLoader that refuses duplicate and non-string mapping keys."""
+    """SafeLoader that refuses duplicate and non-string mapping keys and reads only plain
+    decimal integers as ints (YAML 1.1's ``1:30``, ``010`` and ``1_0`` stay strings)."""
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
         seen: set[str] = set()
         for key_node, _ in node.value:
             key = self.construct_object(key_node, deep=True)
+            line = key_node.start_mark.line + 1
             if not isinstance(key, str):
-                raise yaml.YAMLError(f"mapping key {key!r} is not a string")
+                raw = key_node.value if isinstance(key_node, yaml.ScalarNode) else "(not a scalar)"
+                raise _KeyProblem(
+                    None,
+                    None,
+                    f"mapping key {_printable(str(raw)[:50])} at line {line} is not a string; "
+                    "quote it",
+                    key_node.start_mark,
+                )
             if key in seen:
-                raise yaml.YAMLError(f"duplicate key {key!r}")
+                raise _KeyProblem(
+                    None, None, f"duplicate key {key[:50]!r} at line {line}", key_node.start_mark
+                )
             seen.add(key)
         return super().construct_mapping(node, deep)
+
+
+_Loader.yaml_implicit_resolvers = {
+    ch: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:int"]
+    for ch, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+for _ch in "-0123456789":
+    _Loader.yaml_implicit_resolvers.setdefault(_ch, []).append(
+        ("tag:yaml.org,2002:int", _PLAIN_INT)
+    )
+
+
+def _yaml_message(path: str, exc: yaml.YAMLError) -> str:
+    """A YAML error without any of the source text (a value on the line may be a secret)."""
+    if isinstance(exc, _KeyProblem):
+        return f"{path}: invalid YAML: {exc.problem}"
+    if isinstance(exc, yaml.MarkedYAMLError):
+        if isinstance(exc, yaml.constructor.ConstructorError):
+            what = "an unsupported or invalid YAML construct"
+        else:
+            what = " ".join(str(exc.problem or "invalid YAML").split())
+        mark = exc.problem_mark or exc.context_mark
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        return f"{path}: invalid YAML: {what}{where}"
+    if isinstance(exc, yaml.reader.ReaderError):
+        return f"{path}: invalid YAML: unacceptable character at position {exc.position}"
+    return f"{path}: invalid YAML"
 
 
 def _parse_yaml(path: str, text: str) -> dict[str, Any]:
     try:
         depth = 0
         documents = 0
+        events = 0
         for ev in yaml.parse(text, Loader=yaml.SafeLoader):
+            events += 1
+            if events > MAX_YAML_EVENTS:
+                raise _invalid(f"{path}: YAML too complex (more than {MAX_YAML_EVENTS} events)")
             if isinstance(ev, yaml.AliasEvent) or getattr(ev, "anchor", None):
                 raise _invalid(f"{path}: YAML anchors and aliases are not allowed")
             if isinstance(ev, yaml.DocumentStartEvent):
@@ -474,7 +532,9 @@ def _parse_yaml(path: str, text: str) -> dict[str, Any]:
                 depth -= 1
         data = yaml.load(text, Loader=_Loader)  # noqa: S506 (SafeLoader subclass)
     except yaml.YAMLError as exc:
-        raise _invalid(f"{path}: invalid YAML: {' '.join(str(exc).split())}") from exc
+        raise _invalid(_yaml_message(path, exc)) from exc
+    except (ValueError, OverflowError) as exc:  # bad timestamp, `!!int abc`, huge integer
+        raise _invalid(f"{path}: invalid YAML: a value could not be constructed") from exc
     except RecursionError as exc:
         raise _invalid(f"{path}: YAML nested too deeply") from exc
     if data is None:
@@ -499,7 +559,10 @@ def _dropin_paths(config_path: str) -> list[str]:
         names = sorted(os.listdir(d))
     except OSError as exc:
         raise _invalid(f"{d}: cannot read: {exc.strerror}") from exc
-    return [os.path.join(d, n) for n in names if n.endswith(".yaml") and not n.startswith(".")]
+    found = [os.path.join(d, n) for n in names if n.endswith(".yaml") and not n.startswith(".")]
+    if len(found) > MAX_DROPINS:
+        raise _invalid(f"{d}: too many drop-in files (limit {MAX_DROPINS})")
+    return found
 
 
 # ---------------------------------------------------------------- merge and validate
@@ -627,9 +690,14 @@ def load_config(config_path: str | None) -> Config:
 
     layers: list[tuple[str, dict[str, Any]]] = []
     try:
-        present = os.path.lexists(path) or explicit
+        os.lstat(path)
+        present = True
+    except (FileNotFoundError, NotADirectoryError):
+        present = explicit  # an explicit path that is missing fails when it is read
     except ValueError as exc:  # embedded NUL
         raise _invalid(f"{path!r}: invalid path") from exc
+    except OSError as exc:
+        raise _invalid(f"{path}: cannot read: {exc.strerror}") from exc
     if present:
         layers.append((path, _parse_yaml(path, _read_file(path, follow=True))))
     for dropin in _dropin_paths(path):

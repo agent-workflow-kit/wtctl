@@ -562,6 +562,113 @@ def test_deeply_nested_yaml_refused(home: Path) -> None:
     invalid(cfg_file(home, "a: " + "{b: " * 3000 + "1" + "}" * 3000 + "\n"))
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "when: 2024-13-45\n",
+        "me: {name: 2024-02-31}\n",
+        "search_depth: !!int abc\n",
+        "search_depth: " + "9" * 5000 + "\n",
+        "? 2024-13-45\n: x\n",
+    ],
+)
+def test_constructor_value_errors_are_config_invalid(home: Path, text: str) -> None:
+    path = cfg_file(home, text)
+    assert path in invalid(path).message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "token_env: [SECRETVALUE123\n",
+        "token_env: SECRETVALUE123: x: y\n",
+        "a: 1\nb: !!int SECRETVALUE123\n",
+        "a: !!SECRETVALUE123 x\n",
+        "a: !!python/object:SECRETVALUE123 x\n",
+        "a: {b: 2024-13-45 SECRETVALUE123}\nc: 'SECRETVALUE123\n",
+    ],
+)
+def test_yaml_errors_never_echo_source_text(home: Path, text: str) -> None:
+    assert "SECRETVALUE123" not in invalid(cfg_file(home, text)).message
+
+
+def test_yaml_syntax_error_reports_line_and_column(home: Path) -> None:
+    message = invalid(cfg_file(home, "a: 1\nb: [SECRETVALUE123\n")).message
+    assert "line " in message
+    assert "column " in message
+
+
+def test_too_many_yaml_events_refused(home: Path) -> None:
+    err = invalid(cfg_file(home, "mask_env:\n" + "  - A\n" * 20_000))
+    assert "too complex" in err.message
+
+
+def test_hostile_megabyte_file_fails_fast(home: Path) -> None:
+    import time
+
+    start = time.monotonic()
+    invalid(cfg_file(home, "mask_env:\n" + "- a\n" * 250_000))
+    assert time.monotonic() - start < 5
+
+
+def test_many_dropins_refused(home: Path) -> None:
+    d = home / ".config" / "wtctl" / "config.d"
+    for i in range(101):
+        write(d / f"{i:03}.yaml", "")
+    err = invalid(None)
+    assert "config.d" in err.message
+    (d / "100.yaml").unlink()
+    load_config(None)  # exactly 100 is fine
+
+
+@pytest.mark.parametrize("value", ["1:30", "010", "1_0", "0x10", "0o10", "+3"])
+def test_yaml11_integer_forms_are_not_integers(home: Path, value: str) -> None:
+    assert "search_depth" in invalid(cfg_file(home, f"search_depth: {value}\n")).message
+
+
+def test_plain_and_negative_integers_still_load(home: Path) -> None:
+    assert load_config(cfg_file(home, "search_depth: 7\ntombstone_days: 0\n")).search_depth == 7
+
+
+@pytest.mark.parametrize("word", ["no", "on", "yes", "off", "true", "null"])
+def test_non_string_key_message_says_to_quote(home: Path, word: str) -> None:
+    message = invalid(cfg_file(home, f"a: 1\n{word}: 1\n")).message
+    assert f"mapping key {word} at line 2 is not a string; quote it" in message
+
+
+def test_unescaped_control_bytes_in_errors(home: Path) -> None:
+    err = invalid(cfg_file(home, 'hosts:\n  "a\\e[31mb": {}\n'))
+    assert "\x1b" not in err.message
+    assert "\\x1b" in err.message
+
+
+def test_env_name_control_bytes_in_errors(home: Path) -> None:
+    err = invalid(cfg_file(home, 'mask_env: ["A\\eB"]\n'))
+    assert "\x1b" not in err.message
+
+
+def test_undecodable_path_bytes_are_safe_in_errors(home: Path) -> None:
+    d = home / ".config" / "wtctl" / "config.d"
+    d.mkdir(parents=True)
+    with open(os.path.join(os.fsencode(d), b"\xff.yaml"), "wb") as f:
+        f.write(b"bogus: 1\n")
+    err = invalid(None)
+    err.message.encode("utf-8")  # must not raise
+    assert "\\udcff" in err.message
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permissions are not enforced for root")
+def test_unreadable_default_config_is_an_error_naming_the_file(home: Path) -> None:
+    cfg_file(home, "search_depth: 2\n")
+    d = home / ".config" / "wtctl"
+    d.chmod(0o000)
+    try:
+        err = invalid(None)
+    finally:
+        d.chmod(0o700)
+    assert str(d / "config.yaml") in err.message
+
+
 def test_unicode_values(home: Path) -> None:
     c = load_config(
         cfg_file(home, "branch_prefix: 'prefix-é/'\nbranch_template: 'wt/{name}-日本'\n")

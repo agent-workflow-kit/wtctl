@@ -28,7 +28,7 @@ dev = [
     "pymarkdownlnt>=0.9.41",
     "jsonschema>=4.18",
     "referencing>=0.30",
-    "types-pyyaml>=6.0.12.20261113",
+    "types-pyyaml>=6.0.12.20250915",
 ]
 
 [tool.ruff]
