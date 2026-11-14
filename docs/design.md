@@ -95,6 +95,8 @@ Git worktrees, throwaway checkouts, and the mapping from repo ids to local clone
 | Module | Responsibility |
 |---|---|
 | `cli` | argparse surface, global flags, output selection, exit codes |
+| `registry` | the command table: one entry per command (words, arguments, `--dry-run` acceptance, human-only rule, owning issue); handlers are looked up as `wtctl.commands.<key>.run(ctx)`, so adding one edits no shared file |
+| `actor`, `errors`, `context` | the actor grammar and default; error codes, their exit codes and the error object; the `Context` a handler receives and the `Result` it returns |
 | `config` | YAML load, drop-in merge, env overrides, Pydantic validation, per-repo resolution |
 | `state` | `state.db` schema, migrations, leases, record queries |
 | `gateway` | the only module that runs subprocesses or reads `/proc`: git runner, bootstrap step runner, process scanner, clock |
@@ -304,6 +306,7 @@ Spikes ran on 2026-10-30 against git 2.34.1 on Ubuntu 22.04.5 (native Linux), in
 ## Dependencies
 
 - Runtime: Python 3.12+, `pyyaml` (config), `pydantic` (config validation); git 2.34+; on macOS, `lsof` (in-use detection, optional).
+- Test-only: `pytest`, `jsonschema` and `referencing`. The last two validate every golden `--json` output and hook payload against `schemas/` with a registry keyed by each schema's `$id`; the schemas use `$ref` across files and `if`/`then` conditions that a hand-written check would not cover. They are not imported by the package.
 - No awkit tool dependencies. git is called directly (binding A to a third-party CLI); no git library (`GitPython`, `pygit2`) is used, because the hardened invocation must control git's environment and arguments exactly.
 
 ## Testing
