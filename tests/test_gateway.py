@@ -61,3 +61,75 @@ def test_disable_dumpable_clears_the_flag_in_a_child_process() -> None:
     )
     r = gateway.run([sys.executable, "-c", code])
     assert r.stdout.split() == ["True", "0"], r.stderr
+
+
+MOUNTINFO = (
+    "22 28 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw\n"
+    "100 28 0:90 / /mnt/with\\040space rw,relatime shared:1 - tmpfs none rw,uid=1000\n"
+    "101 28 0:91 / /mnt/fuse rw,nosuid,nodev - fuse.sshfs me@host:/ rw,user_id=1000\n"
+    "102 28 8:1 /sub /mnt/bind rw - ext4 /dev/sda1 rw\n"
+)
+
+
+def test_parse_mountinfo_decodes_escapes_and_fields() -> None:
+    entries = gateway.parse_mountinfo(MOUNTINFO)
+    by_point = {e.mount_point: e for e in entries}
+    assert by_point["/mnt/with space"].mount_id == 100
+    assert by_point["/mnt/with space"].fstype == "tmpfs"
+    assert by_point["/mnt/fuse"].fstype == "fuse.sshfs"
+    assert by_point["/mnt/fuse"].source == "me@host:/"
+    assert by_point["/mnt/bind"].source == "/dev/sda1"
+    assert len(entries) == 4
+
+
+def test_parse_mountinfo_skips_malformed_lines() -> None:
+    assert gateway.parse_mountinfo("garbage\n\n1 2 3\n") == []
+
+
+def test_parse_mount_command_output_macos_style() -> None:
+    text = (
+        "/dev/disk3s1 on / (apfs, local, journaled)\nmacfuse@0 on /Volumes/x y (macfuse, nodev)\n"
+    )
+    entries = gateway.parse_mount_command(text)
+    assert [(e.mount_point, e.fstype) for e in entries] == [
+        ("/", "apfs"),
+        ("/Volumes/x y", "macfuse"),
+    ]
+    assert all(e.mount_id is None for e in entries)
+
+
+def test_fd_mount_id_reads_fdinfo_on_linux(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    import os
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("linux only")
+    fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        mnt = gateway.fd_mount_id(fd)
+    finally:
+        os.close(fd)
+    assert isinstance(mnt, int)
+
+
+def test_run_with_deadline_returns_output() -> None:
+    r = gateway.run_with_deadline(
+        [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read().upper())"],
+        stdin=b"abc",
+        timeout=30,
+    )
+    assert (r.returncode, r.stdout, r.timed_out) == (0, b"ABC", False)
+
+
+def test_run_with_deadline_kills_exact_pid_on_expiry() -> None:
+    import os
+
+    started: list[int] = []
+    r = gateway.run_with_deadline(
+        [sys.executable, "-c", "import time; time.sleep(600)"],
+        timeout=0.5,
+        on_start=started.append,
+    )
+    assert r.timed_out
+    assert started == [r.pid]
+    with pytest.raises(ProcessLookupError):  # reaped: the exact PID we started is gone
+        os.kill(r.pid, 0)
