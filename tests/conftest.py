@@ -30,3 +30,13 @@ def private_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
 def no_dumpable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Do not make the pytest process non-dumpable; a dedicated test covers the real call."""
     monkeypatch.setattr(gateway, "disable_dumpable", lambda: True)
+
+
+@pytest.fixture(autouse=True)
+def no_real_crontab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A default Gateway must never reach the user's real crontab; tests pass a fake."""
+
+    def refuse(args: list[str], stdin: bytes | None = None) -> object:
+        raise AssertionError(f"a test ran the real crontab: {args}")
+
+    monkeypatch.setattr(gateway, "run_crontab", refuse)

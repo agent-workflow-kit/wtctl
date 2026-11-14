@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import datetime as dt
+import shutil
 import subprocess
 import sys
 import time
@@ -32,6 +33,22 @@ def run(
         text=True,
         timeout=timeout,
         check=False,
+    )
+
+
+# --- crontab (#8) -------------------------------------------------------------------------------
+
+
+def run_crontab(args: list[str], stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run ``crontab <args>`` with bytes in and out (a crontab is rewritten without re-encoding).
+
+    Raises ``FileNotFoundError`` when there is no ``crontab`` on ``PATH``.
+    """
+    program = shutil.which("crontab")
+    if program is None:
+        raise FileNotFoundError("crontab")
+    return subprocess.run(
+        [program, *args], input=stdin, capture_output=True, timeout=30, check=False
     )
 
 
@@ -86,9 +103,17 @@ class Gateway:
     clock: Clock = field(default_factory=SystemClock)
     scanner: ProcessScanner = field(default_factory=UnavailableScanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
+    crontab_runner: Callable[..., subprocess.CompletedProcess[bytes]] = field(
+        default_factory=lambda: run_crontab  # looked up at call time, so tests can patch it
+    )
 
     def run(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return self.runner(argv, **kwargs)
+
+    def crontab(
+        self, args: list[str], stdin: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        return self.crontab_runner(args, stdin)
 
 
 _PR_SET_DUMPABLE = 4
