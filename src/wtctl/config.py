@@ -119,7 +119,7 @@ class PreHook(_Model):
 
 class Hooks(_Model):
     model_config = ConfigDict(extra="forbid", regex_engine="python-re", populate_by_name=False)
-    # TODO(#6): hooks consume these lists (order, veto, timeouts).
+    # Consumed by ``wtctl.hooks.configured_hooks`` (order, veto, timeouts).
     pre_create: list[PreHook] = Field(default_factory=list, alias="pre-create")
     post_create: list[PostHook] = Field(default_factory=list, alias="post-create")
     pre_remove: list[PreHook] = Field(default_factory=list, alias="pre-remove")
