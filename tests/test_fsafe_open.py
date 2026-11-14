@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -159,8 +160,12 @@ def test_open_file_hard_link_refused_when_link_count_matters(
 
 def test_open_file_refuses_fifo_without_blocking(root: Path, anchor: fsafe.Anchor) -> None:
     os.mkfifo(root / "fifo")
-    with pytest.raises(fsafe.FsafeError) as e:
-        fsafe.open_file(anchor, anchor.fd, "fifo")
+    signal.alarm(10)  # a regression that blocks on the FIFO is killed instead of hanging the run
+    try:
+        with pytest.raises(fsafe.FsafeError) as e:
+            fsafe.open_file(anchor, anchor.fd, "fifo")
+    finally:
+        signal.alarm(0)
     assert e.value.kind == "not_regular"
 
 

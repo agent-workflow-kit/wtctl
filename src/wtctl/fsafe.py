@@ -204,6 +204,22 @@ def identity_of(fd: int, fs: Fs = DEFAULT_FS) -> Identity:
     return Identity(st.dev, st.ino)
 
 
+def raise_fd_limit() -> None:
+    """An fd-based walk holds one fd per level of depth; raise the soft limit to the hard one.
+
+    Best effort (a failure leaves the limit alone; the walk then reports ``EMFILE`` per entry).
+    """
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = hard if hard != resource.RLIM_INFINITY else 1_048_576
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(want, 1_048_576), hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def _require_dir_fd_support() -> None:
     needed = (os.open, os.stat, os.unlink, os.rmdir, os.mkdir, os.rename)
     if not all(f in os.supports_dir_fd for f in needed) or not _O_DIRECTORY or not _O_NOFOLLOW:
@@ -290,7 +306,9 @@ def _mount_id(fs: Fs, fd: int) -> int | None:
     try:
         return fs.mount_id(fd)
     except gateway.MountTableUnavailable as exc:
-        raise FsafeError("unavailable", str(exc)) from exc
+        raise FsafeError(
+            "unavailable", str(exc), errno_=getattr(exc.__cause__, "errno", None)
+        ) from exc
 
 
 @dataclass
@@ -305,6 +323,8 @@ class Anchor:
     mnt_id: int | None
     path: str
     fs: Fs = field(default_factory=Fs, repr=False)
+    mounts_below: tuple[str, ...] = ()
+    """Absolute mount points strictly below the anchor (Linux mount table; empty without one)."""
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -345,13 +365,16 @@ def open_anchor(
 
     ``expected`` is the *recorded* identity (None only for locations wtctl never recorded).
     With ``precheck`` (the default) the mount table is read first and any mount point at or below
-    the anchor refuses it without opening it; an unreadable table fails closed. The chain from
+    the anchor path refuses it without opening it; an unreadable table fails closed. Mounts
+    strictly below the anchor do not refuse it: they are kept in ``Anchor.mounts_below`` so walks
+    skip and report them (the fd checks refuse a mount on the chain to a walk root). The chain from
     ``/`` is not compared for mounts (it may legitimately cross them).
     """
     _require_dir_fd_support()
     fs = fs or DEFAULT_FS
     comps = _split_absolute(path)
     norm = "/" + "/".join(comps)
+    below: tuple[str, ...] = ()
     if precheck:
         try:
             table = fs.mount_table()
@@ -359,13 +382,14 @@ def open_anchor(
             raise FsafeError("unavailable", str(exc), path=path) from exc
         if table is not None:
             mounts = mountpoints_under(norm, table)
-            if mounts:
+            if norm in mounts:
                 raise FsafeError(
                     "mount_point",
-                    f"mount point at or below the anchor {norm}: {', '.join(mounts)}",
+                    f"the anchor {norm} is a mount point",
                     path=norm,
-                    mounts=mounts,
+                    mounts=[norm],
                 )
+            below = tuple(mounts)
     fd = os.open("/", os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
     try:
         walked = ""
@@ -383,7 +407,7 @@ def open_anchor(
                 f"recorded {expected.dev}:{expected.ino}",
                 path=norm,
             )
-        return Anchor(fd, ident, _mount_id(fs, fd), norm, fs)
+        return Anchor(fd, ident, _mount_id(fs, fd), norm, fs, below)
     except BaseException:
         os.close(fd)
         raise
@@ -502,12 +526,17 @@ def open_file(
 @dataclass(frozen=True)
 class Entry:
     """One walked entry. ``kind``: file, dir, symlink, fifo, socket, chardev, blockdev, other, or
-    ``mount`` (on another device or mount; never opened or descended into), ``changed`` (swapped
-    while being opened) and ``unreadable``."""
+    ``mount`` (on another device or mount, or a recorded mount point; never opened or descended
+    into), ``changed`` (swapped while being opened) and ``unreadable`` (``errno`` when known)."""
 
     path: tuple[str, ...]
     kind: str
     nlink: int = 1
+    errno: int | None = None
+
+
+def _abs_join(root: str, parts: Sequence[str], name: str) -> str:
+    return root.rstrip("/") + "/" + "/".join((*parts, name))
 
 
 def walk_tree(
@@ -516,37 +545,72 @@ def walk_tree(
     *,
     limit: int | None = None,
     descend: Callable[[Entry], bool] | None = None,
+    dirs_only: bool = False,
+    root_path: str | None = None,
 ) -> Iterator[Entry]:
     """Depth-first, pre-order walk below ``root_fd`` without following links or crossing mounts.
 
-    Iterative (a hostile 100k-deep tree cannot exhaust the interpreter stack). Non-regular
+    Iterative (a hostile 100k-deep tree cannot exhaust the interpreter stack) and linear in
+    memory (one shared name stack; a path tuple is built only for the entry emitted). Non-regular
     entries are reported by type only. ``descend(entry)`` may veto entering a directory (for
     example to stop at a nested ``.git``). More than ``limit`` entries raises
-    ``FsafeError("limit")``.
+    ``FsafeError("limit")``, checked while each directory is read, so a huge directory is never
+    listed whole. With ``dirs_only`` non-directories are skipped before they are counted.
+    ``root_path`` (the absolute path of ``root_fd``) enables skipping the anchor's recorded
+    ``mounts_below`` by path, without opening them.
     A file that is a bind-mount over another file on the same device is only detected when it is
     opened (``open_file``), since a walk does not open regular files.
     """
+    raise_fd_limit()
     fs = anchor.fs
     count = 0
-    stack: list[tuple[int, tuple[str, ...], deque[str], bool]] = []
-    names = deque(sorted(os.listdir(root_fd)))
-    stack.append((root_fd, (), names, False))
+    read = 0
+    mounts = frozenset(anchor.mounts_below) if root_path is not None else frozenset()
+    mount_names = {m.rsplit("/", 1)[-1] for m in mounts}
+
+    def read_names(fd: int) -> deque[str]:
+        nonlocal read
+        names: list[str] = []
+        with os.scandir(fd) as it:
+            for e in it:
+                if dirs_only:
+                    try:
+                        if not e.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                read += 1
+                if limit is not None and read > limit:
+                    raise FsafeError("limit", f"more than {limit} entries")
+                names.append(e.name)
+        names.sort()
+        return deque(names)
+
+    stack: list[tuple[int, deque[str], bool]] = [(root_fd, read_names(root_fd), False)]
+    parts: list[str] = []  # names of the open owned directories, root excluded
     try:
         while stack:
-            fd, path, pending, _owned = stack[-1]
+            fd, pending, owned = stack[-1]
             if not pending:
                 stack.pop()
-                if _owned:
+                if owned:
                     os.close(fd)
+                    parts.pop()
                 continue
             name = pending.popleft()
-            epath = (*path, name)
+            if (
+                name in mount_names
+                and root_path is not None
+                and _abs_join(root_path, parts, name) in mounts
+            ):
+                yield Entry((*parts, name), "mount")
+                continue
             try:
                 st = fs.lstat_at(fd, name)
             except FileNotFoundError:
                 continue
-            except OSError:
-                yield Entry(epath, "unreadable")
+            except OSError as exc:
+                yield Entry((*parts, name), "unreadable", errno=exc.errno)
                 continue
             count += 1
             if limit is not None and count > limit:
@@ -554,39 +618,50 @@ def walk_tree(
             kind = kind_of_mode(st.mode)
             if kind != "dir":
                 if st.dev != anchor.identity.dev:
-                    yield Entry(epath, "mount")
+                    yield Entry((*parts, name), "mount")
                 else:
-                    yield Entry(epath, kind, st.nlink)
+                    yield Entry((*parts, name), kind, st.nlink)
                 continue
             try:
                 child = open_dir(anchor, fd, name)
             except FsafeError as exc:
                 if exc.kind == "mount_point":
-                    yield Entry(epath, "mount")
+                    yield Entry((*parts, name), "mount")
                 elif exc.kind == "missing":
                     pass
                 elif exc.kind in ("symlink", "not_dir"):
-                    yield Entry(epath, "changed")
+                    yield Entry((*parts, name), "changed")
                 else:
-                    yield Entry(epath, "unreadable")
+                    yield Entry((*parts, name), "unreadable", errno=exc.errno)
                 continue
             cst = fs.fstat(child)
             if (cst.dev, cst.ino) != (st.dev, st.ino):
                 os.close(child)
-                yield Entry(epath, "changed")
+                yield Entry((*parts, name), "changed")
                 continue
-            entry = Entry(epath, "dir", st.nlink)
-            yield entry
-            if descend is not None and not descend(entry):
+            entry = Entry((*parts, name), "dir", st.nlink)
+            try:
+                yield entry
+                enter = descend is None or descend(entry)
+            except BaseException:
+                os.close(child)
+                raise
+            if not enter:
                 os.close(child)
                 continue
             try:
-                stack.append((child, epath, deque(sorted(os.listdir(child))), True))
-            except OSError:
+                names = read_names(child)
+            except OSError as exc:
                 os.close(child)
-                yield Entry(epath, "unreadable")
+                yield Entry((*parts, name), "unreadable", errno=exc.errno)
+                continue
+            except BaseException:
+                os.close(child)
+                raise
+            stack.append((child, names, True))
+            parts.append(name)
     finally:
-        for fd, _path, _pending, owned in stack:
+        for fd, _pending, owned in stack:
             if owned:
                 os.close(fd)
 
@@ -603,28 +678,68 @@ class Remaining:
     errno: int | None = None
 
 
+REMAINING_CAP = 100  # docs/interface.md: details.remaining holds at most 100 entries
+
+
 @dataclass
 class DeleteResult:
+    """``remaining`` holds the first ``REMAINING_CAP`` entries left; ``remaining_total`` counts all.
+
+    Names are raw (they may contain a newline or other control characters); the consumer escapes
+    them when it builds ``details.remaining``.
+    """
+
     removed: int = 0
     remaining: list[Remaining] = field(default_factory=list)
+    remaining_total: int = 0
+
+    def add(self, item: Remaining) -> None:
+        self.remaining_total += 1
+        # todo(#14): escape newline names in details.remaining (raw names are kept here)
+        if len(self.remaining) < REMAINING_CAP:
+            self.remaining.append(item)
 
     @property
     def complete(self) -> bool:
-        return not self.remaining
+        return self.remaining_total == 0
 
 
 Hook = Callable[[str, tuple[str, ...]], None]
 
 
-def _open_dir_for_delete(anchor: Anchor, parent_fd: int, name: str, lst: FdStat, owner: int) -> int:
-    """Open a directory for emptying; grant ``u+rwx`` on one we own that lacks it."""
+def _open_dir_for_delete(
+    anchor: Anchor,
+    parent_fd: int,
+    name: str,
+    lst: FdStat,
+    owner: int,
+    expected: Identity | None = None,
+) -> int:
+    """Open a directory for emptying; grant ``u+rwx`` on one we own that lacks it.
+
+    Nothing is chmodded before the opened inode is verified: ``(dev, ino)`` equal to ``lst`` (what
+    the caller classified) and to ``expected`` (the recorded id) when given, else
+    ``FsafeError("identity")`` and the mode stays as it was.
+    """
+
+    def check(st: FdStat) -> None:
+        if (st.dev, st.ino) != (lst.dev, lst.ino):
+            raise FsafeError("identity", f"{name}: changed while opening", path=name)
+        if expected is not None and Identity(st.dev, st.ino) != expected:
+            raise FsafeError(
+                "identity",
+                f"{name} has identity {st.dev}:{st.ino}, recorded {expected.dev}:{expected.ino}",
+                path=name,
+            )
+
     try:
         fd = open_dir(anchor, parent_fd, name)
     except FsafeError as exc:
         if exc.kind != "permission" or lst.uid != owner or not hasattr(os, "O_PATH"):
             raise
         # An owned directory without read permission (mode 000): open it by O_PATH, check it is
-        # the very inode we classified, and chmod through the fd (never by name).
+        # the very inode we classified, on the anchor's device and mount, and chmod through the
+        # fd (never by name).
         try:
             pfd = os.open(
                 name, os.O_PATH | _O_NOFOLLOW | _O_DIRECTORY | _O_CLOEXEC, dir_fd=parent_fd
@@ -632,8 +747,9 @@ def _open_dir_for_delete(anchor: Anchor, parent_fd: int, name: str, lst: FdStat,
         except OSError as exc2:
             raise _map_oserror(exc2, name) from exc2
         try:
-            pst = anchor.fs.fstat(pfd)
-            if (pst.dev, pst.ino) != (lst.dev, lst.ino) or pst.uid != owner:
+            pst = anchor.verify_fd(pfd, name)
+            check(pst)
+            if pst.uid != owner:
                 raise FsafeError(
                     "permission", f"{name}: changed while fixing permissions", path=name
                 )
@@ -645,22 +761,30 @@ def _open_dir_for_delete(anchor: Anchor, parent_fd: int, name: str, lst: FdStat,
         fd = open_dir(anchor, parent_fd, name)
     try:
         st = anchor.fs.fstat(fd)
+        check(st)
         if st.uid == owner and stat.S_IMODE(st.mode) & 0o700 != 0o700:
             os.fchmod(fd, stat.S_IMODE(st.mode) | 0o700)
     except OSError as exc:
         os.close(fd)
         raise _map_oserror(exc, name) from exc
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
 @dataclass
 class _Frame:
     fd: int
-    path: tuple[str, ...]
     names: list[str]
     name: str
     parent_fd: int
     dirty: bool = False
+
+
+def _frame_path(stack: Sequence[_Frame]) -> tuple[str, ...]:
+    """Names of the open directories below the root frame (built only when needed)."""
+    return tuple(fr.name for fr in stack[1:])
 
 
 def delete_tree(
@@ -671,6 +795,7 @@ def delete_tree(
     hook: Hook | None = None,
     expected: Identity | None = None,
     owner_uid: int | None = None,
+    parent_path: str | None = None,
 ) -> DeleteResult:
     """Delete directory ``name`` of ``parent_fd`` and everything below it, fd-based.
 
@@ -678,15 +803,26 @@ def delete_tree(
     another device or mount (reported ``mount_point``), grants ``u+rwx`` only on directories owned
     by ``owner_uid`` (default: the effective user), and returns everything it could not remove
     instead of raising. A root that is a symlink or not a directory, or whose identity differs
-    from ``expected`` (the recorded ``dir_id``), raises before anything is deleted.
+    from ``expected`` (the recorded ``dir_id``), raises before anything is deleted or chmodded.
+    ``parent_path`` (the absolute path of ``parent_fd``) enables skipping the anchor's recorded
+    ``mounts_below`` by path, without opening them.
 
     ``hook(stage, path)`` is a test seam called after an entry was classified (``classified``)
     and after a directory was opened (``opened``).
     """
     check_component(name)
+    raise_fd_limit()
     fs = anchor.fs
     owner = os.geteuid() if owner_uid is None else owner_uid
     result = DeleteResult()
+    mounts = frozenset(anchor.mounts_below) if parent_path is not None else frozenset()
+    mount_names = {m.rsplit("/", 1)[-1] for m in mounts}
+
+    def is_mount(stack: Sequence[_Frame], entry: str) -> bool:
+        if parent_path is None or entry not in mount_names:
+            return False
+        return _abs_join(parent_path, [fr.name for fr in stack], entry) in mounts
+
     try:
         rst = fs.lstat_at(parent_fd, name)
     except FileNotFoundError:
@@ -697,34 +833,29 @@ def delete_tree(
         raise FsafeError("symlink", f"{name}: is a symbolic link", path=name)
     if not stat.S_ISDIR(rst.mode):
         raise FsafeError("not_dir", f"{name}: not a directory", path=name)
+    if parent_path is not None and is_mount([], name):
+        result.add(Remaining((), "mount_point"))
+        return result
     try:
-        root = _open_dir_for_delete(anchor, parent_fd, name, rst, owner)
+        root = _open_dir_for_delete(anchor, parent_fd, name, rst, owner, expected)
     except FsafeError as exc:
         if exc.kind == "mount_point":
-            result.remaining.append(Remaining((), "mount_point"))
+            result.add(Remaining((), "mount_point"))
             return result
         raise
     try:
-        got = identity_of(root, fs)
-        if (got.dev, got.ino) != (rst.dev, rst.ino):
-            raise FsafeError("identity", f"{name}: changed while opening", path=name)
-        if expected is not None and got != expected:
-            raise FsafeError(
-                "identity",
-                f"{name} has identity {got.dev}:{got.ino}, recorded {expected.dev}:{expected.ino}",
-                path=name,
-            )
         names = os.listdir(root)
     except BaseException:
         os.close(root)
         raise
-    stack = [_Frame(root, (), names, name, parent_fd)]
+    stack = [_Frame(root, names, name, parent_fd)]
     try:
         while stack:
             f = stack[-1]
             if f.names:
-                _delete_entry(anchor, stack, f.names.pop(), result, owner, hook)
+                _delete_entry(anchor, stack, f.names.pop(), result, owner, hook, is_mount)
                 continue
+            path = _frame_path(stack)
             stack.pop()
             os.close(f.fd)
             f.fd = -1
@@ -738,8 +869,13 @@ def delete_tree(
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                reason = "not_empty" if exc.errno in (errno.ENOTEMPTY, errno.EEXIST) else "error"
-                result.remaining.append(Remaining(f.path, reason, exc.errno))
+                if exc.errno == errno.EBUSY:
+                    reason = "mount_point"
+                elif exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    reason = "not_empty"
+                else:
+                    reason = "error"
+                result.add(Remaining(path, reason, exc.errno))
                 if stack:
                     stack[-1].dirty = True
     finally:
@@ -756,14 +892,17 @@ def _delete_entry(
     result: DeleteResult,
     owner: int,
     hook: Hook | None,
+    is_mount: Callable[[Sequence[_Frame], str], bool],
 ) -> None:
     f = stack[-1]
-    path = (*f.path, name)
 
     def fail(reason: str, err: int | None = None) -> None:
-        result.remaining.append(Remaining(path, reason, err))
+        result.add(Remaining((*_frame_path(stack), name), reason, err))
         f.dirty = True
 
+    if is_mount(stack, name):
+        fail("mount_point")
+        return
     try:
         st = anchor.fs.lstat_at(f.fd, name)
     except FileNotFoundError:
@@ -772,13 +911,16 @@ def _delete_entry(
         fail("error", exc.errno)
         return
     if hook is not None:
-        hook("classified", path)
+        hook("classified", (*_frame_path(stack), name))
     if stat.S_ISDIR(st.mode):
         try:
             child = _open_dir_for_delete(anchor, f.fd, name, st, owner)
         except FsafeError as exc:
             if exc.kind == "mount_point":
                 fail("mount_point")
+                return
+            if exc.kind == "identity":  # not the directory we classified; nothing was chmodded
+                fail("raced")
                 return
             if exc.kind == "missing":
                 return
@@ -787,20 +929,15 @@ def _delete_entry(
                 return
             # swapped for a non-directory after it was classified: unlink that entry below
         else:
-            cst = anchor.fs.fstat(child)
-            if (cst.dev, cst.ino) != (st.dev, st.ino):
-                os.close(child)
-                fail("raced")
-                return
             if hook is not None:
-                hook("opened", path)
+                hook("opened", (*_frame_path(stack), name))
             try:
                 names = os.listdir(child)
             except OSError as exc:
                 os.close(child)
                 fail("error", exc.errno)
                 return
-            stack.append(_Frame(child, path, names, name, f.fd))
+            stack.append(_Frame(child, names, name, f.fd))
             return
     try:
         os.unlink(name, dir_fd=f.fd)
@@ -808,7 +945,7 @@ def _delete_entry(
     except FileNotFoundError:
         pass
     except OSError as exc:
-        fail("error", exc.errno)
+        fail("mount_point" if exc.errno == errno.EBUSY else "error", exc.errno)
 
 
 # ---- writes -----------------------------------------------------------------------------

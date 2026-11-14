@@ -69,18 +69,27 @@ def run_with_deadline(
         env=None if env is None else dict(env),
         close_fds=True,
     )
-    if on_start is not None:
-        on_start(proc.pid)
     try:
-        out, err = proc.communicate(stdin, timeout=max(timeout, 0.0))
-        return DeadlineResult(proc.pid, proc.returncode, out, err, False)
-    except subprocess.TimeoutExpired:
+        if on_start is not None:
+            on_start(proc.pid)
+        try:
+            out, err = proc.communicate(stdin, timeout=max(timeout, 0.0))
+            return DeadlineResult(proc.pid, proc.returncode, out, err, False)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:  # still stuck in the kernel: report, never block
+                out, err = b"", b""
+            return DeadlineResult(proc.pid, None, out, err, True)
+    except BaseException:
+        # on_start raised or we were interrupted: never leave the child running
         proc.kill()
         try:
-            out, err = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:  # still stuck in the kernel: report, never block
-            out, err = b"", b""
-        return DeadlineResult(proc.pid, None, out, err, True)
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
 
 
 @dataclass(frozen=True)

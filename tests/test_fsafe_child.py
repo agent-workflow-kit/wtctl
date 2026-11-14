@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from wtctl import fsafe, fsafe_child
-from wtctl.fsafe import Identity
 
 
 def ident(p: Path) -> list[int]:
@@ -66,6 +65,7 @@ def test_delete_op_deletes_and_reports(tmp_path: Path) -> None:
     )
     assert res.ok and res.value is not None
     assert res.value["remaining"] == [] and res.value["removed"] == 3
+    assert res.value["remaining_total"] == 0
     assert not (tmp_path / "wt").exists()
 
 
@@ -134,4 +134,28 @@ def test_budget_limits_the_per_walk_deadline(tmp_path: Path) -> None:
 def test_default_deadlines_are_the_specified_constants() -> None:
     assert fsafe_child.WALK_DEADLINE == 60.0
     assert fsafe_child.REMOVE_DEADLINE == 300.0
-    assert Identity(1, 2) == Identity(1, 2) and fsafe.DEFAULT_SCAN_LIMIT == 2_000_000
+    assert fsafe.DEFAULT_SCAN_LIMIT == 2_000_000
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permissions")
+def test_walk_op_reports_unreadable_entries_apart_from_special(tmp_path: Path) -> None:
+    (tmp_path / "locked").mkdir()
+    os.chmod(tmp_path / "locked", 0o000)
+    os.mkfifo(tmp_path / "fifo")
+    try:
+        res = fsafe_child.run_op("walk", anchor_args(tmp_path))
+    finally:
+        os.chmod(tmp_path / "locked", 0o755)
+    assert res.ok and res.value is not None
+    assert res.value["unreadable"] == [[["locked"], "unreadable", 13]]
+    assert res.value["special"] == [[["fifo"], "fifo"]]
+
+
+def test_walk_op_dirs_only(tmp_path: Path) -> None:
+    for i in range(10):
+        (tmp_path / f"f{i}").write_text("x")
+    (tmp_path / "d").mkdir()
+    res = fsafe_child.run_op("walk", {**anchor_args(tmp_path), "limit": 2, "dirs_only": True})
+    assert (
+        res.ok and res.value is not None and res.value["count"] == 2
+    )  # d, and the conftest home dir

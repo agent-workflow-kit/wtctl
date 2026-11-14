@@ -34,11 +34,16 @@ def main() -> None:
 
     out: dict[str, object] = {}
 
-    # 1. pre-check (mountinfo) refuses an anchor with mount points below it
+    # 1. the pre-check records mounts below the anchor and still opens it (they are skipped later)
     try:
-        fsafe.open_anchor(str(tree))
+        a0 = fsafe.open_anchor(str(tree))
         out["precheck_kind"] = None
+        out["precheck_mounts"] = [Path(m).name for m in a0.mounts_below]
+        out["walk_precheck"] = {
+            "/".join(e.path): e.kind for e in fsafe.walk_tree(a0, a0.fd, root_path=str(tree))
+        }
     except fsafe.FsafeError as e:
+        a0 = None
         out["precheck_kind"] = e.kind
         out["precheck_mounts"] = [Path(m).name for m in e.mounts]
 
@@ -60,6 +65,10 @@ def main() -> None:
     out["tmp_kept"] = (tree / "tmp" / "inner").read_text() == "inner"
     out["plain_gone"] = not (tree / "plain").exists()
     a.close()
+    if a0 is not None:
+        res0 = fsafe.delete_tree(a0, os.open(work, os.O_RDONLY), "tree", parent_path=str(work))
+        out["remaining_precheck"] = sorted(["/".join(r.path), r.reason] for r in res0.remaining)
+        a0.close()
 
     # 4. an anchor that is itself a mount point
     try:

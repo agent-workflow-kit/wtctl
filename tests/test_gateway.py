@@ -133,3 +133,27 @@ def test_run_with_deadline_kills_exact_pid_on_expiry() -> None:
     assert started == [r.pid]
     with pytest.raises(ProcessLookupError):  # reaped: the exact PID we started is gone
         os.kill(r.pid, 0)
+
+
+def test_run_with_deadline_kills_the_child_when_on_start_raises() -> None:
+    import os
+    import signal
+
+    started: list[int] = []
+
+    def boom(pid: int) -> None:
+        started.append(pid)
+        raise RuntimeError("on_start failed")
+
+    with pytest.raises(RuntimeError):
+        gateway.run_with_deadline(
+            [sys.executable, "-c", "import time; time.sleep(600)"], timeout=30, on_start=boom
+        )
+    alive = True
+    try:
+        os.kill(started[0], 0)
+    except ProcessLookupError:
+        alive = False
+    if alive:  # only if the fix regressed: do not leak the sleeper
+        os.kill(started[0], signal.SIGKILL)
+    assert not alive

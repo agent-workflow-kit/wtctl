@@ -65,7 +65,8 @@ def _identity(raw: object) -> fsafe.Identity | None:
     raise fsafe.FsafeError("bad_request", f"not an identity: {raw!r}")
 
 
-def _open_root(args: dict[str, object], *, parent: bool) -> tuple[fsafe.Anchor, int]:
+def _open_root(args: dict[str, object], *, parent: bool) -> tuple[fsafe.Anchor, int, str]:
+    """Open the anchor and the chain; returns ``(anchor, fd, absolute path of fd)``."""
     spec = args["anchor"]
     chain = args.get("chain", [])
     if not isinstance(spec, dict) or not isinstance(chain, list):
@@ -81,7 +82,7 @@ def _open_root(args: dict[str, object], *, parent: bool) -> tuple[fsafe.Anchor, 
     except BaseException:
         anchor.close()
         raise
-    return anchor, fd
+    return anchor, fd, "/".join([anchor.path.rstrip("/"), *[str(c) for c in chain]]) or "/"
 
 
 def op_walk(args: dict[str, object]) -> dict[str, object]:
@@ -90,28 +91,40 @@ def op_walk(args: dict[str, object]) -> dict[str, object]:
     if not isinstance(limit, int):
         raise fsafe.FsafeError("bad_request", "limit must be an integer")
     stop_at_git = bool(args.get("stop_at_git", False))
-    anchor, root = _open_root(args, parent=False)
+    dirs_only = bool(args.get("dirs_only", False))
+    anchor, root, root_path = _open_root(args, parent=False)
     count = 0
     mounts: list[list[str]] = []
     special: list[list[object]] = []
+    unreadable: list[list[object]] = []  # entries the walk could not read: an incomplete walk
     dotgit: list[list[str]] = []
 
     def descend(e: fsafe.Entry) -> bool:
         return not (stop_at_git and fsafe.is_dotgit(e.path[-1]))
 
     try:
-        for e in fsafe.walk_tree(anchor, root, limit=limit, descend=descend):
+        for e in fsafe.walk_tree(
+            anchor, root, limit=limit, descend=descend, dirs_only=dirs_only, root_path=root_path
+        ):
             count += 1
             if fsafe.is_dotgit(e.path[-1]):
                 dotgit.append(list(e.path))
             if e.kind == "mount":
                 mounts.append(list(e.path))
+            elif e.kind in ("unreadable", "changed"):
+                unreadable.append([list(e.path), e.kind, e.errno])
             elif e.kind not in ("file", "dir"):
                 special.append([list(e.path), e.kind])
     finally:
         os.close(root)
         anchor.close()
-    return {"count": count, "mounts": mounts, "special": special, "dotgit": dotgit}
+    return {
+        "count": count,
+        "mounts": mounts,
+        "special": special,
+        "unreadable": unreadable,
+        "dotgit": dotgit,
+    }
 
 
 def op_delete_tree(args: dict[str, object]) -> dict[str, object]:
@@ -120,14 +133,17 @@ def op_delete_tree(args: dict[str, object]) -> dict[str, object]:
     if not isinstance(name, str):
         raise fsafe.FsafeError("bad_request", "name must be a string")
     root_identity = _identity(args.get("root_identity"))
-    anchor, parent = _open_root(args, parent=True)
+    anchor, parent, parent_path = _open_root(args, parent=True)
     try:
-        res = fsafe.delete_tree(anchor, parent, name, expected=root_identity)
+        res = fsafe.delete_tree(
+            anchor, parent, name, expected=root_identity, parent_path=parent_path
+        )
     finally:
         os.close(parent)
         anchor.close()
     return {
         "removed": res.removed,
+        "remaining_total": res.remaining_total,
         "remaining": [
             {"path": list(r.path), "reason": r.reason, "errno": r.errno} for r in res.remaining
         ],
@@ -140,21 +156,8 @@ OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
 }
 
 
-def _raise_fd_limit() -> None:
-    """An fd-based walk holds one fd per level of depth; use the hard limit (best effort)."""
-    try:
-        import resource
-
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        want = hard if hard != resource.RLIM_INFINITY else 1_048_576
-        if soft != resource.RLIM_INFINITY and soft < want:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (min(want, 1_048_576), hard))
-    except (ImportError, ValueError, OSError):
-        pass
-
-
 def main() -> int:
-    _raise_fd_limit()
+    fsafe.raise_fd_limit()
     try:
         req = json.loads(sys.stdin.read())
         op = req["op"]

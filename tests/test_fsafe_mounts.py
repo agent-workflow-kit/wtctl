@@ -43,12 +43,11 @@ def test_precheck_refuses_mount_at_the_anchor(tmp_path: Path) -> None:
     assert e.value.kind == "mount_point"
 
 
-def test_precheck_refuses_mount_below_the_anchor(tmp_path: Path) -> None:
-    fs = FakeFs(table=[entry(str(tmp_path / "x" / "y"))])
-    with pytest.raises(fsafe.FsafeError) as e:
-        fsafe.open_anchor(str(tmp_path), fs=fs)
-    assert e.value.kind == "mount_point"
-    assert str(tmp_path / "x" / "y") in e.value.message
+def test_precheck_records_mounts_below_the_anchor_without_refusing(tmp_path: Path) -> None:
+    below = str(tmp_path / "x" / "y")
+    fs = FakeFs(table=[entry(below)])
+    with fsafe.open_anchor(str(tmp_path), fs=fs) as a:
+        assert a.mounts_below == (below,)
 
 
 def test_precheck_allows_mounts_above_and_beside_the_anchor(tmp_path: Path) -> None:
@@ -240,7 +239,11 @@ SCENARIO = Path(__file__).with_name("userns_scenario.py")
 @pytest.fixture
 def userns(tmp_path: Path) -> list[str]:
     if not _userns_works(tmp_path):
-        pytest.skip("unprivileged user+mount namespaces are not available here")
+        pytest.skip(
+            "real mount tests skipped: unprivileged user+mount namespaces are unavailable here "
+            "(for example AppArmor restricts them on recent Ubuntu runners); only the FakeFs "
+            "seam tests ran"
+        )
     return [str(shutil.which("unshare")), "-Urm", sys.executable, str(SCENARIO)]
 
 
@@ -259,9 +262,16 @@ def test_real_tmpfs_and_bind_mounts_are_found_skipped_and_never_crossed(
     userns: list[str], tmp_path: Path
 ) -> None:
     out = _scenario(userns, tmp_path)
-    # the pre-check sees both mounts below the anchor and refuses without opening it
-    assert out["precheck_kind"] == "mount_point"
+    # the pre-check records both mounts below the anchor and does not refuse it
+    assert out["precheck_kind"] is None
     assert sorted(out["precheck_mounts"]) == ["bind", "tmp"]  # type: ignore[arg-type]
+    # pre-check on: both are skipped by path without being opened and reported
+    assert out["walk_precheck"] == {
+        "bind": "mount",
+        "tmp": "mount",
+        "plain": "dir",
+        "plain/f": "file",
+    }
     # with the pre-check off (a mount made after it), the fd checks still catch both kinds
     assert out["walk"] == {"bind": "mount", "tmp": "mount", "plain": "dir", "plain/f": "file"}
     assert out["chain_tmp"] == "mount_point"
@@ -269,6 +279,7 @@ def test_real_tmpfs_and_bind_mounts_are_found_skipped_and_never_crossed(
     assert out["bind_same_dev"] is True
     # deletion skipped both and reported them; the victims behind them are untouched
     assert sorted(out["remaining"]) == [["bind", "mount_point"], ["tmp", "mount_point"]]  # type: ignore[arg-type]
+    assert sorted(out["remaining_precheck"]) == [["bind", "mount_point"], ["tmp", "mount_point"]]  # type: ignore[arg-type]
     assert out["victim_kept"] is True
     assert out["tmp_kept"] is True
     assert out["plain_gone"] is True
