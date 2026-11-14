@@ -39,15 +39,19 @@ def edit(
     state = ctx.state
     record = state.resolve(ctx.args.target)  # a tombstone is never a target: 10 with details
     record_id = record["id"]
-    if ctx.dry_run:
-        # Every check, no change, no lease (the record may be mid-create).
-        after = labelmod.render(preview(_pairs(record["labels"]), labels))
-    else:
-        with state.lease(record_lease(record_id), wait=lease_wait(ctx)):
+    # The lease is taken in both modes: a dry run must report `busy` like the real call would
+    # (only `status` and `remove --dry-run` are exempt). Only the write is skipped for a dry run.
+    with state.lease(record_lease(record_id), wait=lease_wait(ctx)):
+        # Re-read inside the lease: a concurrent change may have landed since `resolve`.
+        current = state.get_record(record_id)
+        before = current["labels"] if current is not None else record["labels"]
+        if ctx.dry_run:
+            after = labelmod.render(preview(_pairs(before), labels))
+        else:
             # TODO(#5): write the `label` log record (event `label`, id, repo, actor,
             # decision_ids, details: the labels requested and the result) after this succeeds.
             after = apply(state, record_id, labels)
-    changed = _pairs(after) != _pairs(record["labels"])
+    changed = _pairs(after) != _pairs(before)
     note = " (dry run)" if ctx.dry_run else ""
     summary = f"{record_id}: {verb}{note}, {len(after)} label(s)" + (
         "" if changed else ", unchanged"

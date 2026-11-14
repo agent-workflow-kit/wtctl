@@ -188,12 +188,47 @@ def test_dry_run_still_runs_every_check(capsys, st) -> None:  # noqa: ANN001
     assert cli(capsys, st, "--dry-run", "label", "add", "wt-qqqqqqqq", "n=1").code == 10
 
 
-def test_dry_run_takes_no_lease(capsys, st) -> None:  # noqa: ANN001
-    seed(st, A)
+def test_dry_run_is_busy_while_a_live_holder_has_the_record_lease(
+    capsys,
+    st,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    seed(st, A, state="creating")
     other = State(st.path, st.gateway, pid=200)
     st.gateway.procs.table[200] = "s200"  # type: ignore[attr-defined]
+    monkeypatch.setattr(label_edit, "lease_wait", lambda ctx: 0.0)
     with other.lease(record_lease(A), wait=0):
-        assert cli(capsys, st, "--dry-run", "label", "add", A, "k=1").code == 0
+        r = cli(capsys, st, "--json", "--dry-run", "label", "add", A, "k=1")
+        assert r.code == 12
+        assert r.json()["error"]["code"] == "busy"
+    assert st.try_lease(record_lease(A)) is not None  # and the lease is released afterwards
+
+
+def test_dry_run_releases_the_lease_and_changes_nothing(capsys, st) -> None:  # noqa: ANN001
+    seed(st, A)
+    assert cli(capsys, st, "--dry-run", "label", "add", A, "k=1").code == 0
+    assert labels_of(st, A) == []
+    assert st.try_lease(record_lease(A)) is not None
+
+
+def test_summary_is_unchanged_when_a_concurrent_add_lands_before_the_lease(
+    capsys,
+    st,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    seed(st, A)
+    real = State.resolve
+
+    def resolve_then_race(self: State, selector: str, **kw):  # noqa: ANN003, ANN202
+        rec = real(self, selector, **kw)
+        self.add_labels(rec["id"], ["k=1"])  # another process adds the same pair
+        return rec
+
+    monkeypatch.setattr(State, "resolve", resolve_then_race)
+    r = cli(capsys, st, "label", "add", A, "k=1")
+    assert r.code == 0
+    assert "unchanged" in r.err
+    assert labels_of(st, A) == ["k=1"]
 
 
 def test_busy_when_another_process_holds_the_record_lease(

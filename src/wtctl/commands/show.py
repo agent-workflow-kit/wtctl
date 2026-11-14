@@ -29,7 +29,8 @@ def render_human(obj: dict[str, Any]) -> str:
             )
             for i, step in enumerate(value["steps"], 1):
                 argv = " ".join(step["argv"])
-                lines.append(f"  step {i}: {_scalar(argv)} exit={_scalar(step['exit'])}")
+                code = "killed" if step["exit"] is None else _scalar(step["exit"])
+                lines.append(f"  step {i}: {_scalar(argv)} exit={code}")
                 if step["exit"] != 0 and step["output_tail"]:
                     lines.append(f"    output: {_scalar(step['output_tail'])}")
         elif value is None:

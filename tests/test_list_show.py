@@ -290,8 +290,17 @@ def test_list_older_than_compares_created(capsys, st, clock) -> None:  # noqa: A
 
 
 @pytest.mark.parametrize(
-    "bad", ["0s", "1", "h", "-1h", "1.5h", "1y", "1h\n", " 1h", "9" * 30 + "d"]
+    "huge",
+    ["999999d", "400000d", "999999999w", "99999999999d", "9" * 30 + "d", "9" * 5000 + "w"],
 )
+def test_list_older_than_huge_duration_matches_nothing(capsys, st, huge: str) -> None:  # noqa: ANN001
+    seed(st, A)
+    r = cli(capsys, st, "--json", "list", "--older-than", huge)
+    assert r.code == 0
+    assert ids(r) == []
+
+
+@pytest.mark.parametrize("bad", ["0s", "1", "h", "-1h", "1.5h", "1y", "1h\n", " 1h"])
 def test_list_bad_older_than_is_usage(capsys, st, bad: str) -> None:  # noqa: ANN001
     assert cli(capsys, st, "--json", "list", "--older-than", bad).code == 2
 
@@ -337,3 +346,15 @@ def test_list_labels_are_in_json_but_not_a_table_column(capsys, st) -> None:  # 
 
 def test_list_dry_run_is_rejected(capsys, st) -> None:  # noqa: ANN001
     assert cli(capsys, st, "--dry-run", "list").code == 2
+
+
+def test_show_human_renders_a_null_step_exit_as_killed(capsys, st) -> None:  # noqa: ANN001
+    seed(st, A, bootstrap_state="failed")
+    with st._txn() as c:
+        c.execute(
+            "INSERT INTO bootstrap_runs VALUES (?,?,?,?,?,?,?,?)",
+            (A, 1, 1, '["make","test"]', None, None, None, "t"),
+        )
+    out = cli(capsys, st, "show", A).out
+    assert "exit=killed" in out
+    assert "exit=None" not in out

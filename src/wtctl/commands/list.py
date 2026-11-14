@@ -22,7 +22,8 @@ HEADERS = ("ID", "TYPE", "STATE", "REPO", "NAME/REF", "BRANCH", "AGE")
 
 
 def _timestamp(moment: dt.datetime) -> str:
-    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    # Not strftime: %Y is not zero-padded for years < 1000 on glibc, which breaks string order.
+    return f"{moment.year:04d}" + moment.strftime("-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _age(created: str, now: dt.datetime) -> str:
@@ -60,7 +61,13 @@ def run(ctx: Context) -> Result:
             raise UsageError(f"unknown state {s!r}: expected one of {', '.join(STATES)}")
     older = parse_duration(args.older_than, flag="--older-than") if args.older_than else None
     now = ctx.gateway.clock.now()
-    cutoff = _timestamp(now - dt.timedelta(seconds=older)) if older is not None else None
+    cutoff: str | None = None
+    if older is not None:
+        try:
+            cutoff = _timestamp(now - dt.timedelta(seconds=older))
+        except OverflowError:
+            # Older than anything representable: nothing can match.
+            return Result(data={"records": [], "foreign": []}, human="")
     object_type = "throwaway" if args.throwaways else "worktree" if args.worktrees else None
     # `--state` names tombstones explicitly; without it only live records are listed.
     found = ctx.state.records(
