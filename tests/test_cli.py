@@ -620,13 +620,11 @@ def test_config_and_state_are_lazy_and_cached(
 def test_default_seams_raise_not_implemented_internal(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def handler(ctx: Context) -> Result:
-        return Result({"c": ctx.config})
-
-    install_handler(monkeypatch, "list", handler)
+    # The config seam is implemented (#3): the default loader reads the real (private) config.
+    install_handler(monkeypatch, "list", lambda ctx: Result({"d": ctx.config.search_depth}))
     r = run_cli(capsys, "--json", "list")
-    assert r.code == 1
-    assert "not implemented yet (see #3)" in r.json()["error"]["message"]
+    assert r.code == 0
+    assert r.json() == {"d": 3}
 
     install_handler(monkeypatch, "list", lambda ctx: Result({"s": ctx.state}))
     r = run_cli(capsys, "--json", "list")
