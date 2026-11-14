@@ -221,13 +221,17 @@ def test_install_works_for_any_actor(capsys: pytest.CaptureFixture[str], wtctl_b
     assert go(capsys, fake, "cron", "install", actor="auto:cron").code == 0
 
 
-def test_wtctl_not_on_path_falls_back_to_the_bare_name(
+def test_wtctl_not_found_is_a_usage_error(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("PATH", str(tmp_path))
-    fake = FakeCrontab(None)
-    go(capsys, fake, "cron", "install")
-    assert "exec wtctl reconcile --actor auto:cron" in command_of(jobs(fake)[0])
+    fake = FakeCrontab(b"keep\n")
+    r = go(capsys, fake, "--json", "cron", "install")
+    assert r.code == 2
+    err = r.json()["error"]
+    assert err["code"] == "usage"
+    assert "wtctl executable not found; install it on PATH" in err["message"]
+    assert fake.writes == []
 
 
 def test_relative_path_entries_are_not_used_to_find_wtctl(
@@ -238,8 +242,55 @@ def test_relative_path_entries_are_not_used_to_find_wtctl(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", ".:")
     fake = FakeCrontab(None)
+    assert go(capsys, fake, "cron", "install").code == 2
+    assert fake.writes == []
+
+
+def _exe(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_running_program_is_preferred_over_the_first_on_path(
+    capsys: pytest.CaptureFixture[str],
+    wtctl_bin: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mine = _exe(tmp_path / "venv" / "bin" / "wtctl")
+    monkeypatch.setattr("sys.argv", [str(mine), "cron", "install"])
+    fake = FakeCrontab(None)
     go(capsys, fake, "cron", "install")
-    assert "exec wtctl reconcile" in command_of(jobs(fake)[0])
+    assert f"exec {shlex.quote(str(mine))} reconcile" in command_of(jobs(fake)[0])
+
+
+def test_argv0_is_ignored_unless_its_basename_is_wtctl(
+    capsys: pytest.CaptureFixture[str],
+    wtctl_bin: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    other = _exe(tmp_path / "bin2" / "pytest")
+    monkeypatch.setattr("sys.argv", [str(other)])
+    fake = FakeCrontab(None)
+    go(capsys, fake, "cron", "install")
+    assert f"exec {shlex.quote(wtctl_bin)} reconcile" in command_of(jobs(fake)[0])
+
+
+def test_bare_argv0_is_not_resolved_against_the_cwd(
+    capsys: pytest.CaptureFixture[str],
+    wtctl_bin: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _exe(tmp_path / "cwd" / "wtctl")
+    monkeypatch.chdir(tmp_path / "cwd")
+    monkeypatch.setattr("sys.argv", ["wtctl"])
+    fake = FakeCrontab(None)
+    go(capsys, fake, "cron", "install")
+    assert f"exec {shlex.quote(wtctl_bin)} reconcile" in command_of(jobs(fake)[0])
 
 
 def test_hostile_wtctl_path_is_quoted_and_percent_escaped(
@@ -537,12 +588,27 @@ def test_missing_crontab_binary_is_an_error(
     assert "crontab" in err and "not found" in err
 
 
-def test_non_utf8_crontab_is_refused_untouched(
+@pytest.mark.parametrize("json_out", [False, True])
+def test_non_utf8_foreign_bytes_round_trip(
+    capsys: pytest.CaptureFixture[str], wtctl_bin: str, json_out: bool
+) -> None:
+    before = b"* * * * * \xff\xfe\n"
+    fake = FakeCrontab(before)
+    flags = ["--json"] if json_out else []
+    assert go(capsys, fake, *flags, "cron", "install").code == 0
+    assert fake.content is not None and fake.content.startswith(before)
+    assert go(capsys, fake, *flags, "cron", "uninstall").code == 0
+    assert fake.content == before
+
+
+def test_non_utf8_bytes_inside_the_block_do_not_crash_the_output(
     capsys: pytest.CaptureFixture[str], wtctl_bin: str
 ) -> None:
-    fake = FakeCrontab(b"\xff\xfe\n")
-    r = go(capsys, fake, "cron", "install")
-    assert r.code == 1 and fake.writes == []
+    fake = FakeCrontab(f"{HEADER}\n* * * * * \xff\n{FOOTER}\n".encode("latin-1"))
+    r = go(capsys, fake, "cron", "uninstall")
+    assert r.code == 0 and "\\udcff" in r.out
+    fake2 = FakeCrontab(f"{HEADER}\n* * * * * \xff\n{FOOTER}\n".encode("latin-1"))
+    assert go(capsys, fake2, "--json", "cron", "uninstall", "--dry-run").code == 0
 
 
 def test_failed_write_is_an_error(capsys: pytest.CaptureFixture[str], wtctl_bin: str) -> None:
@@ -616,5 +682,161 @@ def test_real_runner_without_crontab_raises_file_not_found(
 
 
 def test_default_gateway_cannot_reach_the_real_crontab_in_tests() -> None:
-    with pytest.raises(AssertionError, match="real crontab"):
+    with pytest.raises(pytest.fail.Exception, match="real crontab"):
         Gateway().crontab(["-l"])
+
+
+def test_the_real_crontab_guard_cannot_be_swallowed_by_main() -> None:
+    rt = Runtime(stdin_isatty=False, me_name="a", gateway=Gateway())
+    with pytest.raises(pytest.fail.Exception, match="real crontab"):
+        main(["cron", "uninstall"], runtime=rt)
+
+
+def test_real_runner_ignores_relative_and_empty_path_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "ran"
+    prog = tmp_path / "crontab"
+    prog.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
+    prog.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", ".:")
+    with pytest.raises(FileNotFoundError):
+        real_run_crontab(["-l"])
+    assert not marker.exists()
+
+
+def test_real_runner_runs_crontab_in_the_c_locale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prog = tmp_path / "bin" / "crontab"
+    prog.parent.mkdir()
+    prog.write_text('#!/bin/sh\necho "$LC_ALL:$KEEPME"\n')
+    prog.chmod(0o755)
+    monkeypatch.setenv("PATH", str(prog.parent))
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    monkeypatch.setenv("KEEPME", "yes")
+    assert real_run_crontab(["-l"]).stdout == b"C:yes\n"
+
+
+# ---------------------------------------------------------------- review round 1
+
+
+def test_uninstall_of_an_empty_block_says_it_removed_it(
+    capsys: pytest.CaptureFixture[str], wtctl_bin: str
+) -> None:
+    fake = FakeCrontab(f"x\n{HEADER}\n{FOOTER}\n".encode())
+    r = go(capsys, fake, "cron", "uninstall")
+    assert r.code == 0 and "cron block removed" in r.err and "no cron block" not in r.err
+    assert fake.content == b"x\n"
+    fake = FakeCrontab(f"x\n{HEADER}\n{FOOTER}\n".encode())
+    r = go(capsys, fake, "--dry-run", "cron", "uninstall")
+    assert "cron block would be removed" in r.err
+    assert fake.writes == []
+
+
+def test_uninstall_cannot_restore_a_missing_final_newline(
+    capsys: pytest.CaptureFixture[str], wtctl_bin: str
+) -> None:
+    fake = FakeCrontab(b"a")
+    go(capsys, fake, "cron", "install")
+    go(capsys, fake, "cron", "uninstall")
+    assert fake.content == b"a\n"  # the one exception to byte-for-byte preservation
+
+
+def test_bad_xdg_value_is_skipped_not_fatal(
+    capsys: pytest.CaptureFixture[str], wtctl_bin: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", "/a\\b")
+    monkeypatch.setenv("XDG_STATE_HOME", "/a\nb")
+    fake = FakeCrontab(None)
+    assert go(capsys, fake, "cron", "install").code == 0
+    script = command_of(jobs(fake)[0])
+    assert "XDG_DATA_HOME" not in script and "XDG_STATE_HOME" not in script
+    assert "XDG_CONFIG_HOME" in script
+
+
+def test_unencodable_home_is_a_clean_error() -> None:
+    with pytest.raises(cron.CronError):
+        cron._home({"HOME": "/h\ud800me"})
+
+
+def test_unencodable_wtctl_path_is_a_clean_error() -> None:
+    with pytest.raises(cron.CronError):
+        cron.build_entries(
+            wtctl="/x/\ud800/wtctl", config=None, env_file=None, path="/usr/bin", xdg={}
+        )
+
+
+def test_undecodable_but_escapable_bytes_in_the_wtctl_path_are_accepted() -> None:
+    lines = cron.build_entries(
+        wtctl="/x/\udcff/wtctl", config=None, env_file=None, path="/usr/bin", xdg={}
+    )
+    assert len(lines) == 2
+
+
+class _Info:
+    def __init__(self, mode: int, uid: int, gid: int) -> None:
+        self.st_mode, self.st_uid, self.st_gid = mode, uid, gid
+
+
+ME, MYGID = 1000, 1000
+
+
+def _unsafe(mode: int, uid: int, gid: int, immediate: bool, members: list[str]) -> str | None:
+    return cron.unsafe_directory(
+        _Info(mode, uid, gid),  # type: ignore[arg-type]
+        "/d",
+        immediate=immediate,
+        uid=ME,
+        gid=MYGID,
+        user="me",
+        members=lambda g: members,
+    )
+
+
+def test_directory_rules_group_write() -> None:
+    assert _unsafe(0o40775, 0, 0, False, []) is None  # root-owned, any group
+    assert _unsafe(0o40775, 0, 0, True, ["x"]) is None
+    assert _unsafe(0o40775, ME, MYGID, False, []) is None  # private group
+    assert _unsafe(0o40775, ME, MYGID, False, ["me"]) is None
+    shared = _unsafe(0o40775, ME, MYGID, False, ["me", "other"])
+    assert shared is not None and "chmod g-w /d" in shared
+    other_group = _unsafe(0o40775, ME, 50, False, [])
+    assert other_group is not None and "chmod g-w" in other_group
+    assert _unsafe(0o40755, ME, 50, False, ["a"]) is None
+
+
+def test_directory_rules_other_write() -> None:
+    refused = _unsafe(0o40777, 0, 0, False, [])
+    assert refused is not None and "chmod o-w /d" in refused
+    assert _unsafe(0o41777, 0, 0, False, []) is None  # sticky ancestor (e.g. /tmp)
+    sticky_parent = _unsafe(0o41777, 0, 0, True, [])
+    assert sticky_parent is not None and "chmod o-w" in sticky_parent
+    assert _unsafe(0o40700, 5, 5, False, []) is not None  # owned by someone else
+
+
+def test_env_file_in_my_private_group_writable_directory_is_accepted(
+    capsys: pytest.CaptureFixture[str],
+    wtctl_bin: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    f = make_env_file(tmp_path)
+    f.parent.chmod(0o770)
+    monkeypatch.setattr(cron, "_group_members", lambda gid: [])
+    r = go(capsys, FakeCrontab(None), "cron", "install", "--env-file", str(f))
+    assert r.code == 0, r.err
+
+
+def test_env_file_in_a_group_writable_directory_shared_with_others_is_refused(
+    capsys: pytest.CaptureFixture[str],
+    wtctl_bin: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    f = make_env_file(tmp_path)
+    f.parent.chmod(0o770)
+    monkeypatch.setattr(cron, "_group_members", lambda gid: ["someone-else"])
+    r = go(capsys, FakeCrontab(None), "--json", "cron", "install", "--env-file", str(f))
+    assert r.code == 2 and "chmod g-w" in r.json()["error"]["message"]

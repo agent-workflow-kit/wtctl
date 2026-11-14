@@ -10,9 +10,14 @@ wtctl owns one block of the user's crontab, delimited by two exact marker lines:
 Rules (docs/interface.md, ``cron install`` / ``cron uninstall``):
 
 - Everything outside the block is kept byte for byte: the crontab is edited as text by offset,
-  never re-joined from lines, and read and written as bytes (a crontab that is not valid UTF-8
-  is refused rather than re-encoded). Installing appends the block after one separating newline
-  when the last foreign line has none; nothing else changes.
+  never re-joined from lines, and read and written as bytes (decoded with ``surrogateescape``,
+  so foreign bytes that are not valid UTF-8 round-trip unchanged). Installing appends the block
+  after one separating newline when the last foreign line has none; ``uninstall`` cannot take
+  that newline away again (it cannot tell it from one the user had), so a crontab whose last
+  line had no newline ends with one afterwards. That is the single exception to byte-for-byte
+  preservation.
+- Lines between the two markers belong to wtctl: ``install`` replaces them and ``uninstall``
+  removes them, whatever they hold.
 - ``crontab -l`` failing is "no crontab" only when its error says so; any other failure ends
   the command rather than treating the crontab as empty and overwriting it.
 - A malformed marker structure (unterminated, repeated, reversed, stray end marker) is refused;
@@ -27,12 +32,15 @@ Rules (docs/interface.md, ``cron install`` / ``cron uninstall``):
   crontab assignment (which would change the environment of the user's own entries).
 - ``--env-file`` is sourced by cron as the user, so it and every directory above it must be
   safe from other users (``check_env_file``).
+- ``wtctl`` is the running program when its basename is ``wtctl``, else the first executable
+  ``wtctl`` on an absolute ``PATH`` entry; without either the command fails (exit 2).
 
 All ``crontab`` runs go through the gateway, so tests use a fake.
 """
 
 from __future__ import annotations
 
+import grp
 import os
 import pwd
 import shlex
@@ -68,7 +76,15 @@ def _clean(text: str, limit: int = 200) -> str:
 
 
 def _bad(text: str) -> bool:
-    return any(c in text for c in _BAD_CHARS)
+    """Not usable in a crontab line: a forbidden character, or not encodable (a lone surrogate
+    other than the escapes of undecodable bytes)."""
+    if any(c in text for c in _BAD_CHARS):
+        return True
+    try:
+        text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------- the block
@@ -129,16 +145,22 @@ def block_text(entries: list[str]) -> str:
     return "\n".join([HEADER, *entries, FOOTER])
 
 
-def find_wtctl(environ: Mapping[str, str]) -> str:
-    """The absolute path of the ``wtctl`` executable on ``PATH`` (absolute entries only), else
-    the bare name, which the cron ``PATH`` resolves."""
-    for entry in environ.get("PATH", "").split(os.pathsep):
-        if not os.path.isabs(entry):
-            continue
-        candidate = os.path.join(entry, "wtctl")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+def _executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def find_wtctl(environ: Mapping[str, str], argv0: str | None = None) -> str:
+    """The absolute path of the ``wtctl`` to schedule: the running program (``argv0`` made
+    absolute, only when it holds a ``/``, is executable and its basename is ``wtctl``), else the
+    first executable ``wtctl`` on an absolute ``PATH`` entry. Neither: a usage error."""
+    if argv0 and "/" in argv0 and os.path.basename(argv0) == "wtctl":
+        candidate = os.path.abspath(argv0)
+        if _executable(candidate):
             return candidate
-    return "wtctl"
+    for entry in environ.get("PATH", "").split(os.pathsep):
+        if os.path.isabs(entry) and _executable(os.path.join(entry, "wtctl")):
+            return os.path.join(entry, "wtctl")
+    raise CronError("wtctl executable not found; install it on PATH", "usage")
 
 
 def _home(environ: Mapping[str, str]) -> str:
@@ -156,12 +178,45 @@ def _home(environ: Mapping[str, str]) -> str:
 # ---------------------------------------------------------------- --env-file
 
 
+def _group_members(gid: int) -> list[str]:
+    try:
+        return list(grp.getgrgid(gid).gr_mem)
+    except KeyError:
+        return ["?"]  # unknown group: assume it is shared
+
+
+def unsafe_directory(
+    info: os.stat_result,
+    path: str,
+    *,
+    immediate: bool,
+    uid: int,
+    gid: int,
+    user: str,
+    members: Callable[[int], list[str]],
+) -> str | None:
+    """Why other users could replace what is in this directory, or None. The group-write bit is
+    ignored when root owns the directory (e.g. ``root:admin 775 /usr/local``) or the user owns
+    it, its group is the user's primary group and no one else is a member of that group. A
+    world-writable directory is refused unless it is sticky and not the file's own parent."""
+    shown = _clean(path)
+    if info.st_uid not in (uid, 0):
+        return f"directory {shown!r} is owned by neither you nor root"
+    if info.st_mode & 0o002 and (immediate or not info.st_mode & stat.S_ISVTX):
+        return f"directory {shown!r} is writable by others; run: chmod o-w {shlex.quote(shown)}"
+    if info.st_mode & 0o020 and info.st_uid != 0:
+        private = info.st_gid == gid and set(members(info.st_gid)) <= {user}
+        if not private:
+            return (
+                f"directory {shown!r} is writable by its group; run: chmod g-w {shlex.quote(shown)}"
+            )
+    return None
+
+
 def check_env_file(path: str) -> str:
     """The real path of ``--env-file`` once it passed the checks, else a usage error: a regular
     file owned by the user, readable, not group- or world-writable, in directories (all the way
-    up) owned by the user or root that others cannot write to (a sticky directory is accepted
-    above the file's own, never as its own parent). Anyone who can replace the file runs code
-    as the user."""
+    up) that pass ``unsafe_directory``. Anyone who can replace the file runs code as the user."""
 
     def refuse(why: str) -> CronError:
         return CronError(f"--env-file {_clean(path)!r}: {why}", "usage")
@@ -183,16 +238,27 @@ def check_env_file(path: str) -> str:
         raise refuse("group- or world-writable")
     if not os.access(real, os.R_OK):
         raise refuse("not readable by you")
+    try:
+        user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        user = ""
     directory, immediate = os.path.dirname(real), True
     while True:
         try:
             dinfo = os.stat(directory)
         except OSError as exc:
             raise refuse(f"cannot check {_clean(directory)!r}: {exc.strerror}") from None
-        if dinfo.st_uid not in (os.geteuid(), 0):
-            raise refuse(f"directory {_clean(directory)!r} is owned by neither you nor root")
-        if dinfo.st_mode & 0o022 and (immediate or not dinfo.st_mode & stat.S_ISVTX):
-            raise refuse(f"directory {_clean(directory)!r} is writable by others")
+        why = unsafe_directory(
+            dinfo,
+            directory,
+            immediate=immediate,
+            uid=os.geteuid(),
+            gid=os.getgid(),
+            user=user,
+            members=_group_members,
+        )
+        if why is not None:
+            raise refuse(why)
         parent = os.path.dirname(directory)
         if parent == directory:
             return real
@@ -268,46 +334,47 @@ class Crontab:
         """The crontab text ('' when the user has none)."""
         result = self._run(["-l"])
         if result.returncode != 0:
-            err = result.stderr.decode("utf-8", "replace")
+            err = result.stderr.decode("utf-8", "replace")  # crontab ran with LC_ALL=C
             if "no crontab" in err.lower():
                 return ""
             raise CronError(f"crontab -l failed (exit {result.returncode}): {_clean(err)}")
-        try:
-            return result.stdout.decode("utf-8")  # strict, no newline translation
-        except UnicodeDecodeError:
-            raise CronError(
-                "the crontab is not valid UTF-8 and cannot be rewritten safely; nothing changed"
-            ) from None
+        # No newline translation; undecodable bytes survive as surrogate escapes.
+        return result.stdout.decode("utf-8", "surrogateescape")
 
     def write(self, text: str) -> None:
         """Replace the crontab by ``text`` (``crontab -r`` for the empty text)."""
         op = ["-r"] if text == "" else ["-"]
-        result = self._run(op, None if text == "" else text.encode("utf-8"))
+        try:
+            data = None if text == "" else text.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError:
+            raise CronError("the crontab text is not encodable; nothing changed") from None
+        result = self._run(op, data)
         if result.returncode != 0:
             err = _clean(result.stderr.decode("utf-8", "replace"))
             raise CronError(f"crontab {op[0]} failed (exit {result.returncode}): {err}")
 
 
-Plan = tuple[str | None, list[str]]  # (new text or None for no change, entries to report)
+# (new text or None for no change, entries to report, whether a block was found)
+Plan = tuple[str | None, list[str], bool]
 
 
 def _edit(
     crontab: Crontab, compute: Callable[[str], Plan], expect: list[str] | None, dry_run: bool
-) -> list[str]:
+) -> tuple[list[str], bool]:
     """Read, compute and write the crontab; ``expect`` is the body the block must hold
-    afterwards (None: no block)."""
+    afterwards (None: no block). Returns the entries and whether a block was found."""
     for _ in range(ATTEMPTS):
         current = crontab.read()
-        new, entries = compute(current)
+        new, entries, found = compute(current)
         if new is None or dry_run:
-            return entries
+            return entries, found
         if crontab.read() != current:
             continue  # edited since we read it: start over on the new text
         crontab.write(new)
         after = find_block(crontab.read())
         if (None if after is None else after.body) != expect:
             raise CronError("the crontab does not hold the expected block after the write")
-        return entries
+        return entries, found
     raise CronError("the crontab keeps changing; gave up, retry")
 
 
@@ -329,9 +396,13 @@ def install(ctx: Context) -> Result:
     config = None
     if ctx.config_path is not None:
         config = os.path.abspath(ctx.config_path)
-    xdg = {v: environ[v] for v in XDG_VARS if os.path.isabs(environ.get(v, ""))}
+    xdg = {
+        v: environ[v]
+        for v in XDG_VARS
+        if os.path.isabs(environ.get(v, "")) and not _bad(environ[v])
+    }
     entries = build_entries(
-        wtctl=find_wtctl(environ),
+        wtctl=find_wtctl(environ, sys.argv[0] if sys.argv else None),
         config=config,
         env_file=env_file,
         path=cron_path(_home(environ), macos=_is_macos(), isdir=os.path.isdir),
@@ -343,13 +414,13 @@ def install(ctx: Context) -> Result:
         found = find_block(text)
         if found is None:
             sep = "" if text == "" or text.endswith("\n") else "\n"
-            return text + sep + wanted + "\n", entries
+            return text + sep + wanted + "\n", entries, False
         if found.body == entries:
-            return None, entries
-        return text[: found.start] + wanted + text[found.end :], entries
+            return None, entries, True
+        return text[: found.start] + wanted + text[found.end :], entries, True
 
     # TODO(#5): write the `cron` log.jsonl record once the log writer exists.
-    changed = _edit(Crontab(ctx.gateway), compute, entries, ctx.dry_run)
+    changed, _ = _edit(Crontab(ctx.gateway), compute, entries, ctx.dry_run)
     verb = "would install" if ctx.dry_run else "installed"
     return _result(True, changed, ctx.dry_run, f"cron block {verb} ({len(changed)} entries)")
 
@@ -358,12 +429,12 @@ def uninstall(ctx: Context) -> Result:
     def compute(text: str) -> Plan:
         found = find_block(text)
         if found is None:
-            return None, []
+            return None, [], False
         end = found.end + 1 if text[found.end : found.end + 1] == "\n" else found.end
-        return text[: found.start] + text[end:], found.body
+        return text[: found.start] + text[end:], found.body, True
 
-    removed = _edit(Crontab(ctx.gateway), compute, None, ctx.dry_run)
-    if not removed:
+    removed, was_present = _edit(Crontab(ctx.gateway), compute, None, ctx.dry_run)
+    if not was_present:
         summary = "no cron block present"
     else:
         summary = f"cron block {'would be removed' if ctx.dry_run else 'removed'}"

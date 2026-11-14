@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import datetime as dt
-import shutil
+import os
 import subprocess
 import sys
 import time
@@ -39,16 +39,32 @@ def run(
 # --- crontab (#8) -------------------------------------------------------------------------------
 
 
-def run_crontab(args: list[str], stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
-    """Run ``crontab <args>`` with bytes in and out (a crontab is rewritten without re-encoding).
+def _find_executable(name: str, path: str) -> str | None:
+    """``name`` in the absolute entries of ``path`` (relative and empty entries are ignored, so
+    a planted program in the working directory is never run; design D49)."""
+    for entry in path.split(os.pathsep):
+        candidate = os.path.join(entry, name)
+        if os.path.isabs(entry) and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
-    Raises ``FileNotFoundError`` when there is no ``crontab`` on ``PATH``.
+
+def run_crontab(args: list[str], stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run ``crontab <args>`` with bytes in and out (a crontab is rewritten without re-encoding),
+    in the C locale so its "no crontab" message can be recognised.
+
+    Raises ``FileNotFoundError`` when there is no ``crontab`` on an absolute ``PATH`` entry.
     """
-    program = shutil.which("crontab")
+    program = _find_executable("crontab", os.environ.get("PATH", ""))
     if program is None:
         raise FileNotFoundError("crontab")
     return subprocess.run(
-        [program, *args], input=stdin, capture_output=True, timeout=30, check=False
+        [program, *args],
+        input=stdin,
+        capture_output=True,
+        timeout=30,
+        check=False,
+        env={**os.environ, "LC_ALL": "C"},
     )
 
 
