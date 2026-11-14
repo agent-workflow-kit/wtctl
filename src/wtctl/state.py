@@ -286,6 +286,31 @@ class State:
     # -- migrations -----------------------------------------------------------------------
 
     def _migrate(self) -> int:
+        """Open sequence, retried on lock contention.
+
+        SQLite skips the busy handler for some lock states (e.g. switching a fresh database
+        to WAL while peers do the same), returning BUSY at once; so retry here until the
+        ``_BUSY_TIMEOUT`` deadline, then report busy.
+        """
+        deadline = time.monotonic() + _BUSY_TIMEOUT
+        while True:
+            try:
+                return self._migrate_once()
+            except WtctlError as exc:
+                if exc.code != "busy":
+                    raise
+                failure: Exception = exc
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
+                failure = exc
+            if time.monotonic() >= deadline:
+                if isinstance(failure, WtctlError):
+                    raise failure
+                raise WtctlError("busy", "state.db is locked by another process") from failure
+            time.sleep(0.01 + secrets.randbelow(40) / 1000)
+
+    def _migrate_once(self) -> int:
         migrations = MIGRATIONS  # looked up late so tests can substitute
         latest = migrations[-1][0]
         conn = self._conn

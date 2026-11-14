@@ -347,3 +347,43 @@ def test_real_concurrent_first_open_migrates_once(tmp_path: Path, worker: Path) 
 
 
 _ = (fake_gateway,)
+
+
+OPENER = textwrap.dedent(
+    """
+    import os, sys, time
+    from wtctl.gateway import Gateway
+    from wtctl.state import State, state_path
+
+    go = float(sys.argv[1])
+    print("ready", flush=True)
+    while time.time() < go:
+        pass
+    State(state_path(), Gateway()).close()
+    print("opened")
+    """
+)
+
+
+def test_real_concurrent_first_open_of_a_fresh_database_never_reports_busy(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "opener.py"
+    script.write_text(OPENER)
+    for rnd in range(4):
+        # A fresh private state dir per round, so every round races the very first open.
+        env = {
+            **os.environ,
+            "XDG_STATE_HOME": str(tmp_path / f"round{rnd}"),
+            "PYTHONPATH": os.pathsep.join(sys.path),
+        }
+        go = time.time() + 2.0
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(script), str(go)], stdout=subprocess.PIPE, text=True, env=env
+            )
+            for _ in range(16)
+        ]
+        for p in procs:
+            out, _ = p.communicate(timeout=120)
+            assert p.returncode == 0 and "opened" in out, out

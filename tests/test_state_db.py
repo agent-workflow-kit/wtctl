@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -266,3 +267,27 @@ def test_lock_timeout_while_opening_is_busy_not_internal(
     finally:
         peer.execute("ROLLBACK")
         peer.close()
+
+
+def test_open_retries_a_transient_locked_pragma(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_connect = state_mod._connect
+    failures = {"left": 2}
+
+    class Flaky:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self._c = conn
+
+        def execute(self, sql: str, *a: Any) -> sqlite3.Cursor:
+            if sql.startswith("PRAGMA journal_mode") and failures["left"] > 0:
+                failures["left"] -= 1
+                raise sqlite3.OperationalError("database is locked")
+            return self._c.execute(sql, *a)
+
+        def close(self) -> None:
+            self._c.close()
+
+    monkeypatch.setattr(state_mod, "_connect", lambda p: Flaky(real_connect(p)))
+    st = make_state(tmp_path)
+    assert failures["left"] == 0 and st.schema_version >= 1
