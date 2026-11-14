@@ -671,6 +671,26 @@ def test_r4_whole_record_of_many_long_values_is_bounded(tmp_path: Path) -> None:
     assert time.perf_counter() - t0 < 5
 
 
+@pytest.mark.parametrize("unit", ["token", "token_"])
+def test_r4_keyword_dense_record_is_bounded(unit: str) -> None:
+    s = audit._Sanitizer([], 4096, 1000, 8)
+    t0 = time.perf_counter()
+    s.value([unit * (16000 // len(unit))] * 1000)
+    assert time.perf_counter() - t0 < 2
+    assert s.truncated
+
+
+def test_r4_record_budget_marks_truncation_without_leaking() -> None:
+    s = audit._Sanitizer([], 4096, 1000, 8)
+    tail = ["password=hunter2hunter2", "x" * 10 + "ghp_" + "A1b2C3d4" * 5]
+    out = s.value(["filler " * 2000] * 40 + tail)
+    flat = json.dumps(out)
+    assert s.truncated
+    assert "hunter2" not in flat and "A1b2C3d4" not in flat
+    assert "truncated" in out[-1] and "truncated" in out[-2]
+    assert "budget" in out[-1] and "budget" in out[-2]
+
+
 def test_r3_decision_ids_that_leak_are_rejected(tmp_path: Path) -> None:
     j = make(tmp_path, secrets=["configuredsecret1"])
     for bad in (

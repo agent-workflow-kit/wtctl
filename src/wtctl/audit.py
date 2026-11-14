@@ -100,6 +100,7 @@ AUDIT_INPUTS: Mapping[str, frozenset[str]] = {
 
 MAX_LINE_BYTES = 32 * 1024  # including the newline
 MAX_DECISION_IDS = 32
+_RECORD_BUDGET = 256 * 1024  # characters of text sanitized per record; the rest is dropped
 _PRECUT = 16 * 1024  # strings longer than this are cut before the regexes run
 _MIN_SECRET = 6  # shorter configured secrets are ignored: masking them would shred records
 # (max string chars, max items per list/dict, max depth), tried in order for log records.
@@ -242,16 +243,24 @@ class _Sanitizer:
         self.max_items = max_items
         self.max_depth = max_depth
         self.truncated = False
+        self.budget = _RECORD_BUDGET
 
     def text(self, s: str, *, ident: bool = False) -> str:
         """Redact ``s``. ``ident`` (or ``self.identity``): a path, ref or hash, which only loses
         URL userinfo, token-shaped strings and configured secrets, never ``key=value`` pairs."""
+        if self.budget <= 0:
+            self.truncated = True
+            return "...[truncated: record text budget spent]"
         if len(s) > _PRECUT:
             self.truncated = True
             cut = s[:_PRECUT]
             # Do not leave half a token at the edge: back up to the last whitespace.
             ws = max(cut.rfind(" "), cut.rfind("\n"), cut.rfind("\t"))
             s = cut[: ws if ws > _PRECUT - 256 else _PRECUT]
+        if len(s) > self.budget:
+            self.truncated = True
+            s = s[: self.budget]
+        self.budget -= len(s)
         low = s.lower()
         if "://" in s:
             s = _URL_USERINFO.sub(r"\1", s)

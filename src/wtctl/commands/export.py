@@ -51,6 +51,12 @@ def run(ctx: Context) -> Result:
                     write(render_json(rec) + "\n")
         finally:
             reader.close()
+            # Set here too: a mid-stream failure must not lose the count (see cli._emit_result).
+            result.stderr = note()
+        return result.stderr
+
+    def note() -> str:
         return f"skipped {reader.skipped} unreadable line(s) in {name}" if reader.skipped else ""
 
-    return Result(data=None, stream=stream)
+    result = Result(data=None, stream=stream)
+    return result

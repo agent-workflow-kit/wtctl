@@ -266,3 +266,26 @@ def test_jsonl_and_json_output_bytes(capsys: pytest.CaptureFixture[str]) -> None
     assert len(lines) == 2 and out == "\n".join(lines) + "\n"
     _, jout, _ = export(capsys, "--log", "--json")
     assert jout == "[" + ",".join(lines) + "]\n"
+
+
+def test_skipped_count_is_reported_when_the_stream_fails_midway(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl.commands import export as export_cmd
+
+    class Reader:
+        skipped = 3
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            yield {"a": 1}
+            raise OSError("disk went away")
+
+        def close(self) -> None:
+            pass
+
+    at(NOW).log("create", actor=None, details={"n": 1})
+    monkeypatch.setattr(export_cmd, "read_records", lambda *a, **k: Reader())
+    code, _, err = export(capsys, "--log")
+    assert code == 1
+    assert "skipped 3 unreadable line" in err
+    assert "disk went away" in err
