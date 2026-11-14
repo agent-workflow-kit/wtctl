@@ -505,7 +505,7 @@ Removes a worktree ([Remove order](#remove-order)) or a throwaway ([Throwaway re
 
 ### `export`
 
-`wtctl export [--since TIME] [--audit | --log]` prints the records of `audit.jsonl` (default) or, with `--log`, of `log.jsonl`, oldest first: all of them, or those since `--since` (an RFC 3339 time or a DURATION). Without `--json`, one JSON record per line (JSONL); with `--json`, a JSON array whose items follow `schemas/audit.json` or `schemas/log.json` (`schemas/cli/export.json`). Read-only. Exit 0, 2.
+`wtctl export [--since TIME] [--audit | --log]` prints the records of `audit.jsonl` (default) or, with `--log`, of `log.jsonl`, oldest first: all of them, or those since `--since` (an RFC 3339 time or a DURATION). Without `--json`, one JSON record per line (JSONL); with `--json`, a JSON array whose items follow `schemas/audit.json` or `schemas/log.json` (`schemas/cli/export.json`). Read-only (creates nothing); a missing file is an empty result. `--since` needs an offset (`2026-01-31T12:00:00Z`); a time without one, or anything else, exits 2; records are kept when their `ts` is at or after it. Records come in file (append) order. Torn, blank, oversized, non-UTF-8 and non-object lines are skipped, with a count on stderr; output is always ASCII. A symlinked file or directory is refused (exit 1). Exit 0, 1, 2.
 
 ### `cron install` / `cron uninstall`
 
@@ -669,6 +669,7 @@ Every payload carries `tool: "wtctl"`, `hook`, `object_type` (`worktree` or `thr
   - a **global** lease for `reconcile` and `prune`.
 
   Read-only commands (`show`, `list`, `status`, `baseline check`, `locate` without auto-clone, `export`) take no per-record lease. A command waits up to `lease_wait` (default `10m`) for a held lease; then it exits 12, `error.code: busy` (callers retry later), or, for the global lease, 0 with `already_running`. Every state transition is a compare-and-set on the record's state; a command that loses the race exits 12, `busy` (or 10 if the record became a tombstone), except where a step says otherwise ([Create order](#create-order) step 16).
+- **Writing.** Each record is one ASCII JSON line of at most 32 KiB, appended with one `write` on an `O_APPEND` descriptor (so concurrent processes never interleave); `audit.jsonl` is also fsynced. The directory is 0700 and the files 0600; a symlinked or hard-linked file or a symlinked directory is refused. Over-long log values are cut and marked `...[truncated N chars]`; an audit record that would not fit is not written (exit 1) rather than cut. `decision_id` in `audit.jsonl` is null with no ids, a string with one, a list with several. A failed audit write fails the command (exit 1): an action is never reported successful without its audit record. There is no rotation. Redaction: URL userinfo is removed; token-shaped strings, `key: value` pairs for secret-looking keys (token, secret, password, authorization, api key) and the values of such object keys are replaced by `[redacted]`; configured token values are masked.
 - **Secrets.** Tokens, header values and env-file contents never appear in state, logs, audit records, hook payloads or output; URLs are recorded without userinfo.
 
 ## Residual risks
