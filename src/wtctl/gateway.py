@@ -235,30 +235,34 @@ def run_step(
     its exceptions are ignored. A failure to start is a result, not an exception.
     """
     t0 = time.monotonic()
-    try:
-        proc = subprocess.Popen(
-            list(argv),
-            stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(env),
-            cwd=cwd,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except (OSError, ValueError) as exc:
-        return StepResult(None, start_error=f"{type(exc).__name__}: {exc}")
-    pid = proc.pid
+    saved: dict[int, object] = {}
+    proc: subprocess.Popen[bytes] | None = None
+    sel = selectors.DefaultSelector()
     out, err = _Capture(max_stdout, tail), _Capture(max_stderr, tail)
     timed_out = incomplete = False
-    sel = selectors.DefaultSelector()
-    saved: dict[int, object] = {}
     try:
         if threading.current_thread() is threading.main_thread():
             # A SIGTERM/SIGHUP to wtctl must not orphan the child's group: turn it into
-            # SystemExit so the BaseException path below kills the group.
+            # SystemExit so the BaseException path below kills the group. Installed before
+            # the spawn (no unprotected window); an inherited SIG_IGN is respected.
             for signum in (signal.SIGTERM, signal.SIGHUP):
-                saved[signum] = signal.signal(signum, _raise_system_exit)
+                previous = signal.getsignal(signum)
+                if previous != signal.SIG_IGN:
+                    saved[signum] = signal.signal(signum, _raise_system_exit)
+        try:
+            proc = subprocess.Popen(
+                list(argv),
+                stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(env),
+                cwd=cwd,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (OSError, ValueError) as exc:
+            return StepResult(None, start_error=f"{type(exc).__name__}: {exc}")
+        pid = proc.pid
         if on_start is not None:
             on_start(pid)
         assert proc.stdout is not None and proc.stderr is not None
@@ -330,33 +334,37 @@ def run_step(
         if timed_out:
             # Collect what the dead group had already written, bounded in time and bytes (a
             # writer that escaped the group could otherwise keep the pipe full).
-            collect_deadline = time.monotonic() + _COLLECT_SECONDS
-            budget = _COLLECT_BYTES
             for key in list(sel.get_map().values()):
-                if key.data is not None:
-                    try:
-                        while budget > 0 and time.monotonic() < collect_deadline:
-                            data = os.read(key.fileobj.fileno(), _READ_CHUNK)  # type: ignore[union-attr]
-                            if not data:
-                                break
-                            budget -= len(data)
-                            key.data.add(data)
-                    except OSError:
-                        pass
-    except BaseException:
-        _kill_group(pid)
-        raise
-    finally:
-        for signum, previous in saved.items():
-            signal.signal(signum, previous if previous is not None else signal.SIG_DFL)  # type: ignore[arg-type]
-        sel.close()
-        for f in (proc.stdin, proc.stdout, proc.stderr):
-            if f is not None:
+                if key.data is None:
+                    continue
+                collect_deadline = time.monotonic() + _COLLECT_SECONDS
+                budget = _COLLECT_BYTES
                 try:
-                    f.close()
+                    while budget > 0 and time.monotonic() < collect_deadline:
+                        data = os.read(key.fileobj.fileno(), _READ_CHUNK)  # type: ignore[union-attr]
+                        if not data:
+                            break
+                        budget -= len(data)
+                        key.data.add(data)
                 except OSError:
                     pass
-        proc.wait()
+    except BaseException:
+        if proc is not None:
+            _kill_group(proc.pid)
+        raise
+    finally:
+        sel.close()
+        if proc is not None:
+            for f in (proc.stdin, proc.stdout, proc.stderr):
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+            proc.wait()
+        for signum, previous in saved.items():
+            signal.signal(signum, previous if previous is not None else signal.SIG_DFL)  # type: ignore[arg-type]
+    assert proc is not None
     return StepResult(
         proc.returncode,
         stdout=bytes(out.buf),

@@ -281,13 +281,56 @@ def test_sigterm_to_the_waiting_process_kills_the_step_group(tmp_path: Path) -> 
     try:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            if pidfile.exists() and pidfile.read_text().strip():
+            if ready.exists() and pidfile.exists() and pidfile.read_text().strip():
                 break
             time.sleep(0.05)
+        else:
+            raise AssertionError("step never became ready")
         hook_pid = int(pidfile.read_text())
         os.kill(child.pid, signal.SIGTERM)
         assert child.wait(timeout=20) == 128 + signal.SIGTERM
         assert wait_gone(hook_pid, 10)
+    finally:
+        if hook_pid > 1 and alive(hook_pid):
+            try:
+                os.killpg(hook_pid, signal.SIGKILL)  # the hook leads its own group
+            except ProcessLookupError:
+                pass
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_an_inherited_sig_ign_is_not_overridden_by_the_step(tmp_path: Path) -> None:
+    pidfile = tmp_path / "hook.pid"
+    ready = tmp_path / "ready"
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    code = (
+        "import signal; signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+        "from wtctl.gateway import run_step, sh_argv\n"
+        f"run_step(sh_argv('echo $$ > {pidfile}; sleep 2'), env={ENV!r}, timeout=600, "
+        f"on_start=lambda p: open({str(ready)!r}, 'w').write('x'))"
+    )
+    env = {
+        **ENV,
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home),
+        "PYTHONPATH": os.pathsep.join(sys.path),
+    }
+    child = subprocess.Popen([sys.executable, "-c", code], env=env, start_new_session=True)
+    hook_pid = 0
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if ready.exists() and pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("step never became ready")
+        hook_pid = int(pidfile.read_text())
+        os.kill(child.pid, signal.SIGHUP)
+        assert child.wait(timeout=20) == 0  # ignored SIGHUP: the step finished normally
     finally:
         if hook_pid > 1 and alive(hook_pid):
             try:
