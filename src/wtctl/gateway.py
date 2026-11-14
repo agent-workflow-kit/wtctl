@@ -202,6 +202,14 @@ def _kill_group(pgid: int) -> None:
         pass
 
 
+_COLLECT_SECONDS = 0.2
+_COLLECT_BYTES = 1 << 20
+
+
+def _raise_system_exit(signum: int, _frame: object) -> None:
+    raise SystemExit(128 + signum)
+
+
 def run_step(
     argv: Sequence[str],
     *,
@@ -244,7 +252,13 @@ def run_step(
     out, err = _Capture(max_stdout, tail), _Capture(max_stderr, tail)
     timed_out = incomplete = False
     sel = selectors.DefaultSelector()
+    saved: dict[int, object] = {}
     try:
+        if threading.current_thread() is threading.main_thread():
+            # A SIGTERM/SIGHUP to wtctl must not orphan the child's group: turn it into
+            # SystemExit so the BaseException path below kills the group.
+            for signum in (signal.SIGTERM, signal.SIGHUP):
+                saved[signum] = signal.signal(signum, _raise_system_exit)
         if on_start is not None:
             on_start(pid)
         assert proc.stdout is not None and proc.stderr is not None
@@ -314,11 +328,18 @@ def run_step(
                     sel.unregister(f)
                     f.close()
         if timed_out:
-            # Collect what the dead group had already written.
+            # Collect what the dead group had already written, bounded in time and bytes (a
+            # writer that escaped the group could otherwise keep the pipe full).
+            collect_deadline = time.monotonic() + _COLLECT_SECONDS
+            budget = _COLLECT_BYTES
             for key in list(sel.get_map().values()):
                 if key.data is not None:
                     try:
-                        while data := os.read(key.fileobj.fileno(), _READ_CHUNK):  # type: ignore[union-attr]
+                        while budget > 0 and time.monotonic() < collect_deadline:
+                            data = os.read(key.fileobj.fileno(), _READ_CHUNK)  # type: ignore[union-attr]
+                            if not data:
+                                break
+                            budget -= len(data)
                             key.data.add(data)
                     except OSError:
                         pass
@@ -326,6 +347,8 @@ def run_step(
         _kill_group(pid)
         raise
     finally:
+        for signum, previous in saved.items():
+            signal.signal(signum, previous if previous is not None else signal.SIG_DFL)  # type: ignore[arg-type]
         sel.close()
         for f in (proc.stdin, proc.stdout, proc.stderr):
             if f is not None:

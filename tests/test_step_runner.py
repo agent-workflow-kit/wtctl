@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -257,3 +258,60 @@ def test_duration_is_measured() -> None:
 
 def test_default_gateway_exposes_the_step_runner() -> None:
     assert gateway.run_step is run_step
+
+
+def test_sigterm_to_the_waiting_process_kills_the_step_group(tmp_path: Path) -> None:
+    pidfile = tmp_path / "hook.pid"
+    ready = tmp_path / "ready"
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    code = (
+        "import sys; from wtctl.gateway import run_step, sh_argv; "
+        f"run_step(sh_argv('echo $$ > {pidfile}; sleep 300'), env={ENV!r}, timeout=600, "
+        f"on_start=lambda p: open({str(ready)!r}, 'w').write('x'))"
+    )
+    env = {
+        **ENV,
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home),
+        "PYTHONPATH": os.pathsep.join(sys.path),
+    }
+    child = subprocess.Popen([sys.executable, "-c", code], env=env, start_new_session=True)
+    hook_pid = 0
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        hook_pid = int(pidfile.read_text())
+        os.kill(child.pid, signal.SIGTERM)
+        assert child.wait(timeout=20) == 128 + signal.SIGTERM
+        assert wait_gone(hook_pid, 10)
+    finally:
+        if hook_pid > 1 and alive(hook_pid):
+            try:
+                os.killpg(hook_pid, signal.SIGKILL)  # the hook leads its own group
+            except ProcessLookupError:
+                pass
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_signal_handlers_are_restored_after_a_step() -> None:
+    before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+    run_step(py("pass"), env=ENV, timeout=10)
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)) == before
+
+
+def test_a_flooding_writer_outside_the_group_cannot_stall_the_post_timeout_collect() -> None:
+    cmd = (
+        f"setsid {sys.executable} -c "
+        "\"import sys\nwhile True: sys.stderr.buffer.write(b'x' * 65536); sys.stderr.flush()\" & "
+        "sleep 300"
+    )
+    t0 = time.monotonic()
+    r = run_step(sh_argv(cmd), env=ENV, timeout=1)
+    assert r.timed_out
+    assert time.monotonic() - t0 < 5

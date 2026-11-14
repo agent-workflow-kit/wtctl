@@ -215,6 +215,22 @@ def test_without_the_flag_a_human_actor_still_escalates() -> None:
     assert err_of([spec("exit 13")], actor=HUMAN).code == "escalated"
 
 
+def test_veto_after_an_earlier_hook_exposes_runs_and_warnings() -> None:
+    e = err_of([spec("echo not-json-but-fine; echo '{\"decision_id\": 5}'"), spec("exit 1")])
+    assert e.code == "vetoed"
+    runs = e.hook_runs  # type: ignore[attr-defined]
+    assert len(runs) == 2
+    assert runs[0].exit_code == 0 and runs[1].exit_code == 1
+    assert isinstance(e.hook_warnings, tuple)  # type: ignore[attr-defined]
+    assert "hook_runs" not in e.to_object()["error"]
+
+
+def test_escalation_exposes_runs_and_warnings() -> None:
+    e = err_of([spec("true"), spec("exit 13")])
+    assert e.code == "escalated" and len(e.hook_runs) == 2  # type: ignore[attr-defined]
+    assert e.hook_warnings == ()  # type: ignore[attr-defined]
+
+
 # --- timeouts --------------------------------------------------------------------------------
 
 
@@ -263,6 +279,39 @@ def test_post_hook_start_failure_is_a_warning() -> None:
     assert out.warnings and "boom" in out.warnings[0]
 
 
+def test_post_hook_start_failure_text_is_not_repeated() -> None:
+    out = hooks.run_post_hooks(
+        "post-remove", [spec("x")], {}, env=ENV,
+        runner=lambda *a, **k: gateway.StepResult(None, start_error="OSError: boom"),
+    )  # fmt: skip
+    assert out.warnings[0].count("boom") == 1
+
+
+def test_post_hook_incomplete_output_is_a_warning(tmp_path: Path) -> None:
+    pidfile = tmp_path / "holder.pid"
+    with reap_pid_file(pidfile):
+        out = hooks.run_post_hooks(
+            "post-create", [spec(f"sleep 300 & echo $! > {pidfile}")], {}, env=ENV,
+        )  # fmt: skip
+        assert any("output incomplete" in w for w in out.warnings)
+
+
+def test_async_post_hook_that_cannot_be_spawned_is_a_warning() -> None:
+    out = hooks.run_post_hooks("post-create", [spec("echo a\0b", is_async=True)], {}, env=ENV)
+    assert len(out.warnings) == 1 and "did not start" in out.warnings[0]
+    assert out.runs[0].start_error is not None and not out.runs[0].launched_async
+
+
+def test_async_post_hook_overflowing_timeout_is_a_warning() -> None:
+    def spawner(*a: Any, **k: Any) -> int:
+        raise OverflowError("too big")
+
+    out = hooks.run_post_hooks(
+        "post-create", [spec("x", is_async=True)], {}, env=ENV, spawner=spawner
+    )
+    assert "did not start" in out.warnings[0]
+
+
 def test_post_hooks_collect_decision_ids() -> None:
     out = hooks.run_post_hooks("post-create", [spec('echo \'{"decision_id": "d1"}\'')], {}, env=ENV)
     assert out.decision_ids == ("d1",)
@@ -273,16 +322,18 @@ def test_async_hook_is_launched_detached_with_the_payload(tmp_path: Path) -> Non
     code = f"import sys; open({str(got)!r}, 'w').write(sys.stdin.read())"
     t0 = time.monotonic()
     out = hooks.run_post_hooks(
-        "post-create", [spec(f"sleep 1; {py(code)}", is_async=True)], {"tool": "wtctl"},
+        "post-create", [spec(f"sleep 5; {py(code)}", is_async=True)], {"tool": "wtctl"},
         env=ENV,
     )  # fmt: skip
-    assert time.monotonic() - t0 < 0.9
+    # The hook sleeps 5 s before writing; returning long before that proves it was detached.
+    assert time.monotonic() - t0 < 3
+    assert not got.exists()
     assert out.runs[0].launched_async
     assert out.warnings == ()
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 20
     while not got.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    time.sleep(0.2)
+    time.sleep(0.5)
     assert json.loads(got.read_text()) == {"tool": "wtctl"}
 
 

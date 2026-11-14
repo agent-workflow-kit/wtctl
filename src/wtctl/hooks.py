@@ -269,6 +269,12 @@ def _run_one(
     return run, res
 
 
+def _attach(err: WtctlError, runs: Sequence[HookRun], warnings: Sequence[str]) -> None:
+    """Expose what ran before a veto/escalation so the caller can log it (not serialized)."""
+    err.hook_runs = tuple(runs)  # type: ignore[attr-defined]
+    err.hook_warnings = tuple(warnings)  # type: ignore[attr-defined]
+
+
 def run_pre_hooks(
     name: str,
     specs: Sequence[HookSpec],
@@ -324,16 +330,18 @@ def run_pre_hooks(
             else:
                 escalated.append(run)
             continue
-        raise WtctlError(
+        veto = WtctlError(
             "vetoed",
             _describe(name, spec, res),
             hook=spec.cmd,
             hook_stderr=run.stderr,
             **fields(),
         )
+        _attach(veto, runs, warnings)
+        raise veto
     if escalated:
         first = escalated[0]
-        raise WtctlError(
+        esc = WtctlError(
             "escalated",
             f"{name} hook escalated: a human must decide",
             hook=first.cmd,
@@ -341,6 +349,8 @@ def run_pre_hooks(
             escalated_hooks=[r.cmd for r in escalated],
             **fields(),
         )
+        _attach(esc, runs, warnings)
+        raise esc
     return PreHookOutcome(tuple(runs), ids, tuple(warnings))
 
 
@@ -375,7 +385,7 @@ def run_post_hooks(
                     gateway.sh_argv(spec.cmd), env=env, cwd=cwd, stdin=body, timeout=spec.timeout
                 )
                 error = None
-            except OSError as exc:
+            except (OSError, ValueError, OverflowError) as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 warnings.append(f"{label} did not start: {error}")
             runs.append(
@@ -386,10 +396,13 @@ def run_post_hooks(
         runs.append(run)
         found, warns = _hook_decision_ids(res.stdout, res.stdout_truncated, label)
         warnings += warns
+        if res.output_incomplete:
+            warnings.append(f"{label}: output incomplete, a process kept the pipes open")
         if found:
             ids, merge_warns = merge_decision_ids(ids, found)
             warnings += merge_warns
         if res.returncode != 0 or res.timed_out:
-            tail = f": {run.stderr.strip()}" if run.stderr.strip() else ""
+            detail = "" if res.start_error else run.stderr.strip()
+            tail = f": {detail}" if detail else ""
             warnings.append(f"{_describe(name, spec, res)}{tail}")
     return PostHookOutcome(tuple(runs), ids, tuple(warnings))

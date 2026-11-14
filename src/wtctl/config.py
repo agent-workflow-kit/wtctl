@@ -108,13 +108,13 @@ class Me(_Model):
 class PostHook(_Model):
     model_config = ConfigDict(extra="forbid", regex_engine="python-re", populate_by_name=False)
     cmd: NonEmpty
-    timeout: Annotated[StrictInt, Field(ge=1)] = 30
+    timeout: Annotated[StrictInt, Field(ge=1, le=86400)] = 30
     async_: StrictBool = Field(default=False, alias="async")
 
 
 class PreHook(_Model):
     cmd: NonEmpty
-    timeout: Annotated[StrictInt, Field(ge=1)] = 30
+    timeout: Annotated[StrictInt, Field(ge=1, le=86400)] = 30
 
 
 class Hooks(_Model):
