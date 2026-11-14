@@ -285,3 +285,35 @@ def test_real_tmpfs_and_bind_mounts_are_found_skipped_and_never_crossed(
     assert out["plain_gone"] is True
     # a mount point as the anchor itself is refused by the pre-check
     assert out["anchor_on_mount"] == "mount_point"
+
+
+def test_open_chain_refuses_a_mount_on_the_chain_without_opening_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a" / "mnt" / "deep").mkdir(parents=True)
+    fs = FakeFs(table=[entry(str(tmp_path / "a" / "mnt"))])
+    opened: list[str] = []
+    real = fsafe._open_dir_nofollow
+
+    def spy(parent_fd: int, name: str, display: str) -> int:
+        opened.append(name)
+        return real(parent_fd, name, display)
+
+    monkeypatch.setattr(fsafe, "_open_dir_nofollow", spy)
+    with fsafe.open_anchor(str(tmp_path), fs=fs) as a:
+        opened.clear()
+        with pytest.raises(fsafe.FsafeError) as e:
+            fsafe.open_chain(a, a.fd, ["a", "mnt", "deep"], start_path=a.path)
+    assert e.value.kind == "mount_point"
+    assert opened == ["a"]
+
+
+def test_walk_and_delete_without_a_path_refuse_when_mounts_are_recorded(tmp_path: Path) -> None:
+    (tmp_path / "t" / "mnt").mkdir(parents=True)
+    fs = FakeFs(table=[entry(str(tmp_path / "t" / "mnt"))])
+    with fsafe.open_anchor(str(tmp_path), fs=fs) as a:
+        with pytest.raises(fsafe.FsafeError) as e1:
+            list(fsafe.walk_tree(a, a.fd))
+        with pytest.raises(fsafe.FsafeError) as e2:
+            fsafe.delete_tree(a, a.fd, "t")
+    assert (e1.value.kind, e2.value.kind) == ("bad_request", "bad_request")

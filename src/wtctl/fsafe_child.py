@@ -78,7 +78,13 @@ def _open_root(args: dict[str, object], *, parent: bool) -> tuple[fsafe.Anchor, 
     )
     try:
         expected = None if parent else _identity(args.get("root_identity"))
-        fd = fsafe.open_chain(anchor, anchor.fd, [str(c) for c in chain], expected=expected)
+        fd = fsafe.open_chain(
+            anchor,
+            anchor.fd,
+            [str(c) for c in chain],
+            expected=expected,
+            start_path=anchor.path,
+        )
     except BaseException:
         anchor.close()
         raise

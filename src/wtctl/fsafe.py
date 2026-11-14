@@ -450,18 +450,28 @@ def open_chain(
     owner_uid: int | None = None,
     forbid_git: bool = False,
     expected: Identity | None = None,
+    start_path: str | None = None,
 ) -> int:
     """Open ``components`` below ``start_fd`` one at a time and return the final directory's fd.
 
     Every directory is verified against the anchor's device and mount; the final one against
     ``expected`` (its recorded ``dir_id``) when given. Returns a duplicate of ``start_fd`` for an
-    empty chain. The caller closes the result; no fd leaks on failure.
+    empty chain. The caller closes the result; no fd leaks on failure. With ``start_path`` (the
+    absolute path of ``start_fd``) a component that is one of the anchor's recorded
+    ``mounts_below`` is refused (``mount_point``) before it is opened.
     """
+    mounts = frozenset(anchor.mounts_below) if start_path is not None else frozenset()
     fd = os.dup(start_fd)
     try:
         walked: list[str] = []
         for c in components:
             walked.append(c)
+            if mounts and start_path is not None:
+                full = _abs_join(start_path, walked[:-1], c)
+                if full in mounts:
+                    raise FsafeError(
+                        "mount_point", f"{full} is a mount point", path="/".join(walked)
+                    )
             nfd = open_dir(anchor, fd, c, owner_uid=owner_uid, forbid_git=forbid_git)
             os.close(fd)
             fd = nfd
@@ -561,6 +571,8 @@ def walk_tree(
     A file that is a bind-mount over another file on the same device is only detected when it is
     opened (``open_file``), since a walk does not open regular files.
     """
+    if root_path is None and anchor.mounts_below:
+        raise FsafeError("bad_request", "root_path is required: the anchor has mounts below it")
     raise_fd_limit()
     fs = anchor.fs
     count = 0
@@ -811,6 +823,8 @@ def delete_tree(
     and after a directory was opened (``opened``).
     """
     check_component(name)
+    if parent_path is None and anchor.mounts_below:
+        raise FsafeError("bad_request", "parent_path is required: the anchor has mounts below it")
     raise_fd_limit()
     fs = anchor.fs
     owner = os.geteuid() if owner_uid is None else owner_uid
@@ -855,7 +869,6 @@ def delete_tree(
             if f.names:
                 _delete_entry(anchor, stack, f.names.pop(), result, owner, hook, is_mount)
                 continue
-            path = _frame_path(stack)
             stack.pop()
             os.close(f.fd)
             f.fd = -1
@@ -875,6 +888,8 @@ def delete_tree(
                     reason = "not_empty"
                 else:
                     reason = "error"
+                # the root frame (stack now empty) reports the empty path
+                path = (*_frame_path(stack), f.name) if stack else ()
                 result.add(Remaining(path, reason, exc.errno))
                 if stack:
                     stack[-1].dirty = True

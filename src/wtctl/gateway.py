@@ -89,6 +89,12 @@ def run_with_deadline(
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
         raise
 
 

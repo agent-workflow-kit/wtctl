@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+from typing import Any
 
 import pytest
 
@@ -135,11 +136,23 @@ def test_run_with_deadline_kills_exact_pid_on_expiry() -> None:
         os.kill(r.pid, 0)
 
 
-def test_run_with_deadline_kills_the_child_when_on_start_raises() -> None:
+def test_run_with_deadline_kills_the_child_when_on_start_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import os
     import signal
+    import subprocess
 
     started: list[int] = []
+    procs: list[Any] = []
+    real_popen: Any = subprocess.Popen
+
+    def capture(*a: Any, **k: Any) -> Any:
+        p = real_popen(*a, **k)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", capture)
 
     def boom(pid: int) -> None:
         started.append(pid)
@@ -157,3 +170,6 @@ def test_run_with_deadline_kills_the_child_when_on_start_raises() -> None:
     if alive:  # only if the fix regressed: do not leak the sleeper
         os.kill(started[0], signal.SIGKILL)
     assert not alive
+    p = procs[0]
+    assert p.stdin is not None and p.stdout is not None and p.stderr is not None
+    assert p.stdin.closed and p.stdout.closed and p.stderr.closed
