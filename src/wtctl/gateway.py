@@ -96,20 +96,32 @@ class ProcessIdentity(Protocol):
 
 
 class PsProcessIdentity:
-    """Start time from ``ps -o lstart=`` (macOS and anywhere without ``/proc``)."""
+    """Start time from ``ps -o stat=,lstart=`` (macOS and anywhere without ``/proc``).
+
+    Run with ``TZ=UTC LC_ALL=C`` so the start time does not depend on the caller's time zone or
+    locale; a zombie (stat starting with ``Z``) counts as not running.
+    """
 
     def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = run) -> None:
         self._runner = runner
 
     def start_time(self, pid: int) -> str | None:
         try:
-            r = self._runner(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
+            r = self._runner(
+                ["env", "TZ=UTC", "LC_ALL=C", "ps", "-o", "stat=,lstart=", "-p", str(pid)],
+                timeout=10,
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ProcessUnreadable(f"cannot run ps: {exc}") from exc
         out = r.stdout.strip()
         if r.returncode != 0 or not out:
             return None
-        return out
+        parts = out.split(None, 1)
+        if parts[0].startswith("Z"):
+            return None
+        if len(parts) < 2:
+            raise ProcessUnreadable(f"unexpected ps output: {out!r}")
+        return parts[1]
 
 
 class ProcProcessIdentity:

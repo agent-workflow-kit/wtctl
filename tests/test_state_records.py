@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 from pathlib import Path
 
@@ -63,18 +64,23 @@ def test_insert_requires_an_allocated_id(st: State) -> None:
         st.insert_record(rec("wt-aaaaaaaa"))
 
 
-def test_insert_rejects_bad_id_unknown_column_and_bad_enum(st: State) -> None:
+@pytest.mark.parametrize(
+    ("bad", "match"),
+    [
+        (rec("wt-AAAAAAAA"), "invalid record id"),
+        (rec("wt-aaaaaaa1"), "invalid record id"),  # '1' is not base32
+        (rec("wt-aaaaaaaa", nonsense=1), "unknown record fields"),
+        (rec("wt-aaaaaaaa", state="exploded"), "unknown record state"),
+        (rec("wt-aaaaaaaa", object_type="thing"), "unknown object_type"),
+        (rec("wt-aaaaaaaa", **{"state; drop table records; --": 1}), "unknown record fields"),
+    ],
+)
+def test_insert_rejects_bad_id_unknown_column_and_bad_enum(
+    st: State, bad: dict, match: str
+) -> None:
     st.reserve_id("wt-aaaaaaaa")
-    for bad in (
-        rec("wt-AAAAAAAA"),
-        rec("wt-aaaaaaa1"),  # '1' is not base32
-        rec("wt-aaaaaaaa", nonsense=1),
-        rec("wt-aaaaaaaa", state="exploded"),
-        rec("wt-aaaaaaaa", object_type="thing"),
-        rec("wt-aaaaaaaa", **{"state; drop table records; --": 1}),
-    ):
-        with pytest.raises((ValueError, WtctlError, Conflict)):
-            st.insert_record(bad)
+    with pytest.raises(ValueError, match=match):
+        st.insert_record(bad)
     assert st.get_record("wt-aaaaaaaa") is None
 
 
@@ -90,7 +96,7 @@ def test_record_roundtrip_with_types(st: State) -> None:
     assert got is not None
     assert got["owned"] is False and got["created_branch"] is None and got["depth"] == 0
     assert got["labels"] == ["a=1", "b=2"] and got["holders"] == ["agent#1"]
-    assert got["created"] == got["updated"] == "2026-01-01T00:00:00Z"
+    assert got["created"] == got["updated"] == "2026-01-01T00:00:00.000Z"
     assert got["removed_at"] is None
 
 
@@ -143,7 +149,7 @@ def test_transition_updates_state_fields_and_timestamp(st: State) -> None:
     clock.advance(5)
     r = st.transition("wt-aaaaaaaa", "creating", "active", head_at_create="a" * 40)
     assert r["state"] == "active" and r["head_at_create"] == "a" * 40
-    assert r["updated"] == "2026-01-01T00:00:05Z" and r["created"] == "2026-01-01T00:00:00Z"
+    assert r["updated"] == "2026-01-01T00:00:05.000Z" and r["created"] == "2026-01-01T00:00:00.000Z"
 
 
 def test_transition_from_any_of_several_expected_states(st: State) -> None:
@@ -168,7 +174,7 @@ def test_losing_to_a_tombstone_is_not_found_with_details(st: State) -> None:
         st.transition("wt-aaaaaaaa", "active", "partial")
     assert e.value.code == "not_found" and e.value.exit_code == 10
     d = e.value.fields["details"]
-    assert d["state"] == "removed" and d["removed_at"] == "2026-01-01T00:00:00Z"
+    assert d["state"] == "removed" and d["removed_at"] == "2026-01-01T00:00:00.000Z"
 
 
 def test_unknown_record_is_not_found(st: State) -> None:
@@ -182,7 +188,7 @@ def test_tombstone_transition_stamps_removed_at_and_is_final(st: State) -> None:
     put(st, "wt-aaaaaaaa")
     clock.advance(60)
     r = st.transition("wt-aaaaaaaa", "active", "gone")
-    assert r["removed_at"] == "2026-01-01T00:01:00Z"
+    assert r["removed_at"] == "2026-01-01T00:01:00.000Z"
     with pytest.raises(ValueError):
         st.transition("wt-aaaaaaaa", "removed", "active")  # expecting a tombstone is a bug
     with pytest.raises(WtctlError):
@@ -198,7 +204,7 @@ def test_transition_rejects_unknown_column_and_state(st: State) -> None:
     with pytest.raises(ValueError):
         st.transition("wt-aaaaaaaa", "active", "sideways")
     with pytest.raises(ValueError):
-        st.transition("wt-aaaaaaaa", "active", "partial", removed_at="2026-01-01T00:00:00Z")
+        st.transition("wt-aaaaaaaa", "active", "partial", removed_at="2026-01-01T00:00:00.000Z")
     got = st.get_record("wt-aaaaaaaa")
     assert got is not None and got["state"] == "active"
 
@@ -281,7 +287,7 @@ def test_path_never_matches_a_tombstone(tmp_path: Path, st: State) -> None:
 
 
 def test_relative_paths_and_junk_are_usage_errors(three: State) -> None:
-    for sel in ("./x", "../x", "a/b", "x.y", "WT-ABCD", "wt-abcd ", "wt-abcd\n", "wt-abc1", "-x"):
+    for sel in ("./x", "../x", "a/b", "x.y", "WT-ABCD", "wt-abcd ", "wt-abcd\n", "-x"):
         with pytest.raises(UsageError):
             three.resolve(sel)
 
@@ -290,6 +296,65 @@ def test_sql_wildcards_in_selector_do_not_match(three: State) -> None:
     for sel in ("wt-%%%%", "wt-____", "%%%%"):
         with pytest.raises(UsageError):
             three.resolve(sel)
+
+
+def test_out_of_alphabet_ids_of_4_to_8_chars_are_not_found(three: State) -> None:
+    for sel in ("abc1", "ABCD", "wt-0000", "wt-abc1", "wt-ab189xyz"):
+        with pytest.raises(WtctlError) as e:
+            three.resolve(sel)
+        assert e.value.code == "not_found" and e.value.exit_code == 10
+        assert "absolute path" in str(e.value)
+    with pytest.raises(UsageError):
+        three.resolve("ab1")  # still too short
+
+
+def test_unencodable_path_is_not_found(st: State) -> None:
+    with pytest.raises(WtctlError) as e:
+        st.resolve("/tmp/\udcff")
+    assert e.value.code == "not_found"
+
+
+def test_transition_name_or_path_collision_is_a_conflict(st: State) -> None:
+    put(st, "wt-aaaaaaaa", path="/w/x", name="x")
+    put(st, "wt-bbbbbbbb", path="/w/y", name="y")
+    with pytest.raises(Conflict) as e:
+        st.transition("wt-bbbbbbbb", "active", "partial", path="/w/x")
+    assert e.value.column == "path"
+    with pytest.raises(Conflict) as e2:
+        st.transition("wt-bbbbbbbb", "active", "partial", name="x")
+    assert e2.value.column == "name"
+    got = st.get_record("wt-bbbbbbbb")
+    assert got is not None and got["state"] == "active"
+
+
+def test_timestamps_are_fixed_width_and_sort_like_time(tmp_path: Path) -> None:
+    clock = FakeClock()
+    s = make_state(tmp_path, clock=clock)
+    start = clock.t
+    ids = []
+    for n, off in enumerate((1.0, 0.51, 0.5, 0.0)):  # inserted out of time order
+        clock.t = start + dt.timedelta(seconds=off)
+        i = f"wt-aaaaaaa{'abcd'[n]}"
+        s.reserve_id(i)
+        s.insert_record(rec(i, path=f"/w/{n}", name=f"n{n}"))
+        ids.append(i)
+    got = s.records()
+    assert [r["id"] for r in got] == [ids[3], ids[2], ids[1], ids[0]]
+    stamps = [r["created"] for r in got]
+    assert stamps == [
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.500Z",
+        "2026-01-01T00:00:00.510Z",
+        "2026-01-01T00:00:01.000Z",
+    ]
+    assert stamps == sorted(stamps)
+
+
+def test_throwaway_cannot_have_holders(st: State) -> None:
+    st.reserve_id("wt-aaaaaaaa")
+    with pytest.raises(ValueError, match="holders"):
+        st.insert_record(rec("wt-aaaaaaaa", object_type="throwaway", name=None), holders=["h"])
+    assert st.get_record("wt-aaaaaaaa") is None
 
 
 # --- labels -----------------------------------------------------------------------------------
@@ -346,3 +411,21 @@ def test_records_listing_orders_and_filters(st: State) -> None:
     assert [r["id"] for r in st.records()] == ["wt-bbbbbbbb"]
     assert [r["id"] for r in st.records(states=["removed"])] == ["wt-aaaaaaaa"]
     assert [r["id"] for r in st.records(include_tombstones=True)] == ["wt-aaaaaaaa", "wt-bbbbbbbb"]
+
+
+def test_noop_label_changes_leave_updated_alone(tmp_path: Path) -> None:
+    clock = FakeClock()
+    s = make_state(tmp_path, clock=clock)
+    put(s, "wt-aaaaaaaa")
+    s.add_labels("wt-aaaaaaaa", ["a=1"])
+    before = s.get_record("wt-aaaaaaaa")["updated"]  # type: ignore[index]
+    clock.advance(5)
+    s.add_labels("wt-aaaaaaaa", ["a=1"])
+    s.remove_labels("wt-aaaaaaaa", ["zz=9"])
+    assert s.get_record("wt-aaaaaaaa")["updated"] == before  # type: ignore[index]
+    s.add_labels("wt-aaaaaaaa", ["b=2"])
+    after_add = s.get_record("wt-aaaaaaaa")["updated"]  # type: ignore[index]
+    assert after_add != before
+    clock.advance(5)
+    s.remove_labels("wt-aaaaaaaa", ["b=2"])
+    assert s.get_record("wt-aaaaaaaa")["updated"] != after_add  # type: ignore[index]

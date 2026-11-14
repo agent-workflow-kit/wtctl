@@ -102,14 +102,22 @@ def test_zombie_counts_as_not_running() -> None:
         p.wait()
 
 
-def test_ps_fallback_parses_and_reports_missing() -> None:
+def test_ps_fallback_parses_pins_tz_and_locale_and_reports_missing() -> None:
     import subprocess
 
+    seen: list[list[str]] = []
+
     def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        seen.append(argv)
         if argv[-1] == "5":
-            return subprocess.CompletedProcess(argv, 0, "Mon Jan  5 10:00:00 2026\n", "")
+            return subprocess.CompletedProcess(argv, 0, "Ss   Mon Jan  5 10:00:00 2026\n", "")
+        if argv[-1] == "7":
+            return subprocess.CompletedProcess(argv, 0, "Z+   Mon Jan  5 10:00:00 2026\n", "")
         return subprocess.CompletedProcess(argv, 1, "", "")
 
     ident = gateway.PsProcessIdentity(runner=fake)
     assert ident.start_time(5) == "Mon Jan  5 10:00:00 2026"
     assert ident.start_time(6) is None
+    assert ident.start_time(7) is None  # zombie
+    assert seen[0][:3] == ["env", "TZ=UTC", "LC_ALL=C"]
+    assert seen[0][3:] == ["ps", "-o", "stat=,lstart=", "-p", "5"]

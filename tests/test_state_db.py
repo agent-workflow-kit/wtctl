@@ -212,3 +212,57 @@ def test_wiring_via_context_seam() -> None:
     ctx = Context(args=argparse.Namespace(), actor=Actor("auto:x"), runtime=Runtime())
     assert isinstance(ctx.state, State)
     assert ctx.state is ctx.state  # cached
+
+
+def test_first_open_race_on_mkdir_is_tolerated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_mkdir = Path.mkdir
+    target = tmp_path / "st"
+
+    def racing(self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False):
+        if self == target:
+            real_mkdir(self, mode=0o700)  # the peer wins the race
+            raise FileExistsError(str(self))
+        return real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", racing)
+    st = make_state(tmp_path)
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o700
+    st.close()
+
+
+def test_race_winner_that_is_a_symlink_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_mkdir = Path.mkdir
+    target = tmp_path / "st"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    def racing(self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False):
+        if self == target:
+            target.symlink_to(elsewhere)
+            raise FileExistsError(str(self))
+        return real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", racing)
+    with pytest.raises(WtctlError, match="symlink"):
+        make_state(tmp_path)
+
+
+def test_lock_timeout_while_opening_is_busy_not_internal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = tmp_path / "st"
+    d.mkdir(mode=0o700)
+    peer = sqlite3.connect(d / "state.db", isolation_level=None)
+    peer.execute("BEGIN EXCLUSIVE")
+    monkeypatch.setattr(state_mod, "_BUSY_TIMEOUT", 0.1)
+    try:
+        with pytest.raises(WtctlError) as e:
+            make_state(tmp_path)
+        assert e.value.code == "busy" and e.value.exit_code == 12
+    finally:
+        peer.execute("ROLLBACK")
+        peer.close()

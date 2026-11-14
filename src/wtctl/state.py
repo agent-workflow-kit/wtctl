@@ -38,6 +38,7 @@ OBJECT_TYPES = ("worktree", "throwaway")
 GLOBAL_LEASE = "global"
 LEASE_TTL = 600.0  # 10 minutes, renewed while held (docs/design.md, Concurrency)
 _POLL = 0.1
+_BUSY_TIMEOUT = 30.0  # seconds SQLite waits on a locked database (tests shorten it)
 
 _ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
 _ID_BODY = "[a-z2-7]"
@@ -174,6 +175,15 @@ def _internal(message: str) -> WtctlError:
     return WtctlError("internal", message)
 
 
+def _integrity_error(exc: sqlite3.IntegrityError) -> Exception:
+    """Conflict for a uniqueness violation on path/name/id, else ValueError."""
+    msg = str(exc)
+    for column in ("path", "name", "id"):
+        if f"records.{column}" in msg:
+            return Conflict(column, f"record {column} already in use: {msg}")
+    return ValueError(f"invalid record: {msg}")
+
+
 def _not_found(record_id: str, row: sqlite3.Row | tuple[Any, ...] | None) -> WtctlError:
     """exit 10; for a tombstone the error carries ``details: {state, removed_at}``."""
     if row is not None and row[0] in TOMBSTONE_STATES:
@@ -193,9 +203,14 @@ def _prepare_dir(d: Path) -> None:
         st = os.lstat(d)
     except FileNotFoundError:
         d.parent.mkdir(parents=True, exist_ok=True)
-        d.mkdir(mode=0o700)
-        os.chmod(d, 0o700)  # not subject to the umask
-        return
+        try:
+            d.mkdir(mode=0o700)
+        except FileExistsError:
+            pass  # a concurrent first open created it: fall through to the checks below
+        else:
+            os.chmod(d, 0o700)  # not subject to the umask
+            return
+        st = os.lstat(d)
     if stat.S_ISLNK(st.st_mode):
         raise _internal(f"refusing to use {d}: it is a symlink")
     if not stat.S_ISDIR(st.st_mode):
@@ -232,7 +247,7 @@ def _current_version(conn: sqlite3.Connection) -> int:
 
 
 def _connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, isolation_level=None, timeout=30.0)
+    conn = sqlite3.connect(path, isolation_level=None, timeout=_BUSY_TIMEOUT)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -293,6 +308,10 @@ class State:
                     conn.execute("INSERT INTO schema_version(version) VALUES (?)", (version,))
                     current = version
             return current
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc) or "busy" in str(exc):
+                raise WtctlError("busy", "state.db is locked by another process") from exc
+            raise _internal(f"cannot use state database {self.path}: {exc}") from exc
         except sqlite3.DatabaseError as exc:
             raise _internal(f"cannot use state database {self.path}: {exc}") from exc
 
@@ -321,10 +340,8 @@ class State:
     # -- time -----------------------------------------------------------------------------
 
     def _now(self) -> str:
-        return (
-            self.gateway.clock.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3].rstrip("0").rstrip(".")
-            + "Z"
-        )
+        """UTC, fixed width (``YYYY-MM-DDTHH:MM:SS.mmmZ``) so the text sorts like the time."""
+        return self.gateway.clock.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     # -- ids ------------------------------------------------------------------------------
 
@@ -452,6 +469,8 @@ class State:
             raise ValueError(f"id {fields['id']} was not allocated (use allocate_id first)")
         pairs = labelmod.merge_labels((), labels)
         hs = set(holders)
+        if hs and fields["object_type"] == "throwaway":
+            raise ValueError("a throwaway has no holders")
         for h in hs:
             _check_holder(h)
         now = self._now()
@@ -470,11 +489,7 @@ class State:
                 [row[k] for k in cols],
             )
         except sqlite3.IntegrityError as exc:
-            msg = str(exc)
-            for column in ("path", "name", "id"):
-                if f"records.{column}" in msg:
-                    raise Conflict(column, f"record {column} already in use: {msg}") from exc
-            raise ValueError(f"invalid record: {msg}") from exc
+            raise _integrity_error(exc) from exc
         c.executemany(
             'INSERT INTO labels(record_id, "key", value) VALUES (?, ?, ?)',
             [(row["id"], k, v) for k, v in pairs],
@@ -515,10 +530,13 @@ class State:
         assign = ", ".join(f"{k} = ?" for k in sets)
         marks = ",".join("?" * len(exp))
         with self._txn() as c:
-            cur = c.execute(
-                f"UPDATE records SET {assign} WHERE id = ? AND state IN ({marks})",
-                [*sets.values(), record_id, *exp],
-            )
+            try:
+                cur = c.execute(
+                    f"UPDATE records SET {assign} WHERE id = ? AND state IN ({marks})",
+                    [*sets.values(), record_id, *exp],
+                )
+            except sqlite3.IntegrityError as exc:
+                raise _integrity_error(exc) from exc
             if cur.rowcount == 0:
                 row = c.execute(
                     "SELECT state, removed_at FROM records WHERE id = ?", (record_id,)
@@ -545,15 +563,21 @@ class State:
         never match tombstones; a full id does, but only returns it with ``allow_tombstone``
         (otherwise exit 10 with ``details: {state, removed_at}``).
 
-        A relative path that happens to look like an id prefix is taken as the prefix.
+        A relative selector made only of letters and digits is read as an id or prefix, so one
+        that cannot be an id (outside ``a-z2-7``) is not found (10), not a usage error. A relative
+        path that happens to look like an id prefix is taken as the prefix.
         """
         if selector.startswith("/"):
             return self._resolve_path(selector)
         body = selector[3:] if selector.startswith("wt-") else selector
-        if not (1 <= len(body) <= 8 and all(ch in _ID_ALPHABET for ch in body)):
+        if not (1 <= len(body) <= 8 and body.isascii() and body.isalnum()):
             raise UsageError(f"{selector!r} is neither a record id (prefix) nor an absolute path")
         if len(body) < 4:
             raise UsageError(f"an id prefix needs at least 4 characters after wt-: {selector!r}")
+        if not all(ch in _ID_ALPHABET for ch in body):
+            raise WtctlError(
+                "not_found", f"no record matches {selector!r} (expected an id or an absolute path)"
+            )
         if len(body) == 8:
             full = "wt-" + body
             row = self._conn.execute("SELECT * FROM records WHERE id = ?", (full,)).fetchone()
@@ -582,11 +606,14 @@ class State:
             real = os.path.realpath(path)
         except ValueError as exc:
             raise UsageError(f"invalid path: {exc}") from exc
-        row = self._conn.execute(
-            "SELECT * FROM records WHERE path = ? AND state IN "
-            f"({','.join('?' * len(LIVE_STATES))})",
-            (real, *LIVE_STATES),
-        ).fetchone()
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM records WHERE path = ? AND state IN "
+                f"({','.join('?' * len(LIVE_STATES))})",
+                (real, *LIVE_STATES),
+            ).fetchone()
+        except UnicodeEncodeError:  # not representable as text, so no record can hold it
+            row = None
         if row is None:
             raise WtctlError("not_found", f"no record for path {path}")
         return self._build(row)
@@ -607,11 +634,13 @@ class State:
             self._require_live(c, record_id)
             current = self.label_rows(record_id)
             merged = labelmod.merge_labels(current, additions)
+            added = merged - set(current)
             c.executemany(
                 'INSERT INTO labels(record_id, "key", value) VALUES (?, ?, ?)',
-                [(record_id, k, v) for k, v in merged - set(current)],
+                [(record_id, k, v) for k, v in added],
             )
-            c.execute("UPDATE records SET updated = ? WHERE id = ?", (self._now(), record_id))
+            if added:
+                c.execute("UPDATE records SET updated = ? WHERE id = ?", (self._now(), record_id))
             return labelmod.render(merged)
 
     def remove_labels(self, record_id: str, removals: Iterable[str]) -> list[str]:
@@ -619,11 +648,13 @@ class State:
             self._require_live(c, record_id)
             current = set(self.label_rows(record_id))
             kept = labelmod.remove_labels(current, removals)
+            gone = current - kept
             c.executemany(
                 'DELETE FROM labels WHERE record_id = ? AND "key" = ? AND value = ?',
-                [(record_id, k, v) for k, v in current - kept],
+                [(record_id, k, v) for k, v in gone],
             )
-            c.execute("UPDATE records SET updated = ? WHERE id = ?", (self._now(), record_id))
+            if gone:
+                c.execute("UPDATE records SET updated = ? WHERE id = ?", (self._now(), record_id))
             return labelmod.render(kept)
 
     # -- leases ---------------------------------------------------------------------------
