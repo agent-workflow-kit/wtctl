@@ -73,7 +73,11 @@ def test_abbreviated_flags_are_not_accepted(capsys: pytest.CaptureFixture[str]) 
     assert run_cli(capsys, "remove", SID, "--forc", "--actor", "human:a").code == 2
 
 
-@pytest.mark.parametrize("key", sorted(MINIMAL))
+# Commands whose handler exists; each issue adds its own line.
+IMPLEMENTED = {"list", "show", "label_add", "label_remove"}  # #7
+
+
+@pytest.mark.parametrize("key", sorted(set(MINIMAL) - IMPLEMENTED))
 def test_unimplemented_commands_exit_1_internal(
     capsys: pytest.CaptureFixture[str], key: str
 ) -> None:
