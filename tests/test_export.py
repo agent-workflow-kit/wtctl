@@ -122,6 +122,8 @@ def test_since_is_inclusive(capsys: pytest.CaptureFixture[str]) -> None:
         "2026-03-10",
         "2026-03-10T12:00:00",
         "99999999999999w",
+        "9" * 5000 + "d",
+        "12345678901d",
     ],
 )
 def test_invalid_since_is_a_usage_error(capsys: pytest.CaptureFixture[str], bad: str) -> None:
@@ -196,3 +198,71 @@ def test_export_does_not_need_a_human_actor(capsys: pytest.CaptureFixture[str]) 
     seed()
     rt = Runtime(stdin_isatty=False, gateway=Gateway(clock=FixedClock(NOW)))
     assert main(["export", "--actor", "auto:report"], runtime=rt) == 0
+
+
+def test_blank_lines_not_counted_but_missing_ts_with_since_is(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    j = at(NOW)
+    j.directory.mkdir(parents=True, mode=0o700)
+    j.log_path.write_bytes(b'\n\n{"n":1}\n{"ts":"2026-03-10T11:00:00.000Z","n":2}\n')
+    code, out, err = export(capsys, "--log")
+    assert (code, err) == (0, "")
+    assert len(out.splitlines()) == 2
+    code, out, err = export(capsys, "--log", "--since", "1d")
+    assert [json.loads(x)["n"] for x in out.splitlines()] == [2]
+    assert "skipped 1 unreadable line" in err
+
+
+def test_non_finite_numbers_are_skipped(capsys: pytest.CaptureFixture[str]) -> None:
+    j = at(NOW)
+    j.directory.mkdir(parents=True, mode=0o700)
+    j.log_path.write_bytes(b'{"n":1e999}\n{"n":2}\n')
+    code, out, err = export(capsys, "--log")
+    assert [json.loads(x)["n"] for x in out.splitlines()] == [2]
+    assert "skipped 1" in err
+
+
+def test_export_streams_without_holding_all_records(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    j = at(NOW)
+    for n in range(50):
+        j.log("fetch", actor=None, details={"n": n})
+    live = 0
+    peak = 0
+    real_loads = json.loads
+    import wtctl.audit as audit_mod
+    import wtctl.commands.export as export_mod
+
+    real_render = export_mod.render_json
+
+    def counting(*a: object, **kw: object) -> object:
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        return real_loads(*a, **kw)  # type: ignore[arg-type]
+
+    def render(data: object) -> str:
+        nonlocal live
+        live -= 1  # a record is done once rendered
+        return real_render(data)
+
+    monkeypatch.setattr(audit_mod.json, "loads", counting)
+    monkeypatch.setattr(export_mod, "render_json", render)
+    for extra in ([], ["--json"]):
+        live = peak = 0
+        code, out, _ = export(capsys, "--log", *extra)
+        assert code == 0
+        assert peak <= 2
+    assert len(real_loads(out)) == 50
+
+
+def test_jsonl_and_json_output_bytes(capsys: pytest.CaptureFixture[str]) -> None:
+    at(NOW).log("fetch", actor=None, details={"n": 1})
+    at(NOW).log("fetch", actor=None, details={"n": 2})
+    _, out, _ = export(capsys, "--log")
+    lines = out.splitlines()
+    assert len(lines) == 2 and out == "\n".join(lines) + "\n"
+    _, jout, _ = export(capsys, "--log", "--json")
+    assert jout == "[" + ",".join(lines) + "]\n"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from collections.abc import Callable
 
 from ..audit import parse_ts, read_records
 from ..context import Context, Result
@@ -11,7 +12,7 @@ from ..errors import UsageError
 from ..output import render_json
 from ..state import state_path
 
-_DURATION = re.compile(r"([1-9][0-9]*)([smhdw])")
+_DURATION = re.compile(r"([1-9][0-9]{0,9})([smhdw])")
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
@@ -36,10 +37,20 @@ def run(ctx: Context) -> Result:
     args = ctx.args
     since = parse_since(args.since, ctx.gateway.clock.now()) if args.since is not None else None
     name = "log.jsonl" if args.log else "audit.jsonl"
-    records, skipped = read_records(state_path().parent / name, since=since)
-    stderr = f"skipped {skipped} unreadable line(s) in {name}" if skipped else ""
-    return Result(
-        data=records,
-        human="\n".join(render_json(r) for r in records),
-        stderr=stderr,
-    )
+    reader = read_records(state_path().parent / name, since=since)  # refuses unsafe files here
+
+    def stream(as_json: bool, write: Callable[[str], None]) -> str:
+        try:
+            if as_json:
+                write("[")
+                for n, rec in enumerate(reader):
+                    write(("," if n else "") + render_json(rec))
+                write("]\n")
+            else:
+                for rec in reader:
+                    write(render_json(rec) + "\n")
+        finally:
+            reader.close()
+        return f"skipped {reader.skipped} unreadable line(s) in {name}" if reader.skipped else ""
+
+    return Result(data=None, stream=stream)

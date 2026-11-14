@@ -139,9 +139,13 @@ class Result:
     """A handler's success output.
 
     ``data`` is printed with ``--json``; ``human`` goes to stdout without it; ``stderr`` is the
-    summary line(s) on stderr (suppressed by ``--quiet``).
+    summary line(s) on stderr (suppressed by ``--quiet``). A handler with output too large to
+    hold may set ``stream`` instead: it is called with ``as_json`` and a ``write`` function for
+    stdout, writes everything incrementally, and returns the stderr text (``data`` and ``human``
+    are then unused).
     """
 
     data: Any
     human: str = ""
     stderr: str = ""
+    stream: Callable[[bool, Callable[[str], None]], str] | None = None

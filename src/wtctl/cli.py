@@ -158,7 +158,9 @@ def _trace(exc: BaseException) -> str:
 
 
 def _emit_result(result: Result, ctx: Context) -> None:
-    if ctx.json:
+    if result.stream is not None:
+        result.stderr = result.stream(ctx.json, lambda text: _write(sys.stdout, text))
+    elif ctx.json:
         _write(sys.stdout, render_json(result.data) + "\n")
     elif result.human:
         _write(sys.stdout, escape_text_lines(result.human.rstrip("\n")) + "\n")

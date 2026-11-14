@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import os
 import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -602,3 +603,275 @@ def test_journal_for_context_uses_state_dir_and_gateway_clock(tmp_path: Path) ->
     assert j.directory == Path(os.environ["XDG_STATE_HOME"]) / "wtctl"
     j.log("fetch", actor=ctx.actor.value, decision_ids=ctx.decision_ids)
     assert records(j.log_path)[0]["ts"].startswith("2026-03-04")
+
+
+# --- review round 1 ------------------------------------------------------------------------------
+
+
+def _redact_via_log(tmp_path: Path, text: str, **kw: Any) -> str:
+    j = make(tmp_path, **kw)
+    j.log("hook", actor=None, details={"s": text})
+    (rec,) = records(j.log_path)
+    return str(rec["details"]["s"])
+
+
+@pytest.mark.parametrize(
+    "text,leaked",
+    [
+        ('{"password": "hunter2xyz"}', "hunter2xyz"),
+        ("{'token':'hunter2xyz'}", "hunter2xyz"),
+        ("AWS_SECRET_ACCESS_KEY=hunter2xyz", "hunter2xyz"),
+        ("SECRET_KEY=hunter2xyz", "hunter2xyz"),
+        ("client_secret_value=hunter2xyz", "hunter2xyz"),
+        ("Cookie: sid=hunter2xyz; other=1", "hunter2xyz"),
+        ("Set-Cookie: sid=hunter2xyz; HttpOnly", "hunter2xyz"),
+        ("run --password hunter2xyz --token second2xyz", "hunter2xyz"),
+        ("run --password hunter2xyz --token second2xyz", "second2xyz"),
+        ("password='unterminated hunter2xyz", "hunter2xyz"),
+        ('password="a\\"bcdhunter2xyz"', "hunter2xyz"),
+        ("password: alpha hunter2xyz gamma", "hunter2xyz"),
+        ("credential=hunter2xyz", "hunter2xyz"),
+        ("access key: hunter2xyz", "hunter2xyz"),
+        ("key sk-" + "A1b2C3d4" * 4, "A1b2C3d4A1b2"),
+        ("id AKIAABCDEFGHIJKLMNOP end", "AKIAABCDEFGHIJKLMNOP"),
+        ("https://user:p@ssword@example.test/x", "ssword"),
+        ("https://user:p@ss@word@example.test/x", "word@"),
+    ],
+)
+def test_r1_r2_redaction_false_negatives(tmp_path: Path, text: str, leaked: str) -> None:
+    assert leaked not in _redact_via_log(tmp_path, text)
+
+
+def test_r2_userinfo_keeps_host_and_path(tmp_path: Path) -> None:
+    out = _redact_via_log(tmp_path, "https://user:p@ssword@example.test/x?a=b@c")
+    assert out == "https://example.test/x?a=b@c"
+
+
+def test_r1_json_structure_survives_redaction(tmp_path: Path) -> None:
+    out = _redact_via_log(tmp_path, '{"password": "x1", "user": "bob"}')
+    assert out == '{"password": [redacted], "user": "bob"}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["a" * 16000, "token" * 3000, "ghp_" + "a" * 16000, "https://" + "a" * 16000, "x://" * 4000]
+    + ["token=" * 3000, "password: " * 1500, 'password="' * 1500, "a@" * 8000],
+)
+def test_r4_redaction_is_linear(text: str) -> None:
+    s = audit._Sanitizer([], 4096, 1000, 8)
+    t0 = time.perf_counter()
+    s.text(text)
+    assert time.perf_counter() - t0 < 0.1
+
+
+def test_r4_whole_record_of_many_long_values_is_bounded(tmp_path: Path) -> None:
+    j = make(tmp_path)
+    t0 = time.perf_counter()
+    j.log("hook", actor=None, details={f"k{n}": "a" * 16000 for n in range(1000)})
+    assert time.perf_counter() - t0 < 5
+
+
+def test_r3_decision_ids_that_leak_are_rejected(tmp_path: Path) -> None:
+    j = make(tmp_path, secrets=["configuredsecret1"])
+    for bad in (
+        "ghp_" + "A1b2C3d4" * 5,
+        "https://u:pw@h.test",
+        "x-configuredsecret1",
+        "AKIAABCDEFGHIJKLMNOP",
+    ):
+        with pytest.raises(WtctlError):
+            j.log("hook", actor=None, decision_ids=[bad])
+        with pytest.raises(WtctlError):
+            audit_remove(j, decision_ids=[bad])
+    assert not j.log_path.exists() and not j.audit_path.exists()
+    ids, warnings = audit.normalize_decision_ids(["ok", "ghp_" + "A1b2C3d4" * 5])
+    assert ids == ["ok"] and len(warnings) == 1
+    ids, _ = audit.normalize_decision_ids(["a-configuredsecret1"], secrets=["configuredsecret1"])
+    assert ids == []
+
+
+def test_r5_identity_fields_are_not_rewritten_by_key_value_redaction(tmp_path: Path) -> None:
+    j = make(tmp_path)
+    audit_remove(j, target_path="/home/u/token=abc/wt")
+    j.audit(
+        "branch_delete",
+        actor="human:a",
+        decision_ids=[],
+        target_id=ID,
+        target_path="/home/u/password=1/wt",
+        inputs={"branch": "fix/token=abc", "sha": SHA},
+    )
+    j.log("create", actor=None, details={"path": "/home/u/token=abc/wt", "note": "token=abc"})
+    a1, a2 = records(j.audit_path)
+    assert a1["target"]["path"] == "/home/u/token=abc/wt"
+    assert a2["target"]["path"] == "/home/u/password=1/wt"
+    assert a2["inputs"]["branch"] == "fix/token=abc"
+    (rec,) = records(j.log_path)
+    assert rec["details"] == {"path": "/home/u/token=abc/wt", "note": "token=[redacted]"}
+
+
+def test_r5_identity_fields_still_get_userinfo_tokens_and_secrets_removed(tmp_path: Path) -> None:
+    j = make(tmp_path, secrets=["configuredsecret1"])
+    audit_remove(j, target_path="/w/configuredsecret1/https://u:pw@h.test/" + "ghp_" + "A" * 24)
+    raw = j.audit_path.read_text()
+    assert "configuredsecret1" not in raw and "pw@" not in raw and "AAAAAAAA" not in raw
+
+
+def test_r5_secret_key_names_only_redact_containers_and_strings(tmp_path: Path) -> None:
+    j = make(tmp_path)
+    j.log(
+        "hook",
+        actor=None,
+        details={
+            "tokens_used": 5,
+            "credentials_ok": True,
+            "secret_ratio": 0.5,
+            "token_none": None,
+            "token": "abc",
+            "secrets": ["a"],
+            "password": {"x": 1},
+        },
+    )
+    (rec,) = records(j.log_path)
+    d = rec["details"]
+    assert (d["tokens_used"], d["credentials_ok"], d["secret_ratio"]) == (5, True, 0.5)
+    assert d["token_none"] is None
+    assert (d["token"], d["secrets"], d["password"]) == ("[redacted]",) * 3
+
+
+def test_r7_prepare_audit_raises_before_any_mutation(tmp_path: Path) -> None:
+    j = make(tmp_path)
+    kw: dict[str, Any] = {
+        "actor": "human:a",
+        "decision_ids": [],
+        "target_id": ID,
+        "target_path": "/p",
+    }
+    many = {"old_digest": DIGEST, "new_digest": DIGEST, "items": list(range(1001)), "anchors": []}
+    with pytest.raises(WtctlError):
+        j.prepare_audit("baseline_accept", inputs=many, **kw)
+    big = {**many, "items": ["x" * 3000] * 20}
+    with pytest.raises(WtctlError):
+        j.prepare_audit("baseline_accept", inputs=big, **kw)
+    assert not j.directory.exists()  # preparing writes nothing
+
+
+def test_r7_audit_uses_prepare_and_commit_writes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    j = make(tmp_path)
+    calls: list[str] = []
+    real = Journal.prepare_audit
+
+    def spy(self: Journal, action: str, **kw: Any) -> Any:
+        calls.append(action)
+        return real(self, action, **kw)
+
+    monkeypatch.setattr(Journal, "prepare_audit", spy)
+    audit_remove(j)
+    assert calls == ["remove"]
+    prepared = j.prepare_audit(
+        "remove",
+        actor="human:a",
+        decision_ids=[],
+        target_id=ID,
+        target_path="/p",
+        inputs=remove_inputs(),
+    )
+    assert not j.audit_path.read_bytes().count(b"\n") > 1
+    rec = j.commit_audit(prepared)
+    assert records(j.audit_path)[-1] == rec
+
+
+@pytest.mark.parametrize(
+    "code,kw,level",
+    [
+        (0, {}, "info"),
+        (1, {}, "error"),
+        (1, {"refused": True}, "error"),
+        (1, {"post_hook_failed": True}, "error"),
+        (10, {}, "info"),
+        (11, {}, "warn"),
+        (12, {}, "warn"),
+        (13, {}, "info"),
+        (13, {"escalated": True}, "warn"),
+        (20, {}, "warn"),
+        (21, {}, "info"),
+        (0, {"refused": True}, "warn"),
+        (0, {"post_hook_failed": True}, "warn"),
+    ],
+)
+def test_r8_level_for_table(code: int, kw: dict[str, bool], level: str) -> None:
+    assert audit.level_for(code, **kw) == level
+
+
+@pytest.mark.parametrize("literal", ["1e999", "-1e999", "[1e999]", '{"a":-1e999}'])
+def test_r9_non_finite_floats_are_skipped_and_counted(tmp_path: Path, literal: str) -> None:
+    p = tmp_path / "f.jsonl"
+    p.write_bytes(b'{"ts":"2026-03-10T12:00:00.000Z","x":' + literal.encode() + b"}\n")
+    p.write_bytes(p.read_bytes() + b'{"ok":1}\n')
+    reader = audit.read_records(p)
+    assert list(reader) == [{"ok": 1}]
+    assert reader.skipped == 1
+
+
+def test_r9_huge_integers_are_skipped_and_counted(tmp_path: Path) -> None:
+    p = tmp_path / "f.jsonl"
+    p.write_bytes(b'{"x":' + b"9" * 5000 + b'}\n{"ok":1}\n')
+    reader = audit.read_records(p)
+    assert list(reader) == [{"ok": 1}]
+    assert reader.skipped == 1
+
+
+def test_r11_since_counts_records_without_a_usable_ts(tmp_path: Path) -> None:
+    p = tmp_path / "f.jsonl"
+    p.write_bytes(
+        b'{"ts":"2026-03-10T12:00:00.000Z","n":1}\n'
+        b'{"n":2}\n'
+        b'{"ts":"junk","n":3}\n'
+        b'{"ts":"2020-01-01T00:00:00.000Z","n":4}\n'
+    )
+    since = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    reader = audit.read_records(p, since=since)
+    assert [r["n"] for r in reader] == [1]
+    assert reader.skipped == 2
+
+
+def test_r13_reader_is_lazy(tmp_path: Path) -> None:
+    p = tmp_path / "f.jsonl"
+    p.write_bytes(b'{"n":1}\n{"n":2}\n')
+    reader = audit.read_records(p)
+    it = iter(reader)
+    assert next(it) == {"n": 1}
+    assert reader.skipped == 0
+    assert list(it) == [{"n": 2}]
+
+
+def test_r13_reader_refuses_a_symlink_before_iterating(tmp_path: Path) -> None:
+    target = tmp_path / "t"
+    target.write_text("{}\n")
+    p = tmp_path / "f.jsonl"
+    p.symlink_to(target)
+    with pytest.raises(WtctlError):
+        audit.read_records(p)
+
+
+def test_r15_overlapping_secrets_mask_the_longest_first(tmp_path: Path) -> None:
+    out = _redact_via_log(
+        tmp_path, "see abcdef-longer-tail here", secrets=["abcdef", "abcdef-longer-tail"]
+    )
+    assert out == "see [redacted] here"
+
+
+def test_r16_clone_accept_requires_anchors(tmp_path: Path) -> None:
+    j = make(tmp_path)
+    with pytest.raises(WtctlError):
+        j.audit(
+            "clone_accept",
+            actor="human:a",
+            decision_ids=[],
+            target_id=None,
+            target_path="/c",
+            inputs={"repo": REPO, "clone_path": "/c", "anchors": []},
+        )
+    assert not j.audit_path.exists()
