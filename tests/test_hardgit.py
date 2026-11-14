@@ -53,8 +53,9 @@ def test_env_is_built_from_scratch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert set(env) == {
         "PATH", "HOME", "LC_ALL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
         "GIT_TERMINAL_PROMPT", "GIT_ALLOW_PROTOCOL", "GIT_NO_LAZY_FETCH",
-        "GIT_NO_REPLACE_OBJECTS", "GIT_GRAFT_FILE", "GIT_SSH_VARIANT",
+        "GIT_NO_REPLACE_OBJECTS", "GIT_GRAFT_FILE", "GIT_SSH_VARIANT", "GIT_EDITOR",
     }  # fmt: skip
+    assert env["GIT_EDITOR"] == ":"
     assert env["PATH"] == "/opt/g/bin:/usr/bin:/bin"
     assert env["GIT_ALLOW_PROTOCOL"] == "none"
     assert env["GIT_NO_LAZY_FETCH"] == "1"
@@ -105,7 +106,10 @@ def test_command_line_carries_the_full_override_set(git: Git, repo: Path) -> Non
         "core.attributesFile=/dev/null", "log.showSignature=false",
         "fetch.recurseSubmodules=false", "submodule.recurse=false", "gc.auto=0",
         "maintenance.auto=false", "core.useReplaceRefs=false", "core.commitGraph=false",
-        "http.followRedirects=false",
+        "http.followRedirects=false", "core.editor=true", "sequence.editor=true",
+        "gpg.ssh.defaultKeyCommand=true", "commit.gpgsign=false", "tag.gpgsign=false",
+        "push.gpgsign=false", "interactive.diffFilter=", "diff.submodule=short",
+        "core.alternateRefsCommand=true", "gpg.program=/bin/false",
     ):  # fmt: skip
         assert expected in cs
     assert f"--git-dir={repo / '.git'}" in cmd.argv
@@ -120,11 +124,15 @@ def test_effective_values_match_the_overrides_in_a_repository(git: Git, repo: Pa
 
 
 def test_network_commands_get_timeouts_and_must_have_one(git: Git, repo: Path) -> None:
-    cmd = git.build(["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="https")
+    cmd = git.build(
+        ["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="https", tool_owned=True
+    )
     cs = [cmd.argv[i + 1] for i, a in enumerate(cmd.argv) if a == "-c"]
     assert "http.lowSpeedLimit=1000" in cs and "http.lowSpeedTime=60" in cs
     with pytest.raises(ValueError, match="timeout"):
-        git.run(["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="https")
+        git.run(
+            ["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="https", tool_owned=True
+        )
 
 
 @pytest.mark.parametrize(
@@ -293,7 +301,9 @@ def test_check_version_on_the_installed_git(private_home: Path, tmp_path: Path) 
         (res(1, "something else"), FetchKind.FAILED, None),
         (res(128, "fatal: could not read Username for 'https://h'"), FetchKind.AUTH_REQUIRED, None),
         (res(128, "fatal: terminal prompts disabled"), FetchKind.AUTH_REQUIRED, None),
-        (res(128, "remote: Authentication failed"), FetchKind.AUTH_REQUIRED, None),
+        (res(128, "fatal: Authentication failed for 'https://h/'"), FetchKind.AUTH_REQUIRED, None),
+        (res(128, "remote: Authentication failed"), FetchKind.FAILED, None),
+        (res(128, "remote: Host key verification failed.\nfatal: boom"), FetchKind.FAILED, None),
         (res(128, "git@h: Permission denied (publickey)."), FetchKind.AUTH_REQUIRED, None),
         (res(128, "Host key verification failed."), FetchKind.AUTH_REQUIRED, None),
         (res(128, "fatal: unable to access: The requested URL returned error: 401"),
@@ -423,7 +433,7 @@ def test_parse_worktree_list_matches_real_git(git: Git, repo: Path, private_home
     plain_git(["worktree", "add", "-q", "--detach", str(wt)], cwd=repo, home=private_home)
     plain_git(["worktree", "lock", "--reason", "because", str(wt)], cwd=repo, home=private_home)
     r = git.run(["worktree", "list", "--porcelain"], git_dir=repo / ".git", work_tree=repo)
-    got = parse_worktree_list(r.stdout)
+    got = parse_worktree_list(r.stdout, expected=2)
     assert [e.path for e in got] == [str(repo), str(wt)]
     assert got[0].branch == "refs/heads/main" and got[1].detached and got[1].locked == "because"
 
@@ -431,9 +441,9 @@ def test_parse_worktree_list_matches_real_git(git: Git, repo: Path, private_home
 def test_parse_worktree_list_fails_closed_on_a_newline_in_a_path() -> None:
     data = b"worktree /a\nb\nHEAD abc\nbranch refs/heads/m\n\n"
     with pytest.raises(PorcelainError):
-        parse_worktree_list(data)
+        parse_worktree_list(data, expected=None)
     with pytest.raises(PorcelainError):
-        parse_worktree_list(b"HEAD abc\n\n")
+        parse_worktree_list(b"HEAD abc\n\n", expected=None)
 
 
 def test_refuse_newline_path() -> None:
@@ -480,3 +490,308 @@ def test_timeout_kills_the_process_group_by_exact_pid(tmp_path: Path) -> None:
 
 def _no_sleep(seconds: float) -> None:
     raise AssertionError("a non-contention failure must not be retried")
+
+
+# -- review round 1 ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sub,args",
+    [
+        ("diff", ["--ext-diff"]), ("diff", ["--ext"]), ("diff", ["--ex"]), ("log", ["--ext-d"]),
+        ("show", ["--no-no-ext-diff"]), ("diff", ["--no-no-textconv"]),
+        ("diff", ["--textconv"]), ("diff", ["--textc"]), ("show", ["--textconv"]),
+        ("cat-file", ["--textconv", "HEAD:x"]), ("cat-file", ["--textc", "HEAD:x"]),
+        ("diff", ["--submodule=diff"]), ("diff", ["--submodule=log"]), ("diff", ["--submodule"]),
+        ("diff-tree", ["--submod=diff"]), ("log", ["--submodule=diff"]),
+        ("diff", ["--ignore-submodules=none"]), ("diff", ["--ignore-submodules=dirty"]),
+        ("diff-files", ["--ignore-submodules=untracked"]), ("diff", ["--ignore-submodules"]),
+        ("show", ["--ignore-sub=none"]), ("diff", ["--no-ext-diff", "--ext-diff"]),
+        ("diff", ["x", "--ext-diff", "--", "y"]),
+    ],
+)  # fmt: skip
+def test_options_that_undo_the_guards_are_rejected(
+    git: Git, repo: Path, sub: str, args: list[str]
+) -> None:
+    with pytest.raises(ValueError):
+        git.build([sub, *args], git_dir=repo / ".git", cwd=repo)
+
+
+@pytest.mark.parametrize(
+    "sub,args",
+    [
+        ("diff", ["--submodule=short"]), ("diff", ["--ignore-submodules=all"]),
+        ("diff", ["--text"]), ("diff", ["--no-ext-diff"]), ("diff", ["--no-textconv"]),
+        ("diff", ["--", "--ext-diff"]), ("diff", ["x", "--", "--textconv", "--submodule=log"]),
+        ("cat-file", ["--filters", "HEAD:x"]), ("diff", ["--exit-code", "--stat"]),
+        ("rev-list", ["--submodule=diff", "x"]), ("status", ["--untracked-files=no"]),
+    ],
+)  # fmt: skip
+def test_harmless_options_are_accepted(git: Git, repo: Path, sub: str, args: list[str]) -> None:
+    git.build([sub, *args], git_dir=repo / ".git", cwd=repo)
+
+
+def test_guards_come_first_and_unconditionally(git: Git, repo: Path) -> None:
+    for sub in ("diff", "diff-files", "diff-index", "diff-tree", "log", "show"):
+        argv = git.build([sub, "--no-ext-diff", "--", "--no-ext-diff"], git_dir=repo / ".git",
+                         cwd=repo).argv  # fmt: skip
+        i = argv.index(sub)
+        assert argv[i + 1 : i + 3] == ["--no-ext-diff", "--ignore-submodules=all"], sub
+    argv = git.build(["diff"], git_dir=repo / ".git", cwd=repo).argv
+    assert argv[argv.index("diff") + 1 :] == [
+        "--no-ext-diff", "--ignore-submodules=all", "--no-textconv",
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "extra,expected",
+    [([], True), (["-uno"], False), (["-u"], False), (["--untracked-files=no"], False),
+     (["--untracked"], False), (["--ignored=no"], True), (["--", "-uno"], True)],
+)  # fmt: skip
+def test_status_lists_untracked_files_unless_the_caller_chooses(
+    git: Git, repo: Path, extra: list[str], expected: bool
+) -> None:
+    argv = git.build(["status", *extra], git_dir=repo / ".git", cwd=repo).argv
+    assert ("--untracked-files=all" in argv) is expected
+
+
+def test_scheme_needs_a_tool_owned_repository(git: Git, repo: Path) -> None:
+    with pytest.raises(ValueError, match="tool_owned"):
+        git.build(["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="https")
+    with pytest.raises(ValueError, match="tool_owned"):
+        git.run(["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="file", timeout=5)
+    git.build(["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="file", tool_owned=True)
+    # no scheme, no flag needed
+    git.build(["ls-remote", "x"], git_dir=repo / ".git", cwd=repo)
+
+
+@pytest.mark.parametrize("bad", ["git", "", "./git", "bin/git"])
+def test_git_bin_must_be_absolute(bad: str, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        build_env(git_bin=bad, home="/h")
+    with pytest.raises(ValueError, match="absolute"):
+        Git(Gateway(), bad, "/h")
+    assert not any(e == "" for e in build_env(git_bin="/u/git", home="/h")["PATH"].split(":"))
+
+
+@pytest.mark.parametrize(
+    "key,ok",
+    [
+        ("http.extraheader", True), ("http.https://h/.extraHeader", True),
+        ("HTTP.https://h/.EXTRAHEADER", True), ("http.proxy", False),
+        ("http.https://h/.proxy", False), ("core.fsmonitor", False),
+        ("remote.o.extraheader", False),
+        ("nodot", False), ("http.extraheader.x", False), ("filter.a.clean", False),
+    ],
+)  # fmt: skip
+def test_extra_config_takes_only_extra_headers(git: Git, repo: Path, key: str, ok: bool) -> None:
+    if ok:
+        git.build(["rev-parse", "HEAD"], git_dir=repo / ".git", cwd=repo, extra_config=[(key, "v")])
+    else:
+        with pytest.raises(ValueError, match="extraheader"):
+            git.build(["rev-parse", "HEAD"], git_dir=repo / ".git", cwd=repo,
+                      extra_config=[(key, "v")])  # fmt: skip
+
+
+def test_run_applies_a_default_timeout_that_the_caller_can_override(
+    private_home: Path, repo: Path
+) -> None:
+    seen: list[object] = []
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        seen.append(kw.get("timeout"))
+        return res(0)
+
+    g = Git(Gateway(git_runner=runner), GIT, str(private_home))
+    g.run(["rev-parse", "HEAD"], git_dir=repo / ".git", cwd=repo)
+    g.run(["rev-parse", "HEAD"], git_dir=repo / ".git", cwd=repo, timeout=7)
+    g.run(["ls-remote", "x"], git_dir=repo / ".git", cwd=repo, scheme="file", tool_owned=True,
+          timeout=9)  # fmt: skip
+    # each run is preceded by the config listing (30 seconds)
+    assert seen == [30, hardgit.DEFAULT_TIMEOUT, 30, 7, 30, 9]
+    assert hardgit.DEFAULT_TIMEOUT == 300
+
+
+def test_non_utf8_names_survive_the_round_trip() -> None:
+    raw = b"filter.ev\xffil.clean\nx\0http.https://h/\xff.extraheader\nA: b\0"
+    entries = hardgit.parse_config_list(raw)
+    (name,) = hardgit.filter_names(entries)
+    (header,) = hardgit.extra_header_keys(entries)
+    assert os.fsencode(name) == b"ev\xffil"
+    assert os.fsencode(header) == b"http.https://h/\xff.extraheader"
+    env = build_env(
+        git_bin="/u/git", home="/h",
+        config=[(header, ""), *hardgit.filter_config([name], {})],
+    )  # fmt: skip
+    assert os.fsencode(env["GIT_CONFIG_KEY_0"]) == b"http.https://h/\xff.extraheader"
+    assert os.fsencode(env["GIT_CONFIG_KEY_1"]) == b"filter.ev\xffil.clean"
+
+
+def test_names_parse_from_real_config_output(git: Git, repo: Path, private_home: Path) -> None:
+    for key, value in (
+        ("filter.a.b.clean", "x"), ("filter.My.Lfs.smudge", "y"),
+        ("http.https://x/.extraHeader", "A: b"), ("http.extraheader", "C: d"),
+    ):  # fmt: skip
+        assert plain_git(["config", key, value], cwd=repo, home=private_home).returncode == 0
+    r = git.run(["config", "--list", "-z"], git_dir=repo / ".git", cwd=repo)
+    entries = hardgit.parse_config_list(r.stdout)
+    assert hardgit.filter_names(entries) == ["a.b", "My.Lfs"]
+    assert hardgit.extra_header_keys(entries) == ["http.https://x/.extraheader", "http.extraheader"]
+
+
+# -- worktree list (item 10) --------------------------------------------------------------------
+
+FORGED = b"worktree /a\nHEAD a\n\nworktree /v\nHEAD b\nbranch refs/heads/m\n\n"
+
+
+def test_worktree_list_count_must_match_the_linked_directories() -> None:
+    assert len(parse_worktree_list(FORGED, expected=2)) == 2
+    with pytest.raises(WtctlError) as e:
+        parse_worktree_list(FORGED, expected=1)
+    assert e.value.code == "internal"
+
+
+def test_a_newline_path_cannot_forge_a_worktree_entry_in_real_git(
+    git: Git, repo: Path, private_home: Path
+) -> None:
+    (repo / "a").write_text("1\n")
+    plain_git(["add", "a"], cwd=repo, home=private_home)
+    plain_git(["commit", "-q", "-m", "x"], cwd=repo, home=private_home)
+    evil = repo.parent / "x\nHEAD 0\n\nworktree " / "v"
+    r = plain_git(["worktree", "add", "-q", "--detach", str(evil)], cwd=repo, home=private_home)
+    assert r.returncode == 0, r.stderr
+    out = git.run(["worktree", "list", "--porcelain"], git_dir=repo / ".git", work_tree=repo)
+    # Locally the forged text is perfectly valid and shows three entries...
+    assert len(parse_worktree_list(out.stdout, expected=None)) == 3
+    # ...but there are only two worktrees (main plus one linked directory).
+    with pytest.raises(WtctlError) as e:
+        parse_worktree_list(out.stdout, expected=2)
+    assert e.value.code == "internal"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"worktree /a\nHEAD a\nHEAD b\n\n",  # duplicate attribute
+        b"worktree /a\nbranch refs/heads/m\n\n",  # no HEAD
+        b"worktree /a\nHEAD a\nbranch main\n\n",  # branch outside refs/
+        b"worktree /a\nHEAD a\ndetached\ndetached\n\n",
+    ],
+)
+def test_worktree_list_block_rules(data: bytes) -> None:
+    with pytest.raises(PorcelainError):
+        parse_worktree_list(data, expected=None)
+
+
+def test_a_bare_main_worktree_needs_no_head() -> None:
+    got = parse_worktree_list(b"worktree /b\nbare\n\n", expected=1)
+    assert got[0].bare
+
+
+# -- filter policy (items 13, 14) -----------------------------------------------------------------
+
+
+def _global_config(home: Path, text: str) -> None:
+    (home / ".gitconfig").write_text(text)
+
+
+def _policy(home: Path, priv: Path, allow: list[str]) -> hardgit.FilterPolicy:
+    return hardgit.load_filter_policy(
+        Gateway(), GIT, home=str(home), xdg_config_home=None, allow=allow,
+        path_env="/usr/bin:/bin", private_dir=str(priv),
+    )  # fmt: skip
+
+
+def test_valueless_required_is_honored_as_true(private_home: Path, tmp_path: Path) -> None:
+    _global_config(private_home, '[filter "x"]\n\tprocess = /bin/sh -c\n\trequired\n\tclean\n')
+    policy = _policy(private_home, tmp_path, ["x"])
+    assert policy.drivers["x"] == {"process": "/bin/sh -c", "required": "true"}
+
+
+def test_global_config_is_read_with_a_ceiling_and_no_discovery(
+    private_home: Path, tmp_path: Path
+) -> None:
+    _global_config(private_home, '[filter "x"]\n\tprocess = /bin/sh\n')
+    seen: list[dict[str, str]] = []
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        seen.append(dict(kw["env"]))  # type: ignore[call-overload]
+        return GitResult(0, b"filter.x.process\n/bin/sh\0", b"")
+
+    priv = tmp_path / "state" / "p"
+    priv.mkdir(parents=True)
+    hardgit.load_filter_policy(
+        Gateway(git_runner=runner), GIT, home=str(private_home), xdg_config_home=None,
+        allow=["x"], path_env="/usr/bin:/bin", private_dir=str(priv),
+    )  # fmt: skip
+    assert seen and all(e["GIT_CEILING_DIRECTORIES"] == str(priv.parent) for e in seen)
+
+
+def test_unparsable_process_stays_blanked_with_a_warning(
+    private_home: Path, tmp_path: Path
+) -> None:
+    _global_config(private_home, '[filter "x"]\n\tprocess = "\'unterminated"\n')
+    policy = _policy(private_home, tmp_path, ["x"])
+    assert policy.drivers == {}
+    assert any("unparsable" in w for w in policy.warnings)
+
+
+def test_process_pointing_at_a_missing_binary_stays_blanked(
+    private_home: Path, tmp_path: Path
+) -> None:
+    _global_config(private_home, '[filter "x"]\n\tprocess = /nonexistent/dir/tool\n')
+    policy = _policy(private_home, tmp_path, ["x"])
+    assert policy.drivers == {}
+    assert any("not found" in w for w in policy.warnings)
+
+
+# -- fetch classification (item 15) ---------------------------------------------------------------
+
+
+def test_prune_incomplete_message_uses_the_first_error_line() -> None:
+    err = "error: could not delete reference refs/heads/gone: locked\nFrom x\n - [deleted] gone\n"
+    r = res(0, err)
+    e = outcome_error(classify_fetch(r), r)
+    assert e is not None and "could not delete reference" in e.message
+    assert e.fields["details"] == {"cause": "prune_incomplete"}
+
+
+def test_markers_in_remote_lines_do_not_classify_as_auth() -> None:
+    r = res(128, "remote: fatal: could not read Username for 'x'\nfatal: unable to access x")
+    assert classify_fetch(r).kind is FetchKind.FAILED
+
+
+def test_prune_blocked_by_packed_refs_lock_in_real_git(
+    git: Git, tmp_path: Path, private_home: Path
+) -> None:
+    # Spike F4: a --prune that cannot delete a ref exits 0 with an `error:` line.
+    def pg(args: list[str], cwd: Path) -> None:
+        r = plain_git(args, cwd=cwd, home=private_home)
+        assert r.returncode == 0, (args, r.stderr)
+
+    rem, work, mirror, priv = (tmp_path / n for n in ("r.git", "w", "m.git", "priv"))
+    work.mkdir()
+    priv.mkdir()
+    pg(["init", "-q", "--bare", "-b", "main", str(rem)], tmp_path)
+    pg(["init", "-q", "-b", "main"], work)
+    (work / "f").write_text("1")
+    pg(["add", "f"], work)
+    pg(["commit", "-q", "-m", "1"], work)
+    pg(["branch", "gone"], work)
+    pg(["push", "-q", str(rem), "main", "gone"], work)
+    pg(["init", "-q", "--bare", str(mirror)], tmp_path)
+    pg(["remote", "add", "origin", str(rem)], mirror)
+    args = ["fetch", "--no-tags", "--prune", "origin", "+refs/heads/*:refs/heads/*"]
+
+    def fetch() -> GitResult:
+        return git.run(args, git_dir=mirror, cwd=priv, scheme="file", tool_owned=True, timeout=30)
+
+    assert classify_fetch(fetch()).ok
+    pg(["update-ref", "-d", "refs/heads/gone"], rem)
+    (mirror / "packed-refs.lock").write_text("")
+    r = fetch()
+    assert r.returncode == 0 and "error:" in r.err
+    outcome = classify_fetch(r)
+    assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, "prune_incomplete")
+    e = outcome_error(outcome, r)
+    assert e is not None and "could not delete reference" in e.message

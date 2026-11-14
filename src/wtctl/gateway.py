@@ -55,6 +55,28 @@ class GitResult:
         return self.stderr.decode("utf-8", "replace")
 
 
+# Seconds to wait for the pipes to close after the process group was killed.
+KILL_GRACE = 5.0
+
+
+def _drain(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
+    """Output after a kill: the pipes close once the group is dead; else return what was read.
+
+    A descendant that left the process group (``setsid``) can keep the pipes open for as long as
+    it lives; waiting for end-of-file would then hang forever, so the wait is bounded and the
+    pipes are closed from our side.
+    """
+    try:
+        return proc.communicate(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired as e:
+        out, err = e.output or b"", e.stderr or b""
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+        proc.wait()
+        return out, err
+
+
 def run_git(
     argv: list[str],
     *,
@@ -67,7 +89,10 @@ def run_git(
 
     The group is the one this call created (the child is its leader), so on expiry the whole
     group is killed through the leader's pid captured at launch, never by pattern.
+    ``timed_out`` is set only when git itself was still running at expiry; a git that already
+    exited (its pipes held open by a descendant) is returned with its own exit status.
     """
+    # TODO(#13): stdout is buffered in memory; pack-objects --stdout needs stdout_path or an fd.
     proc = subprocess.Popen(
         argv,
         env=dict(env),
@@ -81,12 +106,18 @@ def run_git(
     try:
         out, err = proc.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        out, err = proc.communicate()
-        return GitResult(proc.returncode, out, err, timed_out=True)
+        was_running = proc.poll() is None
+        if was_running:
+            # Only while the leader is unreaped is its pid certainly still this group's id; once
+            # it has exited, a recycled pid could name an unrelated group, so descendants that
+            # outlive it are left to the bounded wait below.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        out, err = _drain(proc)
+        proc.wait()
+        return GitResult(proc.returncode, out, err, timed_out=was_running)
     return GitResult(proc.returncode, out, err)
 
 

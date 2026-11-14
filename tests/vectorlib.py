@@ -9,12 +9,14 @@ proves nothing about the hardened run.
 from __future__ import annotations
 
 import os
+import pty
+import shutil
 import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GIT = "/usr/bin/git" if os.path.exists("/usr/bin/git") else "git"
+GIT = "/usr/bin/git" if os.path.exists("/usr/bin/git") else (shutil.which("git") or "/usr/bin/git")
 
 PLAIN_ENV_BASE = {
     "PATH": "/usr/bin:/bin",
@@ -36,9 +38,29 @@ def plain_git(
     home: Path,
     env: dict[str, str] | None = None,
     stdin: bytes | None = None,
+    tty: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
-    """Unhardened git with an explicit environment (nothing inherited)."""
+    """Unhardened git with an explicit environment (nothing inherited).
+
+    ``tty`` runs it with a pseudo-terminal as stdout: git starts a pager only for a terminal.
+    """
     full = {**PLAIN_ENV_BASE, "HOME": str(home), **(env or {})}
+    if tty:
+        master, slave = pty.openpty()
+        try:
+            return subprocess.run(
+                [GIT, *args],
+                cwd=cwd,
+                env=full,
+                input=stdin,
+                stdout=slave,
+                stderr=subprocess.PIPE,
+                timeout=60,
+                check=False,
+            )
+        finally:
+            os.close(slave)
+            os.close(master)
     return subprocess.run(
         [GIT, *args],
         cwd=cwd,
@@ -76,6 +98,22 @@ class Hostile:
     def hits(self) -> list[str]:
         return sorted(p.name for p in self.markers.iterdir())
 
+    def payload_hits(self) -> list[str]:
+        """Marker lines written by the payload itself (hooks write theirs to the same file)."""
+        hit = self.markers / "hit"
+        if not hit.exists():
+            return []
+        return [ln for ln in hit.read_text().splitlines() if ln.startswith(str(self.payload))]
+
+    def nested_hits(self) -> list[str]:
+        """Payload lines from the nested repository's own config (its commands carry ``nested``)."""
+        return [ln for ln in self.payload_hits() if " nested" in ln]
+
+    @property
+    def sub(self) -> Path:
+        """The nested repository of ``build_hostile(..., submodule=True)`` (a gitlink at ``s``)."""
+        return self.clone / "s"
+
     def git(self, args: list[str], cwd: Path | None = None, **kw: object):
         r = plain_git(args, cwd=cwd or self.clone, home=self.home, **kw)  # type: ignore[arg-type]
         assert r.returncode == 0, (args, r.stderr)
@@ -87,7 +125,7 @@ def _script(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def build_hostile(root: Path, home: Path) -> Hostile:
+def build_hostile(root: Path, home: Path, *, submodule: bool = False) -> Hostile:
     h = Hostile(root, home)
     h.markers.mkdir(parents=True)
     _script(h.payload, f'echo "$0 $*" >> {h.markers}/hit\nexit 1')
@@ -126,6 +164,8 @@ def build_hostile(root: Path, home: Path) -> Hostile:
     h.b3 = h.git(["rev-parse", "HEAD:c.txt"])
     h.git(["branch", "lazy", h.c3])
     h.git(["reset", "-q", "--hard", h.c2])
+    if submodule:
+        _add_gitlink(h)
 
     p = h.payload
     hooks = h.root / "hookdir"
@@ -150,6 +190,9 @@ def build_hostile(root: Path, home: Path) -> Hostile:
     extra.write_text(f"[core]\n\tfsmonitor = {p}\n[credential]\n\thelper = !{p}\n")
     src = h.src
     cfg = f"""
+[user]
+	name = t
+	email = t@example.invalid
 [core]
 	repositoryformatversion = 1
 	fsmonitor = {p}
@@ -241,3 +284,33 @@ def build_hostile(root: Path, home: Path) -> Hostile:
     for m in h.markers.iterdir():  # building must not have fired anything
         m.unlink()
     return h
+
+
+def _add_gitlink(h: Hostile) -> None:
+    """A nested repository at ``s``, staged as a gitlink, then moved on and left dirty.
+
+    Its own config is hostile (a filter, a textconv driver, an fsmonitor) and is only written
+    here, after the staging, so building does not run it. The outer repository records ``s1``;
+    the nested ``HEAD`` is ``s2`` and its file is modified, so every submodule-aware diff or
+    status has something to show.
+    """
+    p = h.payload
+    sub = h.sub
+    sub.mkdir()
+    h.git(["init", "-q", "-b", "main"], cwd=sub)
+    (sub / ".gitattributes").write_text("*.txt filter=nest diff=nest\n")
+    (sub / "f.txt").write_text("one\n")
+    h.git(["add", "-A"], cwd=sub)
+    h.git(["commit", "-q", "-m", "s1"], cwd=sub)
+    s1 = h.git(["rev-parse", "HEAD"], cwd=sub)
+    h.git(["update-index", "--add", "--cacheinfo", f"160000,{s1},s"])
+    (h.clone / ".gitmodules").write_text(f'[submodule "s"]\n\tpath = s\n\turl = {h.src}\n')
+    h.git(["add", ".gitmodules"])
+    (sub / "f.txt").write_text("two\n")
+    h.git(["commit", "-q", "-am", "s2"], cwd=sub)
+    (sub / "f.txt").write_text("three\n")
+    with open(sub / ".git" / "config", "a") as f:
+        f.write(
+            f'[filter "nest"]\n\tclean = {p} nested\n\tsmudge = {p} nested\n'
+            f'[diff "nest"]\n\ttextconv = {p} nested\n[core]\n\tfsmonitor = {p} nested\n'
+        )

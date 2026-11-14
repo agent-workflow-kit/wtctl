@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import shutil
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -61,3 +65,49 @@ def test_disable_dumpable_clears_the_flag_in_a_child_process() -> None:
     )
     r = gateway.run([sys.executable, "-c", code])
     assert r.stdout.split() == ["True", "0"], r.stderr
+
+
+# -- run_git: bounded waiting after a kill (review round 1, item 6) ------------------------------
+
+needs_setsid = pytest.mark.skipif(not shutil.which("setsid"), reason="needs setsid")
+ENV = {"PATH": "/usr/bin:/bin"}
+
+
+def _kill_recorded(pidfile: Path) -> None:
+    # The pid was written by the script this test launched; signal exactly that one.
+    try:
+        os.kill(int(pidfile.read_text()), 9)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+
+
+@needs_setsid
+def test_escaped_descendant_cannot_hang_a_timed_out_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway, "KILL_GRACE", 0.5)
+    pidfile = tmp_path / "escaped.pid"
+    script = f"setsid sleep 60 & echo $! > {pidfile}; echo partial; exec sleep 60"
+    try:
+        start = time.monotonic()
+        r = gateway.run_git(["/bin/sh", "-c", script], env=ENV, cwd=str(tmp_path), timeout=1.0)
+        assert time.monotonic() - start < 15
+        assert r.timed_out
+        assert b"partial" in r.stdout  # what was read before the kill is kept
+    finally:
+        _kill_recorded(pidfile)
+
+
+@needs_setsid
+def test_git_that_exited_before_the_deadline_is_not_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway, "KILL_GRACE", 0.5)
+    pidfile = tmp_path / "escaped.pid"
+    script = f"setsid sleep 60 & echo $! > {pidfile}; echo done; exit 0"
+    try:
+        r = gateway.run_git(["/bin/sh", "-c", script], env=ENV, cwd=str(tmp_path), timeout=1.0)
+        assert (r.returncode, r.timed_out) == (0, False)
+        assert b"done" in r.stdout
+    finally:
+        _kill_recorded(pidfile)
