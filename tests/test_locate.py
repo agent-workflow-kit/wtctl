@@ -1172,3 +1172,294 @@ def test_discovery_walk_refuses_a_directory_swapped_for_a_symlink(
     budget = locate_mod._Budget(100, float("inf"))
     found = list(locate_mod.walk_for_clones(str(search), 5, budget, Gateway().clock))
     assert found == []
+
+
+# -- review round 1 ------------------------------------------------------------------------------
+
+
+def recording_runner(seen: list[list[str]]):  # type: ignore[no-untyped-def]
+    def run(argv: list[str], **kw: Any) -> GitResult:
+        seen.append(argv)
+        return Gateway().git(argv, **kw)
+
+    return run
+
+
+def test_a_plain_directory_is_a_plain_remote_mismatch(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plain = w.tmp / "plain"
+    plain.mkdir()
+    w.repos[REPO] = {"clone": str(plain)}
+    r = w.cli(capsys, "locate", REPO)
+    assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch")
+    assert "details" not in r.json()["error"]
+
+
+def test_dry_run_clone_of_a_deleted_clone_has_no_identity_warning(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import shutil
+
+    dest = clone_cfg(w, w.bare())
+    assert w.cli(capsys, "clone", REPO).code == 0
+    shutil.rmtree(dest)
+    r = w.cli(capsys, "--dry-run", "clone", REPO)
+    assert r.code == 0 and r.json()["cloned"] is True
+    assert "differs" not in r.err and r.err == ""
+
+
+def test_a_truncated_search_that_finds_nothing_says_so(
+    w: World, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for i in range(5):
+        (w.tmp / "search" / f"d{i}").mkdir(parents=True)
+    w.top["search_roots"] = [str(w.tmp / "search")]
+    monkeypatch.setattr(locate_mod, "MAX_DISCOVERY_DIRS", 3)
+    r = w.cli(capsys, "locate", REPO)
+    assert r.code == 10 and "stopped early" in r.json()["error"]["message"]
+
+
+def test_a_truncated_search_that_is_ambiguous_says_so(
+    w: World, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w.stub(w.tmp / "search" / "a")
+    w.stub(w.tmp / "search" / "b")
+    (w.tmp / "search" / "z").mkdir()
+    w.top["search_roots"] = [str(w.tmp / "search")]
+    monkeypatch.setattr(locate_mod, "MAX_DISCOVERY_DIRS", 3)
+    r = w.cli(capsys, "locate", REPO)
+    assert r.code == 21 and "stopped early" in r.json()["error"]["message"]
+
+
+def test_the_deadline_is_checked_between_children_and_before_each_candidate(w: World) -> None:
+    for name in ("a", "b", "c"):
+        w.stub(w.tmp / "search" / name)
+    ticks = iter(range(100))
+
+    class Clock:
+        def monotonic(self) -> float:
+            return float(next(ticks))
+
+    budget = locate_mod._Budget(100, 4.0)
+    found = list(locate_mod.walk_for_clones(str(w.tmp / "search"), 5, budget, Clock()))
+    assert budget.truncated and len(found) < 3
+
+
+def test_discovery_does_not_hang_on_an_include_of_a_fifo(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "search" / "repo")
+    fifo = w.tmp / "fifo"
+    os.mkfifo(fifo)
+    g(["config", "include.path", str(fifo)], clone, w.home)
+    w.top["search_roots"] = [str(w.tmp / "search")]
+    r = w.cli(capsys, "locate", REPO)  # would block until git's config timeout without the guard
+    assert r.code == 10
+
+
+def test_a_password_url_never_reaches_a_git_argv(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine", "https://alice:hunter2@example.test/org/repo.git")
+    w.repos[REPO] = {"clone": str(clone)}
+    seen: list[list[str]] = []
+    res = make_resolver(w, runner=recording_runner(seen)).locate(REPO)
+    assert res.fetch_url == URL
+    assert seen and not any("hunter2" in " ".join(a) for a in seen)
+
+
+def test_an_insteadof_prefix_naming_the_password_url_is_refused(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine", "https://alice:hunter2@example.test/org/repo.git")
+    g(["config", "url.https://evil.test/.insteadOf", "https://alice:hunter2@"], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    r = w.cli(capsys, "locate", REPO)
+    assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch")
+    assert "hunter2" not in r.out
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("remote.origin.pushurl", "https://evil.test/org/repo.git"),
+        ("url.https://evil.test/.pushInsteadOf", "https://example.test/"),
+        ("url.https://evil.test/.pushInsteadOf", "https://example.test/org/repo.git"),
+    ],
+)
+def test_a_push_redirect_is_remote_mismatch(
+    w: World, capsys: pytest.CaptureFixture[str], key: str, value: str
+) -> None:
+    clone = w.stub(w.tmp / "mine")
+    g(["config", key, value], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    r = w.cli(capsys, "locate", REPO)
+    assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch")
+
+
+def test_an_unrelated_insteadof_is_harmless(w: World, capsys: pytest.CaptureFixture[str]) -> None:
+    clone = w.stub(w.tmp / "mine")
+    g(["config", "url.https://x.test/.insteadOf", "https://other.test/"], clone, w.home)
+    g(["config", "url.https://x.test/.pushInsteadOf", "https://other.test/"], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    assert w.cli(capsys, "locate", REPO).code == 0
+
+
+def plant_commondir(clone: Path) -> None:
+    (clone / ".git" / "commondir").write_text("../elsewhere\n")
+
+
+def plant_config_symlink(clone: Path) -> None:
+    other = clone.parent / "other-config"
+    other.write_text((clone / ".git" / "config").read_text())
+    (clone / ".git" / "config").unlink()
+    os.symlink(other, clone / ".git" / "config")
+
+
+def plant_head_symlink(clone: Path) -> None:
+    (clone / ".git" / "HEAD").unlink()
+    os.symlink("/dev/null", clone / ".git" / "HEAD")
+
+
+def plant_objects_symlink(clone: Path) -> None:
+    import shutil
+
+    moved = clone.parent / "other-objects"
+    shutil.move(str(clone / ".git" / "objects"), moved)
+    os.symlink(moved, clone / ".git" / "objects")
+
+
+def plant_refs_symlink(clone: Path) -> None:
+    import shutil
+
+    moved = clone.parent / "other-refs"
+    shutil.move(str(clone / ".git" / "refs"), moved)
+    os.symlink(moved, clone / ".git" / "refs")
+
+
+def plant_alternates(clone: Path) -> None:
+    (clone / ".git" / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (clone / ".git" / "objects" / "info" / "alternates").write_text("/elsewhere/objects\n")
+
+
+@pytest.mark.parametrize(
+    "plant",
+    [
+        plant_commondir,
+        plant_config_symlink,
+        plant_head_symlink,
+        plant_objects_symlink,
+        plant_refs_symlink,
+        plant_alternates,
+    ],
+)
+def test_a_planted_git_dir_layout_is_not_a_clone(
+    w: World, capsys: pytest.CaptureFixture[str], plant: Any
+) -> None:
+    clone = w.stub(w.tmp / "mine")
+    plant(clone)
+    w.repos[REPO] = {"clone": str(clone)}
+    r = w.cli(capsys, "locate", REPO)
+    assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch")
+    assert row() is None
+
+
+def test_a_plain_stub_passes_the_layout_checks(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine")
+    w.repos[REPO] = {"clone": str(clone)}
+    assert w.cli(capsys, "locate", REPO).code == 0
+
+
+def test_a_template_with_a_password_never_reaches_argv_or_the_clone_config(w: World) -> None:
+    w.top["hosts"] = {"example.test": {"clone_url": "HTTPS://bob:hunter2@{host}/{path}.git"}}
+    captured: list[list[str]] = []
+
+    def runner(argv: list[str], **kw: Any) -> GitResult:
+        captured.append(argv)
+        if "clone" in argv:
+            return GitResult(128, b"", b"fatal: x")
+        return Gateway().git(argv, **kw)
+
+    res = make_resolver(w, runner=runner)
+    assert res.clone_url(REPO) == URL
+    with pytest.raises(WtctlError):
+        res.clone(REPO)
+    assert any("clone" in a for a in captured)
+    assert not any("hunter2" in " ".join(a) for a in captured)
+
+
+def test_a_bad_template_error_does_not_echo_the_template(w: World) -> None:
+    w.top["hosts"] = {"example.test": {"clone_url": "https://bob:hunter2@evil.test/{path}.git"}}
+    with pytest.raises(WtctlError) as exc:
+        make_resolver(w).clone_url(REPO)
+    assert "hunter2" not in exc.value.message
+
+
+def test_open_parent_wraps_a_too_long_name(tmp_path: Path) -> None:
+    with pytest.raises(WtctlError) as exc:
+        locate_mod._open_parent(str(tmp_path), ["a" * 300])
+    assert exc.value.code == "clone_failed"
+
+
+def test_a_swapped_installed_directory_is_not_recorded(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = clone_cfg(w, w.bare())
+    real_rename = os.rename
+
+    def swapping_rename(src: str, dst: str, **kw: Any) -> None:
+        real_rename(src, dst, **kw)
+        pfd = kw["dst_dir_fd"]
+        real_rename(dst, dst + ".old", src_dir_fd=pfd, dst_dir_fd=pfd)
+        os.mkdir(dst, dir_fd=pfd)
+
+    monkeypatch.setattr(os, "rename", swapping_rename)
+    with pytest.raises(WtctlError) as exc:
+        make_resolver(w).clone(REPO)
+    assert exc.value.code == "clone_failed"
+    assert row() is None and dest.exists()
+
+
+def test_cloning_an_empty_remote_twice_is_idempotent(w: World) -> None:
+    empty = w.tmp / "empty.git"
+    g(["init", "-q", "--bare", str(empty)], w.tmp, w.home)
+    clone_cfg(w, empty)
+    first = make_resolver(w).clone(REPO)
+    again = make_resolver(w).clone(REPO)  # e.g. the loser of a lease race
+    assert first.cloned is True and again.cloned is False
+    assert again.clone_path == first.clone_path
+
+
+def test_an_empty_destination_clone_that_is_not_recorded_still_needs_a_commit(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The empty-remote allowance applies only to the recorded clone (same path and identity)."""
+    dest = clone_cfg(w, w.bare())
+    w.stub(dest, str(w.tmp / "remote.git"))
+    r = w.cli(capsys, "clone", REPO)
+    assert (r.code, r.json()["error"]["reason"]) == (20, "path_exists")
+
+
+def test_the_first_recording_loser_keeps_the_winners_identity(w: World) -> None:
+    clone = w.stub(w.tmp / "mine")
+    w.repos[REPO] = {"clone": str(clone)}
+    res = make_resolver(w)
+    # The loser read "nothing recorded"; before it writes, the winner records another identity.
+    real_get = res.state.get_clone
+    first = [True]
+
+    def stale_get(repo: str) -> dict[str, Any] | None:
+        if first[0]:
+            first[0] = False
+            res.state.record_first_clone(repo, path="/winner", common_id="9:9", source="config")
+            return None
+        return real_get(repo)
+
+    res.state.get_clone = stale_get  # type: ignore[method-assign]
+    out = res.locate(REPO)
+    assert out.recorded_id == "9:9" and out.anchor_changed
+    stored = row()
+    assert stored is not None and (stored["common_id"], stored["path"]) == ("9:9", "/winner")

@@ -18,7 +18,9 @@ TODO(#5): the human ``clone`` re-accept is audited as ``clone_accept``.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -29,12 +31,13 @@ from typing import Any
 from . import urls
 from .errors import WtctlError
 from .gitsetup import private_dir
-from .hardgit import Git, classify_fetch, outcome_error
+from .hardgit import Git, classify_fetch, outcome_error, parse_config_list
 from .state import State, repo_lease
 
 MAX_DISCOVERY_DIRS = 200_000
 MAX_DISCOVERY_DEPTH = 64
 DISCOVERY_SECONDS = 60.0
+TRUNCATED_NOTE = "discovery stopped early (too many directories or too slow)"
 NOT_FOUND_HINT = "set repos.<id>.clone, add a directory to search_roots, or run `wtctl clone <id>`"
 
 _OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -173,7 +176,7 @@ def _lstat_gitdir(gitdir: str) -> os.stat_result:
     try:
         st = os.lstat(gitdir)
     except OSError as exc:
-        raise NotAClone("not a git clone (no .git directory)", "no_remote") from exc
+        raise NotAClone("not a git clone (no .git directory)") from exc
     if not stat.S_ISDIR(st.st_mode):
         # A symlink, or a file (a linked worktree or submodule): not a clone wtctl will use.
         kind = "a symlink" if stat.S_ISLNK(st.st_mode) else "not a directory"
@@ -181,14 +184,131 @@ def _lstat_gitdir(gitdir: str) -> os.stat_result:
     return st
 
 
+_SECTION_LINE = re.compile(r"^\s*\[\s*([A-Za-z0-9.-]+)[^\]]*\](.*)$")
+_PATH_LINE = re.compile(r"^\s*path\s*=\s*([^\s\"\\;#][^\"\\;#]*?)\s*$", re.IGNORECASE)
+MAX_CLONE_CONFIG = 1 << 20
+MAX_INCLUDE_DEPTH = 10
+
+
+def _lstat_at(fd: int, name: str) -> os.stat_result | None:
+    """``lstat`` of ``name`` below the directory ``fd`` (None when absent)."""
+    try:
+        return os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise NotAClone(f"cannot examine .git/{name}: {exc.strerror}") from exc
+
+
+def _check_layout(fd: int, gitdir: str, *, allow_includes: bool) -> None:
+    """Refuse a ``.git`` that borrows state from elsewhere or can hang a config read.
+
+    Every check is a no-follow ``lstat`` below the opened ``.git`` directory: a ``commondir``
+    file (a planted ``.git`` pointing at another repository's config and objects), a ``config``
+    or ``HEAD`` that is not a regular file, ``objects`` or ``refs`` that are not real
+    directories, and ``objects/info/alternates``. With ``allow_includes`` false (discovery,
+    where the candidate is somebody else's directory) a config with an ``[include]`` or
+    ``[includeIf]`` section is refused too, since git would open the included path (a FIFO
+    blocks until the config read times out).
+    """
+    if _lstat_at(fd, "commondir") is not None:
+        raise NotAClone(".git has a commondir file; only a self-contained clone is used")
+    for name in ("config", "HEAD"):
+        st = _lstat_at(fd, name)
+        if st is None or not stat.S_ISREG(st.st_mode):
+            raise NotAClone(f".git/{name} is not a regular file")
+    for name in ("objects", "refs"):
+        st = _lstat_at(fd, name)
+        if st is None or not stat.S_ISDIR(st.st_mode):
+            raise NotAClone(f".git/{name} is not a directory")
+    info = _lstat_at(fd, "objects/info")
+    if info is not None:
+        if not stat.S_ISDIR(info.st_mode):
+            raise NotAClone(".git/objects/info is not a directory")
+        if _lstat_at(fd, "objects/info/alternates") is not None:
+            raise NotAClone(".git/objects/info/alternates exists; the clone borrows objects")
+    if not allow_includes:
+        _check_includes_safe(fd, gitdir)
+
+
+def _read_regular(path: str | None, *, fd: int | None = None, name: str = "") -> bytes:
+    """The bytes of a regular file (at most ``MAX_CLONE_CONFIG``), opened without blocking."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        if path is None:
+            rfd = os.open(name, flags, dir_fd=fd)
+        else:  # an included file may be a symlink: git follows it
+            rfd = os.open(path, flags & ~os.O_NOFOLLOW)
+    except OSError as exc:
+        raise NotAClone(f"cannot read a config file: {exc.strerror}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(rfd).st_mode):
+            raise NotAClone("a config file is not a regular file")
+        data = os.read(rfd, MAX_CLONE_CONFIG + 1)
+    finally:
+        os.close(rfd)
+    if len(data) > MAX_CLONE_CONFIG:
+        raise NotAClone("a config file is too large")
+    return data
+
+
+def _check_includes_safe(fd: int, gitdir: str) -> None:
+    """For a discovered candidate: every file its config includes (transitively) is absent or a
+    regular file, so reading the config cannot block on a FIFO or device. Any include syntax this
+    cannot read with certainty (quoting, escapes, ``~``) refuses the candidate."""
+    seen = 0
+    pending = [(_read_regular(None, fd=fd, name="config"), gitdir, 0)]  # (data, base dir, depth)
+    while pending:
+        data, base, depth = pending.pop()
+        section = ""
+        for raw_line in data.decode("utf-8", "replace").splitlines():
+            line = raw_line
+            m = _SECTION_LINE.match(line)
+            if m:
+                section, line = m.group(1).lower(), m.group(2)
+            if section not in ("include", "includeif"):
+                continue
+            pm = _PATH_LINE.match(line)
+            if pm is None:
+                if re.match(r"^\s*path\b", line, re.IGNORECASE):
+                    raise NotAClone("the clone's config has an include this cannot read safely")
+                continue
+            target = pm.group(1)
+            if target.startswith("~"):
+                raise NotAClone("the clone's config includes a file in a home directory")
+            seen += 1
+            if depth >= MAX_INCLUDE_DEPTH or seen > 100:
+                raise NotAClone("the clone's config has too many includes")
+            full = target if target.startswith("/") else os.path.join(base, target)
+            try:
+                st = os.stat(full)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise NotAClone(f"cannot examine an included file: {exc.strerror}") from exc
+            if not stat.S_ISREG(st.st_mode):
+                raise NotAClone("the clone's config includes a file that is not a regular file")
+            pending.append((_read_regular(full), os.path.dirname(full), depth + 1))
+
+
 def verify_clone(
-    git: Git, path: str, repo_id: str, *, remote: str, clone_url: str | None
+    git: Git,
+    path: str,
+    repo_id: str,
+    *,
+    remote: str,
+    clone_url: str | None,
+    allow_includes: bool = True,
 ) -> Verified:
     """Check that ``path`` is a clone of ``repo_id`` and describe it (raises :class:`NotAClone`).
 
     The remote URL is read with hardened git, its userinfo stripped; it must normalize to the repo
-    id (or match the configured ``clone_url``) and come back unchanged from
-    ``ls-remote --get-url`` (so no ``insteadOf`` rewriting applies).
+    id (or match the configured ``clone_url``). Because the clone URL is also the push target, no
+    ``url.*.insteadOf`` / ``pushInsteadOf`` prefix may match it and the remote may have no
+    ``pushurl``; the stripped URL must also come back unchanged from ``ls-remote --get-url``. The
+    raw URL (it may hold a password) is never passed to git as an argument.
+
+    ``allow_includes`` false (discovery) refuses a clone whose config has include sections.
     """
     real = os.path.realpath(path)
     if "\n" in real or "\0" in real:
@@ -196,6 +316,24 @@ def verify_clone(
     gitdir = os.path.join(real, ".git")
     before = _lstat_gitdir(gitdir)
 
+    def open_checked() -> os.stat_result:
+        try:
+            fd = open_dir_nofollow(gitdir)
+        except OSError as exc:
+            raise NotAClone(f"cannot open .git without following links: {exc.strerror}") from exc
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise NotAClone("the clone changed while it was being verified")
+            _check_layout(fd, gitdir, allow_includes=allow_includes)
+            return opened
+        finally:
+            os.close(fd)
+
+    open_checked()
+
+    # TODO(#10): these git runs address the clone by path (--git-dir); a swap of a parent
+    # directory between the checks above and the run needs fsafe's anchored walks to close.
     def run(args: list[str], **kw: Any) -> Any:
         try:
             return git.run(args, git_dir=gitdir, **kw)
@@ -221,27 +359,30 @@ def verify_clone(
     stripped = urls.strip_userinfo(raw)
     if not urls.matches_repo(stripped, repo_id, clone_url=clone_url):
         raise NotAClone(f"remote {remote!r} does not point at {repo_id}")
-    for candidate in dict.fromkeys((stripped, raw)):
-        g = run(["ls-remote", "--get-url", candidate])
-        if g.returncode != 0 or g.out.rstrip("\n") != candidate:
-            raise NotAClone(f"the URL of remote {remote!r} is rewritten by git config (insteadOf)")
+    push = run(["config", "--no-includes", "-z", "--get-all", f"remote.{remote}.pushurl"])
+    if push.returncode == 0:
+        raise NotAClone(f"remote {remote!r} has a pushurl; pushes would go elsewhere")
+    if push.returncode != 1:
+        raise NotAClone("not a usable git repository")
+    rewrites = run(
+        ["config", "--no-includes", "-z", "--get-regexp", r"^url\..*\.(instead|pushinstead)of$"]
+    )
+    if rewrites.returncode not in (0, 1):
+        raise NotAClone("not a usable git repository")
+    for key, value in parse_config_list(rewrites.stdout):
+        prefix = value or ""
+        if any(u.startswith(prefix) for u in (raw, stripped)):
+            kind = "pushInsteadOf" if key.endswith("pushinsteadof") else "insteadOf"
+            raise NotAClone(f"the URL of remote {remote!r} is rewritten by git config ({kind})")
+    g = run(["ls-remote", "--get-url", stripped])
+    if g.returncode != 0 or g.out.rstrip("\n") != stripped:
+        raise NotAClone(f"the URL of remote {remote!r} is rewritten by git config (insteadOf)")
     fmt = run(["config", "--no-includes", "--get", "extensions.objectformat"])
     object_format = fmt.out.strip().lower() if fmt.returncode == 0 else "sha1"
     # The directory must still be the one examined, and the identity comes from an opened fd.
-    try:
-        fd = open_dir_nofollow(gitdir)
-    except OSError as exc:
-        raise NotAClone(f"cannot open .git without following links: {exc.strerror}") from exc
-    try:
-        opened = os.fstat(fd)
-    finally:
-        os.close(fd)
+    opened = open_checked()
     after = _lstat_gitdir(gitdir)
-    if not (
-        (before.st_dev, before.st_ino)
-        == (opened.st_dev, opened.st_ino)
-        == (after.st_dev, after.st_ino)
-    ):
+    if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
         raise NotAClone("the clone changed while it was being verified")
     return Verified(real, gitdir, stripped, identity_str(opened), object_format)
 
@@ -332,12 +473,16 @@ class Resolver:
         self.state = state
         self.git = git
         self.readonly = readonly  # dry run: nothing is stored or created
+        self.notes: list[str] = []  # warnings of the search that a failure message also carries
 
     # -- helpers --------------------------------------------------------------------------
 
-    def _verify(self, path: str, repo_id: str) -> Verified:
+    def _verify(self, path: str, repo_id: str, *, allow_includes: bool = True) -> Verified:
         s = self.config.repo(repo_id)
-        return verify_clone(self.git, path, repo_id, remote=s.remote, clone_url=s.clone_url)
+        return verify_clone(
+            self.git, path, repo_id, remote=s.remote, clone_url=s.clone_url,
+            allow_includes=allow_includes,
+        )  # fmt: skip
 
     def _result(
         self, repo_id: str, v: Verified, source: str, *, cloned: bool = False
@@ -352,11 +497,12 @@ class Resolver:
                 recorded, cloned,
             )  # fmt: skip
         if not recorded:
-            self.state.put_clone(
+            # One transaction: if another process recorded first, its identity stands.
+            row = self.state.record_first_clone(
                 repo_id, path=v.clone_path, common_dir=v.common_dir, common_id=v.common_id,
                 source=source, fetch_url=v.fetch_url,
             )  # fmt: skip
-            recorded = v.common_id
+            recorded = row["common_id"]
         elif recorded == v.common_id:
             keep = (
                 row["source"] if row and row["path"] == v.clone_path and row["source"] else source
@@ -413,34 +559,48 @@ class Resolver:
         return self._result(repo_id, v, "cloned" if row["source"] == "cloned" else "discovered")
 
     def _discover(self, repo_id: str) -> Resolution | None:
-        """Step 3: walk ``search_roots``; several matches are ambiguous (exit 21)."""
+        """Step 3: walk ``search_roots``; several matches are ambiguous (exit 21).
+
+        A candidate is somebody else's directory: it is verified without honoring config
+        includes, and no candidate is verified after the time budget is spent. When the walk was
+        cut short the note is kept in ``self.notes`` and added to the not-found and ambiguous
+        messages (an error object has no warnings field).
+        """
         roots = list(self.config.search_roots)
         if not roots:
             return None
         depth = min(int(self.config.search_depth), MAX_DISCOVERY_DEPTH)
-        warnings: list[str] = []
+        clock = self.git.gateway.clock
         found: dict[str, Verified] = {}
-        budget = _Budget(MAX_DISCOVERY_DIRS, self.git.gateway.clock.monotonic() + DISCOVERY_SECONDS)
+        budget = _Budget(MAX_DISCOVERY_DIRS, clock.monotonic() + DISCOVERY_SECONDS)
         for root in roots:
-            for candidate in walk_for_clones(root, depth, budget, self.git.gateway.clock):
+            for candidate in walk_for_clones(root, depth, budget, clock):
+                if clock.monotonic() > budget.deadline:
+                    budget.truncated = True
+                    break
                 try:
-                    v = self._verify(candidate, repo_id)
+                    v = self._verify(candidate, repo_id, allow_includes=False)
                 except NotAClone:
                     continue
                 found.setdefault(v.clone_path, v)
+            if budget.truncated:
+                break
+        suffix = ""
         if budget.truncated:
-            warnings.append("discovery stopped early (too many directories or too slow)")
+            self.notes.append(TRUNCATED_NOTE)
+            suffix = f" ({TRUNCATED_NOTE})"
         if not found:
             return None
         if len(found) > 1:
             raise WtctlError(
                 "ambiguous",
-                f"several clones of {repo_id} were found; add repos.{repo_id}.clone to choose",
+                f"several clones of {repo_id} were found{suffix}; add repos.{repo_id}.clone "
+                "to choose",
                 candidates=[{"id": None, "path": p} for p in sorted(found)],
             )
         (v,) = found.values()
         res = self._result(repo_id, v, "discovered")
-        res.warnings.extend(warnings)
+        res.warnings.extend(self.notes)
         return res
 
     def find(self, repo_id: str) -> tuple[Resolution | None, bool]:
@@ -464,27 +624,38 @@ class Resolver:
             return res
         settings = self.config.repo(repo_id)
         if settings.auto_clone if auto_clone is None else auto_clone:
-            return self.clone(repo_id)
-        raise WtctlError("not_found", f"no clone of {repo_id} found; {NOT_FOUND_HINT}")
+            res = self.clone(repo_id)
+            res.warnings.extend(self.notes)
+            return res
+        note = f" ({self.notes[0]})" if self.notes else ""
+        raise WtctlError("not_found", f"no clone of {repo_id} found{note}; {NOT_FOUND_HINT}")
 
     # -- cloning --------------------------------------------------------------------------
 
     def clone_url(self, repo_id: str) -> str:
-        """The URL to clone from: ``repos.<id>.clone_url``, else ``hosts.<host>.clone_url``."""
+        """The URL to clone from: ``repos.<id>.clone_url``, else ``hosts.<host>.clone_url``.
+
+        Either way the result is a plain local path or an https/ssh URL without userinfo: the
+        configured text may hold a password, which must reach neither git's argv nor the new
+        clone's ``.git/config``.
+        """
         s = self.config.repo(repo_id)
         if s.clone_url is not None:
-            local = urls.local_path(s.clone_url)
-            if local is not None:
-                return local  # a plain path, never a file:// URL (hardened git rule)
-            stripped = urls.strip_userinfo(s.clone_url)
-            if urls.normalize_url(stripped) is None:
-                raise WtctlError(
-                    "remote_mismatch",
-                    f"repos.{repo_id}.clone_url is not an https, ssh or local path URL",
-                )
-            return stripped
-        template = self.config.host(urls.repo_host(repo_id)).clone_url
-        return urls.render_clone_url(repo_id, template=template)
+            return self._plain_url(s.clone_url, f"repos.{repo_id}.clone_url")
+        host = urls.repo_host(repo_id)
+        template = self.config.host(host).clone_url
+        rendered = urls.render_clone_url(repo_id, template=template)
+        return self._plain_url(rendered, f"hosts.{host}.clone_url")
+
+    @staticmethod
+    def _plain_url(raw: str, what: str) -> str:
+        local = urls.local_path(raw)
+        if local is not None:
+            return local  # a plain path, never a file:// URL (hardened git rule)
+        stripped = urls.strip_userinfo(raw)
+        if urls.normalize_url(stripped) is None:
+            raise WtctlError("remote_mismatch", f"{what} is not an https, ssh or local path URL")
+        return stripped
 
     def destination(self, repo_id: str) -> tuple[str, list[str], str]:
         """``(base, parts, name)``: the parent chain below ``base`` and the clone's directory name.
@@ -543,10 +714,10 @@ class Resolver:
         existing = self._reuse_existing(repo_id, dest)
         if existing is not None:
             return existing
-        row = self.state.get_clone(repo_id)
+        # Nothing exists to compare: "0:0" is a placeholder, never an identity to warn about.
         return Resolution(
             repo_id, dest, os.path.join(dest, ".git"), "cloned", urls.strip_userinfo(url),
-            None, "sha1", "0:0", row["common_id"] if row else None, True,
+            None, "sha1", "0:0", None, True,
         )  # fmt: skip
 
     def _reuse_existing(self, repo_id: str, dest: str) -> Resolution | None:
@@ -561,9 +732,18 @@ class Resolver:
             if not stat.S_ISDIR(st.st_mode):
                 raise NotAClone("not a directory")
             v = self._verify(dest, repo_id)
-            head = self.git.run(["rev-parse", "--verify", "HEAD^{commit}"], git_dir=v.common_dir)
-            if head.returncode != 0:
-                raise NotAClone("HEAD is not a commit")
+            row = self.state.get_clone(repo_id)
+            recorded_here = (
+                row is not None and row["path"] == v.clone_path and row["common_id"] == v.common_id
+            )
+            # A clone of an empty remote has no commit: it is accepted only when it is the very
+            # clone wtctl recorded (same path and identity), so a second clone is idempotent.
+            if not recorded_here:
+                head = self.git.run(
+                    ["rev-parse", "--verify", "HEAD^{commit}"], git_dir=v.common_dir
+                )
+                if head.returncode != 0:
+                    raise NotAClone("HEAD is not a commit")
         except NotAClone:
             raise WtctlError(
                 "refused",
@@ -591,20 +771,13 @@ class Resolver:
                 raise WtctlError("clone_failed", f"{tmp_path} already exists")
             try:
                 self._run_clone(repo_id, url, tmp_path, pfd, ppath)
-                self._install(pfd, ppath, tmp, name, repo_id)
+                v = self._install(pfd, ppath, tmp, name, repo_id)
             except BaseException:
                 with contextlib.suppress(OSError):
                     shutil.rmtree(tmp, dir_fd=pfd)  # TODO(#10): fsafe fd-based delete
                 raise
         finally:
             os.close(pfd)
-        dest = os.path.join(ppath, name)
-        try:
-            v = self._verify(dest, repo_id)
-        except NotAClone as exc:
-            raise WtctlError(
-                "clone_failed", f"the new clone failed verification: {exc.message}"
-            ) from exc
         # wtctl made this directory itself: its identity is recorded even over an older row.
         self.state.put_clone(
             repo_id, path=v.clone_path, common_dir=v.common_dir, common_id=v.common_id,
@@ -636,17 +809,47 @@ class Resolver:
         if err is not None:
             raise err
 
-    def _install(self, pfd: int, ppath: str, tmp: str, name: str, repo_id: str) -> None:
+    def _install(self, pfd: int, ppath: str, tmp: str, name: str, repo_id: str) -> Verified:
+        """Verify the fresh clone in its temporary directory, rename it into place and check that
+        the installed directory is the one verified (same ``(dev, ino)``, same ``.git``)."""
+        tmp_path = os.path.join(ppath, tmp)
+        try:
+            v = self._verify(tmp_path, repo_id)
+        except NotAClone as exc:
+            raise WtctlError(
+                "clone_failed", f"the new clone failed verification: {exc.message}"
+            ) from exc
         if not os.path.samestat(os.fstat(pfd), os.stat(ppath)):
             raise WtctlError("clone_failed", f"{ppath} changed while cloning")
+        dest = os.path.join(ppath, name)
         try:
+            verified = os.stat(tmp, dir_fd=pfd, follow_symlinks=False)
             os.rename(tmp, name, src_dir_fd=pfd, dst_dir_fd=pfd)
         except OSError as exc:
             raise WtctlError(
                 "refused",
-                f"{os.path.join(ppath, name)} appeared while cloning ({exc.strerror})",
+                f"{dest} appeared while cloning ({exc.strerror})",
                 reason="path_exists",
             ) from exc
+        # TODO(#10): the verification above addressed the clone by path; parent-chain swaps need
+        # fsafe's anchored walks. Here the identity is compared through the parent's fd.
+        try:
+            installed = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+            dfd = os.open(name, _OPEN_DIR, dir_fd=pfd)
+            try:
+                dot_git = os.stat(".git", dir_fd=dfd, follow_symlinks=False)
+            finally:
+                os.close(dfd)
+        except OSError as exc:
+            raise WtctlError(
+                "clone_failed", f"{dest} changed after it was installed: {exc.strerror}"
+            ) from exc
+        if (installed.st_dev, installed.st_ino) != (
+            verified.st_dev,
+            verified.st_ino,
+        ) or identity_str(dot_git) != v.common_id:
+            raise WtctlError("clone_failed", f"{dest} changed after it was installed")
+        return dataclasses.replace(v, clone_path=dest, common_dir=os.path.join(dest, ".git"))
 
 
 def _open_parent(base_real: str, parts: list[str]) -> tuple[int, str]:
@@ -662,6 +865,10 @@ def _open_parent(base_real: str, parts: list[str]) -> tuple[int, str]:
                 os.mkdir(part, 0o777, dir_fd=fd)
             except FileExistsError:
                 pass
+            except OSError as exc:
+                raise WtctlError(
+                    "clone_failed", f"cannot create {os.path.join(path, part)}: {exc.strerror}"
+                ) from exc
             try:
                 nxt = os.open(part, _OPEN_DIR, dir_fd=fd)
             except OSError as exc:
@@ -744,6 +951,9 @@ def _walk(
     for name in names:
         if name == ".git" or not _plain_name(name):
             continue
+        if budget.dirs <= 0 or clock.monotonic() > budget.deadline:
+            budget.truncated = True
+            return
         try:
             st = os.stat(name, dir_fd=fd, follow_symlinks=False)
             if not stat.S_ISDIR(st.st_mode) or st.st_dev != dev:

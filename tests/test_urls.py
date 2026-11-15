@@ -228,6 +228,15 @@ def test_valid_repo_ids(repo_id: str) -> None:
         "github.com/org/repo#x",
         "a@github.com/org/repo",
         "github.com/org/rep\\o",
+        # R7: length limits
+        "a" * 64 + ".test/o/r",
+        ".".join(["a" * 60] * 5) + "/o/r",
+        "github.com/org/" + "r" * 201,
+        # R8: a ".git" segment, any case
+        "github.com/.git/repo",
+        "github.com/org/.git",
+        "github.com/org/.GIT/repo",
+        "github.com/org/.Git",
     ],
 )
 def test_invalid_repo_ids_exit_2(repo_id: str) -> None:
@@ -353,3 +362,49 @@ def test_rendered_clone_url_must_normalize_back_to_the_repo_id() -> None:
         urls.render_clone_url(REPO, template="ext::sh -c {path}")
     with pytest.raises(WtctlError):
         urls.render_clone_url(REPO, template="-oProxyCommand={host}")
+
+
+# -- review round 1 --------------------------------------------------------------------------
+
+
+def test_length_limits_are_exact() -> None:
+    assert urls.validate_repo_id("a" * 63 + ".test/o/r")
+    assert urls.validate_repo_id("github.com/org/" + "r" * 200)
+    host = ".".join(["a" * 61] * 4)  # 247 characters
+    assert urls.validate_repo_id(f"{host}/o/r")
+    assert urls.normalize_url("https://" + "a" * 64 + ".test/o/r") is None
+    assert urls.normalize_url("https://github.com/o/" + "r" * 201) is None
+    assert urls.normalize_url("https://github.com/o/" + "r" * 200) is not None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/.git/repo",
+        "https://github.com/org/.GIT/repo",
+        "https://github.com/org/.git/",
+        "git@github.com:org/.git/x",
+        "git@github.com:.git",
+    ],
+)
+def test_a_dot_git_segment_does_not_normalize(url: str) -> None:
+    assert urls.normalize_url(url) is None
+
+
+def test_strip_userinfo_emits_a_lowercase_scheme() -> None:
+    assert urls.strip_userinfo("HTTPS://u:p@github.com/o/r") == "https://github.com/o/r"
+    assert urls.strip_userinfo("HTTPS://github.com/o/r") == "https://github.com/o/r"
+    assert urls.strip_userinfo("SSH://git@github.com/o/r") == "ssh://github.com/o/r"
+
+
+def test_local_path_needs_printable_ascii_and_accepts_an_uppercase_file_scheme() -> None:
+    assert urls.local_path("FILE:///srv/git/r") == "/srv/git/r"
+    assert urls.local_path("/srv/git/r\u00e9") is None
+    assert urls.local_path("/srv/git/r\x80") is None
+    assert urls.local_path("/srv/git/r\u202e") is None
+
+
+def test_the_template_error_never_echoes_the_template() -> None:
+    with pytest.raises(WtctlError) as exc:
+        urls.render_clone_url(REPO, template="https://user:hunter2@evil.test/{path}.git")
+    assert "hunter2" not in exc.value.message and "evil.test" not in exc.value.message

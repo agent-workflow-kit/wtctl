@@ -67,6 +67,7 @@ def run(ctx: Context) -> Result:
     anchors: list[dict[str, Any]] = []
     if res is None:
         res = resolver.clone(repo)
+        res.warnings.extend(resolver.notes)
         cloned = res.cloned
     elif res.anchor_changed:
         anchors = _reaccept(ctx, resolver, res)

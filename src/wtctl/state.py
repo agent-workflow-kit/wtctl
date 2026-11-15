@@ -793,6 +793,39 @@ class State:
                     [repo, *cols.values()],
                 )
 
+    def record_first_clone(self, repo: str, **fields: str | None) -> dict[str, Any]:
+        """Record the repo's clone with its ``common_id`` unless one is already recorded.
+
+        One transaction: the row is inserted, or updated only while its ``common_id`` is still
+        NULL or empty, so two processes racing for the first recording cannot both write: the
+        loser changes nothing. Returns the row as stored afterwards (compare its ``common_id``
+        with the identity you hold to learn whether you won). ``fields`` are those of
+        :meth:`put_clone` and must include ``path`` and ``common_id``.
+        """
+        if not fields.get("common_id") or "path" not in fields:
+            raise ValueError("record_first_clone needs a path and a common_id")
+        unknown = set(fields) - {
+            "path", "common_dir", "common_id", "source", "fetch_url", "default_branch",
+        }  # fmt: skip
+        if unknown:
+            raise ValueError(f"unknown clones columns: {sorted(unknown)}")
+        cols = {**fields, "verified_at": self._now()}
+        names = list(cols)
+        with self._txn() as c:
+            marks = ", ".join("?" for _ in range(len(names) + 1))
+            c.execute(
+                f"INSERT OR IGNORE INTO clones (repo, {', '.join(names)}) VALUES ({marks})",
+                [repo, *cols.values()],
+            )
+            sets = ", ".join(f"{n} = ?" for n in names)
+            c.execute(
+                f"UPDATE clones SET {sets} "
+                "WHERE repo = ? AND (common_id IS NULL OR common_id = '')",
+                [*cols.values(), repo],
+            )
+            row = c.execute("SELECT * FROM clones WHERE repo = ?", (repo,)).fetchone()
+        return dict(row)
+
 
 class Lease:
     """A held lease; use as a context manager. Renewed in the background when the state was

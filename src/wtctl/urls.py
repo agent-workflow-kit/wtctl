@@ -29,10 +29,32 @@ _PORT_RE = re.compile(r"[1-9][0-9]{0,4}")
 _USERINFO_BAD = re.compile(r"[\x00-\x20\x7f-\U0010ffff/?#\\@\[\]%]")
 _SCHEME_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://(.*)\Z", re.DOTALL)
 MAX_URL = 4096
+MAX_LABEL = 63
+MAX_HOST = 253
+MAX_SEGMENT = 200  # leaves room for the ".wtctl-tmp-<random>" suffix within NAME_MAX (255)
 
 
 def _printable_ascii(text: str) -> bool:
     return text.isascii() and all(0x20 < ord(c) < 0x7F for c in text)
+
+
+def _valid_host(name: str) -> bool:
+    """A lowercase DNS-style host within the DNS length limits (label 63, whole name 253)."""
+    return (
+        len(name) <= MAX_HOST
+        and bool(_HOST_RE.fullmatch(name))
+        and all(len(label) <= MAX_LABEL for label in name.split("."))
+    )
+
+
+def _valid_segment(segment: str) -> bool:
+    """A path segment: the grammar, at most 200 characters, not ``.``, ``..`` or ``.git``."""
+    return (
+        len(segment) <= MAX_SEGMENT
+        and bool(_SEGMENT_RE.fullmatch(segment))
+        and segment not in (".", "..")
+        and segment.lower() != ".git"
+    )
 
 
 # --- repo ids ---------------------------------------------------------------------------------
@@ -49,12 +71,12 @@ def _is_repo_id(text: str) -> bool:
     if not slash:
         return False
     name, colon, port = host.partition(":")
-    if not _HOST_RE.fullmatch(name):
+    if not _valid_host(name):
         return False
     if colon and (not _valid_port(port) or port == "443"):
         return False  # 443 is canonical-less: normalization drops it, so no id carries it
     segments = path.split("/")
-    return all(_SEGMENT_RE.fullmatch(s) and s not in (".", "..") for s in segments)
+    return all(_valid_segment(s) for s in segments)
 
 
 def validate_repo_id(text: str) -> str:
@@ -63,7 +85,8 @@ def validate_repo_id(text: str) -> str:
         shown = text if len(text) <= 100 else text[:100] + "..."
         raise UsageError(
             f"invalid repo id {shown!r}: lowercase host[:port]/path with segments of "
-            "[A-Za-z0-9._-] (no '.' or '..' segment)"
+            "[A-Za-z0-9._-] (no '.', '..' or '.git' segment; host labels at most 63 and "
+            "the host at most 253 characters, segments at most 200)"
         )
     return text
 
@@ -95,7 +118,7 @@ def _clean_path(path: str) -> str | None:
     if not path:
         return None
     segments = path.split("/")
-    if all(_SEGMENT_RE.fullmatch(s) and s not in (".", "..") for s in segments):
+    if all(_valid_segment(s) for s in segments):
         return path
     return None
 
@@ -109,7 +132,7 @@ def _split_authority(rest: str) -> tuple[str, str] | None:
 
 def _host_port(hostport: str) -> tuple[str, str | None] | None:
     host, colon, port = hostport.partition(":")
-    if not _HOST_RE.fullmatch(host):
+    if not _valid_host(host):
         return None
     if colon:
         if not _valid_port(port):
@@ -159,7 +182,7 @@ def _parse_scp(url: str) -> _Parsed | None:
         user, _, host = head.rpartition("@")
         if not _USER_RE.fullmatch(user) or user.startswith("-"):
             return None
-    if not _HOST_RE.fullmatch(host):
+    if not _valid_host(host):
         return None
     clean = _clean_path(path)
     if clean is None:
@@ -246,16 +269,18 @@ def url_host(url: str) -> str | None:
 
 
 def strip_userinfo(url: str) -> str:
-    """The URL without its userinfo (user and password); text that is not a parsed URL is
-    returned unchanged. Credentials are never kept in a URL wtctl records or uses."""
-    lowered = _lower_host(url)
-    parsed = _parse(lowered)
-    if parsed is None or parsed.userinfo is None:
+    """The URL without its userinfo (user and password) and with a lowercase scheme; text that
+    is not a parsed URL is returned unchanged. Credentials are never kept in a URL wtctl
+    records or uses, and git and the credential code accept only a lowercase scheme."""
+    parsed = _parse(_lower_host(url))
+    if parsed is None:
         return url
     m = _SCHEME_RE.fullmatch(url)
     if m is not None:
         authority, slash, path = m.group(2).partition("/")
-        return f"{m.group(1)}://{authority.rpartition('@')[2]}{slash}{path}"
+        return f"{m.group(1).lower()}://{authority.rpartition('@')[2]}{slash}{path}"
+    if parsed.userinfo is None:
+        return url
     return url.partition(":")[0].rpartition("@")[2] + ":" + url.partition(":")[2]
 
 
@@ -278,7 +303,7 @@ def local_path(url: str) -> str | None:
             return None  # file://host/..., file://localhost/...
     if not path.startswith("/") or "%" in path:
         return None
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in path) or "\\" in path:
+    if not path.isascii() or any(not 0x20 <= ord(c) < 0x7F for c in path) or "\\" in path:
         return None
     parts = [p for p in path.split("/") if p]
     if not parts or any(p in (".", "..") for p in parts):
@@ -311,6 +336,7 @@ def render_clone_url(repo_id: str, *, template: str) -> str:
     if normalize_url(url) != repo_id:
         raise WtctlError(
             "remote_mismatch",
-            f"the clone URL template {template!r} does not give a URL for {repo_id}",
+            f"the clone URL template of host {repo_host(repo_id)} does not give a URL "
+            f"for {repo_id}",
         )
     return url

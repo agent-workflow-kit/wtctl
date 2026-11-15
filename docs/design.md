@@ -104,7 +104,9 @@ Git worktrees, throwaway checkouts, and the mapping from repo ids to local clone
 | `mirror` | the per-clone mirror (D50): create and config, refresh and outcome classification, default branch, pushed check, base-commit transfer into the clone (pack built in the mirror and indexed in wtctl's private temp dir, D54) |
 | `fsafe` | no-follow, non-blocking per-component opens with the mount-point check against recorded anchor identities (D55) and the mountinfo pre-check, anchored walks in a child process under a hard deadline, started and killed by exact PID through `gateway` (D56), fd-based tree removal (worktrees with the `dir_id` check, admin entries, throwaways), atomic no-follow pointer writes, pack installation into a clone's `objects/pack/`, the `copy_env` source walk, extraction (validation, read, atomic write) |
 | `urls` | URL normalization and repo-id matching |
-| `locate` | config lookup, discovery, auto-clone |
+| `locate` | config lookup, discovery, auto-clone, clone verification |
+| `gitsetup` | opens the hardened git (binary, allowed filters, private directory) from the loaded config |
+| `commands/locate`, `commands/clone` | the `locate` and `clone` handlers: resolve through `locate`, human re-accept of a changed clone identity |
 | `create` | worktree and throwaway creation orders |
 | `bootstrap` | snapshots, env-file copy, steps |
 | `baseline` | item collection (own config parser for includes and per-key items), classes, digest, compare |
