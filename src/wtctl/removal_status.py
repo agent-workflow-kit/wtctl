@@ -95,6 +95,8 @@ class Status:
         self.head: str | None = None
         self.current_branch: str | None = None
         self.by_design_skipped = False  # content checks not run on purpose (a partial record)
+        self.directory_gone = False  # a partial record whose remaining path no longer exists
+        self.baseline_current: baselinesvc.Baseline | None = None
 
     # -- the checks ---------------------------------------------------------------------------
 
@@ -127,6 +129,7 @@ class Status:
             hooks_path=baselinesvc.hooks_recorded_path(items),
         )
         current = baselinesvc.compute(spec)
+        self.baseline_current = current
         rows = repobaseline.compare(items, current.items)
         git_rows = [x for x in rows if x["class"] == "git"]
         if git_rows or (not rows and baselinesvc.is_changed(r, current)):
@@ -329,14 +332,19 @@ class Status:
         r = self.record
         try:
             self._open_recorded_directory()
-        except fsafe.FsafeError:
-            return
+        except fsafe.FsafeError as exc:
+            if exc.kind != "missing":
+                return
+            # the tree was deleted and only the admin entry (if anything) is left to finish
+            self.directory_gone = True
         self.checks["integrity"] = {"status": "pass", "details": []}
         self.by_design_skipped = True
         self.warnings.append(
             f"{_escape(r['path'])} is partial and its git pointers are gone; content checks "
             "were skipped and remove only checks that nothing uses it"
         )
+        if self.directory_gone:
+            self.warnings.append(f"{_escape(r['path'])} no longer exists")
 
     def _open_recorded_directory(self) -> None:
         """Open the remaining path as Partial records require: an owned record component by
