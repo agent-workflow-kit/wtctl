@@ -549,6 +549,7 @@ class Gateway:
     def token_command(self, argv: list[str], **kwargs: object) -> TokenCommandResult:
         """Run a ``token_command`` (see ``wtctl.credentials``, the only caller)."""
         return self.token_runner(argv, **kwargs)
+
     def crontab(
         self, args: list[str], stdin: bytes | None = None
     ) -> subprocess.CompletedProcess[bytes]:
