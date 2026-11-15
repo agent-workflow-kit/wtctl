@@ -10,7 +10,6 @@ import pytest
 from tests.createlib import CW, REPO, script
 from tests.schemacheck import validate
 from tests.vectorlib import plain_git
-from wtctl.errors import WtctlError
 
 
 @pytest.fixture
@@ -85,7 +84,9 @@ def test_new_branch_from_the_default_branch(w: CW, capsys) -> None:  # noqa: ANN
     assert w.g(["config", "--get-regexp", "^branch\\."]).count(rec["branch"]) == 0
     st = os.stat(wt)
     assert rec["dir_id"] == f"{st.st_dev}:{st.st_ino}"
-    assert rec["admin_dir"] == str(w.clone / ".git" / "worktrees" / os.listdir(w.clone / ".git" / "worktrees")[0])
+    assert rec["admin_dir"] == str(
+        w.clone / ".git" / "worktrees" / os.listdir(w.clone / ".git" / "worktrees")[0]
+    )
 
 
 def test_human_output_is_the_path_alone_on_stdout(w: CW, capsys) -> None:  # noqa: ANN001
@@ -126,7 +127,10 @@ def test_detach_checks_out_the_base_tip(w: CW, capsys) -> None:  # noqa: ANN001
     assert data["branch_action"] == "detached" and rec["branch"] is None
     assert rec["created_branch"] is False and rec["base_sha"] == w.shas["c3"]
     assert w.g(["rev-parse", "HEAD"], Path(rec["path"])) == w.shas["c3"]
-    assert plain_git(["symbolic-ref", "-q", "HEAD"], cwd=Path(rec["path"]), home=w.home).returncode == 1
+    assert (
+        plain_git(["symbolic-ref", "-q", "HEAD"], cwd=Path(rec["path"]), home=w.home).returncode
+        == 1
+    )
     assert rec["name"] == rec["id"][3:]
 
 
@@ -269,7 +273,9 @@ def test_derived_name_skips_an_existing_path_with_a_warning(w: CW, capsys) -> No
 
 
 def test_template_branch_collision_suffixes_the_name(
-    w: CW, capsys, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
 ) -> None:
     # the derived name is the id; make the id predictable and take the branch it would build
 
@@ -473,8 +479,8 @@ def test_pre_create_runs_before_any_branch_write(w: CW, capsys) -> None:  # noqa
     snap = w.tmp / "refs.txt"
     hook = script(
         w.tmp / "hook.sh",
-        f'cat > {out}\ngit --git-dir={w.clone}/.git for-each-ref > {snap}\n'
-        f'ls {w.root} > {w.tmp}/rootls 2>&1 || true',
+        f"cat > {out}\ngit --git-dir={w.clone}/.git for-each-ref > {snap}\n"
+        f"ls {w.root} > {w.tmp}/rootls 2>&1 || true",
     )
     w.top["hooks"] = {"pre-create": [{"cmd": hook}]}
     data = ok(w.create(capsys, "--label", "k=v"))
@@ -526,7 +532,10 @@ def test_post_create_runs_after_activation(w: CW, capsys) -> None:  # noqa: ANN0
 
     out = w.tmp / "post.json"
     seen = w.tmp / "seen"
-    probe = "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute('select state from records').fetchone()[0])"
+    probe = (
+        "import sqlite3,sys;"
+        "print(sqlite3.connect(sys.argv[1]).execute('select state from records').fetchone()[0])"
+    )
     hook = script(w.tmp / "post.sh", f'cat > {out}\n{sys.executable} -c "{probe}" {w.db} > {seen}')
     w.top["hooks"] = {"post-create": [{"cmd": hook}]}
     data = ok(w.create(capsys))

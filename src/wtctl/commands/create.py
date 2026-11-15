@@ -3,7 +3,8 @@
 TODO(#21): ``create --throwaway`` (the throwaway create order) lives in its own issue.
 TODO(#16): bootstrap (create order step 14) is a seam: the record keeps ``bootstrap.state: none``.
 TODO(#17): the baseline (create order step 15) is a seam: ``baseline_digest`` stays null.
-TODO(#5): log ``create``, ``fetch``, ``hook`` and ``refused`` events (create is logged, not audited).
+TODO(#5): log ``create``, ``fetch``, ``hook`` and ``refused`` events (create is logged, not
+audited).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from ..context import Context, Result
 from ..errors import UsageError, WtctlError
 from ..gitsetup import open_git
 from ..hardgit import Git, load_filter_policy
-from ..locate import Resolution, Resolver, describe_mount, identity_str
+from ..locate import Resolver, describe_mount, identity_str
 from ..mirror import Mirror, Tips
 from ..packs import clone_has_commit, transfer_base
 from ..state import Lease, Record, State, check_holder, clone_lease, state_path
@@ -158,7 +159,9 @@ class Creator:
         self.warnings += res.warnings
         self.wgit = self._git_with_filters()
         try:
-            with self.state.lease(clone_lease(res.clone_path), wait=self.config.lease_wait_s) as lease:
+            with self.state.lease(
+                clone_lease(res.clone_path), wait=self.config.lease_wait_s
+            ) as lease:
                 return self._locked(resolver, lease)
         except Reused as r:
             return self._result_reused(r.record)
@@ -370,9 +373,7 @@ class Creator:
             return
         raise WtctlError("ref_not_found", f"commit {sha} is neither in the clone nor in the mirror")
 
-    def _classify(
-        self, heads: dict[str, str], tips: Tips | None, live: list[Record]
-    ) -> Plan:
+    def _classify(self, heads: dict[str, str], tips: Tips | None, live: list[Record]) -> Plan:
         o = self.o
         branch = self.branch
         if o.ref is not None:
@@ -462,10 +463,10 @@ class Creator:
             pass
         except (NotADirectoryError, OSError) as exc:
             if isinstance(exc, PermissionError):
-                raise WtctlError("create_failed", f"cannot examine {path}: {exc.strerror}") from None
-            raise WtctlError(
-                "refused", f"{path} cannot be used", reason="path_exists"
-            ) from None
+                raise WtctlError(
+                    "create_failed", f"cannot examine {path}: {exc.strerror}"
+                ) from None
+            raise WtctlError("refused", f"{path} cannot be used", reason="path_exists") from None
         else:
             if not stat.S_ISDIR(st.st_mode) or os.listdir(path):
                 raise WtctlError("refused", f"{path} already exists", reason="path_exists")
@@ -514,9 +515,13 @@ class Creator:
                 self._make_parents(anchor, root)
         return root
 
-    def _root_error(self, root: str, recorded: str | None, exc: fsafe.FsafeError | None) -> WtctlError:
+    def _root_error(
+        self, root: str, recorded: str | None, exc: fsafe.FsafeError | None
+    ) -> WtctlError:
         if exc is not None and exc.kind not in ("identity", "mount_point"):
-            return WtctlError("create_failed", f"cannot open the worktree root {root}: {exc.message}")
+            return WtctlError(
+                "create_failed", f"cannot open the worktree root {root}: {exc.message}"
+            )
         current = "0:0"
         info = {"fs_type": "unknown", "mount_source": "", "mount_point": "/"}
         with contextlib.suppress(OSError):
@@ -575,7 +580,9 @@ class Creator:
 
     def _pre_create(self, plan: Plan) -> list[str]:
         o = self.o
-        specs = hooks.configured_hooks(self.config, "pre-create", o.hook_flags.get("pre-create", []))
+        specs = hooks.configured_hooks(
+            self.config, "pre-create", o.hook_flags.get("pre-create", [])
+        )
         payload = hooks.build_payload(
             "pre-create",
             object_type="worktree",
@@ -682,7 +689,7 @@ class Creator:
                 reflog_start_sha=info.reflog_start_sha,
             )
             self.state.set_stash_ids(record["id"], info.stash_ids)
-        except BaseException as exc:
+        except BaseException:
             if added:
                 # The worktree exists: the record stays `creating` for reconcile to settle
                 # (a record that says `active` or vanishes would lie about the directory).
@@ -702,9 +709,7 @@ class Creator:
         cid = self.res.recorded_id
         assert cid is not None
         dev, _, ino = cid.partition(":")
-        transfer_base(
-            self.mirror, lease, common_id=fsafe.Identity(int(dev), int(ino)), start=start
-        )
+        transfer_base(self.mirror, lease, common_id=fsafe.Identity(int(dev), int(ino)), start=start)
 
     def _unwind(
         self, record: Record, plan: Plan, created_sha: str | None, wrote_upstream: bool
@@ -725,7 +730,9 @@ class Creator:
         o = self.o
         if self.settings.bootstrap.steps and self.settings.bootstrap.auto and not o.no_bootstrap:
             # TODO(#16): run the steps; until then the record says bootstrap never ran.
-            self.warnings.append("bootstrap steps are configured but bootstrap is not implemented yet")
+            self.warnings.append(
+                "bootstrap steps are configured but bootstrap is not implemented yet"
+            )
         # TODO(#17): record the baseline here (after bootstrap).
         active = self.state.transition(record["id"], "creating", "active")
         out = record_object(active)
@@ -739,7 +746,11 @@ class Creator:
             bootstrap={**EMPTY_BOOTSTRAP, "tracked_changes": []},
         )
         env = hooks.hook_env(
-            self.config, os.environ, hook="post-create", object_id=active["id"], object_type="worktree"
+            self.config,
+            os.environ,
+            hook="post-create",
+            object_id=active["id"],
+            object_type="worktree",
         )
         specs = hooks.configured_hooks(
             self.config, "post-create", o.hook_flags.get("post-create", [])
@@ -757,7 +768,13 @@ class Creator:
         )
 
     def _result(
-        self, record: dict[str, Any], action: str | None, bootstrap: Any, *, reused: bool, human: str
+        self,
+        record: dict[str, Any],
+        action: str | None,
+        bootstrap: Any,
+        *,
+        reused: bool,
+        human: str,
     ) -> Result:
         data = {
             "record": record,
@@ -803,9 +820,7 @@ def fsafe_open_dir(path: str) -> int:
 
 def run(ctx: Context) -> Result:
     if ctx.args.throwaway:
-        raise WtctlError(
-            "internal", "`wtctl create --throwaway` is not implemented yet (see #21)"
-        )
+        raise WtctlError("internal", "`wtctl create --throwaway` is not implemented yet (see #21)")
     opts = parse_options(ctx)
     return Creator(ctx, opts).run()
 

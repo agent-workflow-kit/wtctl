@@ -1,4 +1,4 @@
-"""Names, branches and paths derived by ``create`` (docs/interface.md, Identifiers > Names, Locations).
+"""Names, branches and paths derived by ``create`` (docs/interface.md, Names and Locations).
 
 All pure: nothing here touches git, state or the file system. A derived name always matches the
 name grammar, so it is a single safe path component.

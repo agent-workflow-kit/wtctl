@@ -89,7 +89,9 @@ def test_render_branch_prefix_and_template() -> None:
 
 
 def test_render_branch_keeps_unknown_braces_literally() -> None:
-    got = naming.render_branch("", "{evil.__class__}/{name}", name="n", record_id="wt-aaaaaaaa", date="d")
+    got = naming.render_branch(
+        "", "{evil.__class__}/{name}", name="n", record_id="wt-aaaaaaaa", date="d"
+    )
     assert got == "{evil.__class__}/n"
 
 
@@ -129,7 +131,9 @@ def test_render_path_refuses_a_result_outside_the_root(template: str) -> None:
 
 def test_render_path_refuses_a_result_that_is_the_root() -> None:
     with pytest.raises(ValueError):
-        naming.render_path("{root}/", root="/r", host="h", path="p", name="n", record_id="wt-aaaaaaaa")
+        naming.render_path(
+            "{root}/", root="/r", host="h", path="p", name="n", record_id="wt-aaaaaaaa"
+        )
 
 
 def test_render_path_refuses_a_newline() -> None:

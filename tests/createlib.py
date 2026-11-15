@@ -127,13 +127,10 @@ class CW:
             "admin": self.admin_entries(),
             "worktrees": self.worktree_paths(),
             "config": (self.clone / ".git" / "config").read_text(),
-            "dirs": sorted(
-                str(p.relative_to(self.root)) for p in self.root.rglob("*")
-            )
+            "dirs": sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*"))
             if self.root.exists()
             else [],
         }
-
 
     def plant_creating(
         self, *, branch: str | None, name: str, holder: str | None = None, state: str = "creating"
@@ -147,8 +144,14 @@ class CW:
         path = str(self.root.resolve() / "worktrees" / "example.test" / "org" / "repo" / name)
         st.insert_record(
             {
-                "id": rid, "object_type": "worktree", "state": state, "repo": REPO,
-                "path": path, "name": name, "branch": branch, "owned": True,
+                "id": rid,
+                "object_type": "worktree",
+                "state": state,
+                "repo": REPO,
+                "path": path,
+                "name": name,
+                "branch": branch,
+                "owned": True,
                 "clone_path": str(self.clone),
             },  # fmt: skip
             holders=[holder] if holder else [],
@@ -167,3 +170,67 @@ def script(path: Path, body: str) -> str:
     path.write_text("#!/bin/sh\n" + body + "\n")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return str(path)
+
+
+# -- a git runner that can watch and break chosen commands --------------------------------------
+
+
+def subcommand(argv: list[str]) -> str:
+    """The git subcommand of a hardened command line (after ``-c k=v`` pairs and ``--git-dir``)."""
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "-c":
+            i += 2
+        elif a == "--no-pager" or a.startswith(("--git-dir=", "--work-tree=")):
+            i += 1
+        else:
+            return a
+    return ""
+
+
+class Spy:
+    """Wraps the real git runner. ``before(sub, argv, kw)`` may return a ``GitResult`` to replace
+    the command (it then does not run); ``after(sub, argv, kw, result)`` may return another."""
+
+    def __init__(self, before=None, after=None) -> None:  # noqa: ANN001
+        from wtctl.gateway import run_git
+
+        self.real = run_git
+        self.before = before
+        self.after = after
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def __call__(self, argv, **kw):  # noqa: ANN001, ANN204
+        sub = subcommand(argv)
+        self.calls.append((sub, list(argv)))
+        if self.before is not None:
+            replaced = self.before(sub, argv, kw)
+            if replaced is not None:
+                return replaced
+        result = self.real(argv, **kw)
+        if self.after is not None:
+            result = self.after(sub, argv, kw, result) or result
+        return result
+
+    def subs(self) -> list[str]:
+        return [s for s, _ in self.calls]
+
+
+def cli_spy(w: CW, spy: Spy, *argv: str, human: bool = False):  # noqa: ANN201
+    """Run ``create`` in-process with ``spy`` as the git runner; returns ``(code, out, err)``."""
+    import contextlib
+    import io
+
+    from tests.helpers import Run
+    from wtctl.cli import main
+    from wtctl.context import Runtime
+    from wtctl.gateway import Gateway
+
+    actor = ["--actor", "human:tester" if human else "auto:tester"]
+    out, err = io.StringIO(), io.StringIO()
+    rt = Runtime(stdin_isatty=False, me_name="alice", gateway=Gateway(git_runner=spy))
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = main(["--config", w.config(), "--json", *actor, "create", "--repo", REPO, *argv],
+                    runtime=rt)  # fmt: skip
+    return Run(code, out.getvalue(), err.getvalue())

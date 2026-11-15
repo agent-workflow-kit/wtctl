@@ -30,8 +30,10 @@ UNSAFE_LFS_KEYS = re.compile(
 
 
 def create_failed(message: str, **details: object) -> WtctlError:
-    return WtctlError("create_failed", message, details=details) if details else WtctlError(
-        "create_failed", message
+    return (
+        WtctlError("create_failed", message, details=details)
+        if details
+        else WtctlError("create_failed", message)
     )
 
 
@@ -99,9 +101,7 @@ def worktree_entries(git: Git, common_dir: str) -> list[WorktreeEntry]:
             n = sum(1 for e in it if e.is_dir(follow_symlinks=False))
     except FileNotFoundError:
         n = 0
-    r = git.run(
-        ["worktree", "list", "--porcelain"], git_dir=common_dir, cwd=common_dir, timeout=60
-    )
+    r = git.run(["worktree", "list", "--porcelain"], git_dir=common_dir, cwd=common_dir, timeout=60)
     if r.returncode != 0 or r.timed_out:
         raise create_failed("cannot list the worktrees of the clone")
     try:
@@ -137,9 +137,7 @@ def unsafe_driver_keys(git: Git, common_dir: str, start: str | None) -> list[str
     keys += [k for k, _ in parse_config_list(r.stdout) if UNSAFE_LFS_KEYS.fullmatch(k)]
     if start is not None:
         spec = f"{start}:.lfsconfig"
-        present = git.run(
-            ["cat-file", "-e", spec], git_dir=common_dir, cwd=common_dir, timeout=60
-        )
+        present = git.run(["cat-file", "-e", spec], git_dir=common_dir, cwd=common_dir, timeout=60)
         if present.returncode == 0:
             c = git.run(
                 ["config", "--no-includes", f"--blob={spec}", "--list", "-z"],
@@ -233,9 +231,11 @@ def inspect_added(git: Git, common_dir: str, path: str) -> Added:
     )
     admin = r.out.strip()
     common_real = os.path.realpath(common_dir)
-    if r.returncode != 0 or os.path.dirname(os.path.realpath(admin)) != os.path.join(
-        common_real, "worktrees"
-    ) or not ADMIN_NAME.fullmatch(os.path.basename(admin)):
+    if (
+        r.returncode != 0
+        or os.path.dirname(os.path.realpath(admin)) != os.path.join(common_real, "worktrees")
+        or not ADMIN_NAME.fullmatch(os.path.basename(admin))
+    ):
         raise create_failed("the new worktree does not point at an admin entry of the clone")
     admin = os.path.join(common_real, "worktrees", os.path.basename(admin))
     h = git.run(["rev-parse", "--verify", "HEAD"], git_dir=admin, cwd=admin, timeout=60)
@@ -261,12 +261,18 @@ def _reflog_last(admin: str) -> str | None:
 
 def _stash_ids(git: Git, common_dir: str) -> list[str]:
     has = git.run(
-        ["rev-parse", "--verify", "-q", "refs/stash"], git_dir=common_dir, cwd=common_dir, timeout=60
+        ["rev-parse", "--verify", "-q", "refs/stash"],
+        git_dir=common_dir,
+        cwd=common_dir,
+        timeout=60,
     )
     if has.returncode != 0:
         return []
     r = git.run(
-        ["log", "-g", "--format=%H", "refs/stash", "--"], git_dir=common_dir, cwd=common_dir, timeout=60
+        ["log", "-g", "--format=%H", "refs/stash", "--"],
+        git_dir=common_dir,
+        cwd=common_dir,
+        timeout=60,
     )
     if r.returncode != 0 or r.timed_out:
         raise create_failed("cannot read the clone's stash entries")
