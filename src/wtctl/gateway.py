@@ -8,6 +8,7 @@ the ones a command uses, and tests pass fakes.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import datetime as dt
 import os
@@ -214,6 +215,15 @@ def run_git(
             timed_out=was_running and not over,
             output_limit=over,
         )
+    except BaseException:
+        # An interrupt (or any other exception) while waiting: the child must not outlive us.
+        # The leader is unreaped here, so its pid is certainly this group's id.
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGKILL)
+        _drain(proc)
+        proc.wait()
+        raise
     finally:
         if out_fd >= 0:
             if max_stdout_bytes is not None and not over:

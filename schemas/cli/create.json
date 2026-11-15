@@ -31,7 +31,7 @@
     },
     "reused": {
       "type": "boolean",
-      "description": "true: a retry after a crash (create --holder H hit branch_in_use or path_exists on an active record that has H among its holders); that record is returned unchanged, with branch_action and bootstrap null and no hooks run (interface: Create order, Retry after a crash)."
+      "description": "true: a retry after a crash (create --holder H hit branch_in_use or path_exists, or an explicit --name collision, on an active record that has H among its holders); that record is returned unchanged, with branch_action and bootstrap null and no hooks run (interface: Create order, Retry after a crash)."
     },
     "warnings": {
       "$ref": "../defs.json#/$defs/warnings"

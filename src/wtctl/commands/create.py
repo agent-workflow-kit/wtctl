@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
+import sqlite3
 import stat
 from typing import Any
 
@@ -28,6 +29,7 @@ from ..state import Conflict, Lease, Record, State, check_holder, clone_lease, s
 from ..worktrees import SHA, AddSpec
 
 NAME_RE = naming.NAME_RE
+CREATE_HOOKS = ("pre-create", "post-create")  # the hooks that can fire on create
 EMPTY_BOOTSTRAP = {"state": "none", "steps": [], "created_paths_count": 0}
 
 # Fields of the record object, in the order docs/interface.md lists them.
@@ -92,6 +94,10 @@ def parse_options(ctx: Context) -> Options:
     if a.branch is not None:
         _no_option_like(a.branch, "--branch")
     labelmod.merge_labels((), a.label)
+    hook_flags = hooks.parse_hook_flags(a.hook)
+    for name in hook_flags:
+        if name not in CREATE_HOOKS:
+            raise UsageError(f"--hook {name}: create fires only {', '.join(CREATE_HOOKS)}")
     return Options(
         repo=a.repo,
         branch=a.branch,
@@ -101,7 +107,7 @@ def parse_options(ctx: Context) -> Options:
         name=a.name,
         holder=a.holder,
         labels=list(a.label),
-        hook_flags=hooks.parse_hook_flags(a.hook),
+        hook_flags=hook_flags,
         no_bootstrap=a.no_bootstrap,
         copy_env=a.copy_env,
         override_escalation=a.override_escalation,
@@ -258,6 +264,16 @@ class Creator:
                 return r
         return None
 
+    @staticmethod
+    def _case_variant(heads: dict[str, str], ref: str) -> str | None:
+        """The tip of a local branch whose name differs from ``ref`` only by case (a collision on
+        a case-insensitive file system, and confusing on any)."""
+        folded = ref.casefold()
+        for name, sha in heads.items():
+            if name != ref and name.casefold() == folded:
+                return sha
+        return None
+
     def _by_path(self, live: list[Record], path: str) -> Record | None:
         for r in live:
             if r["path"] == path:
@@ -333,13 +349,14 @@ class Creator:
             if template_built:
                 branch = self._render_branch(name)
                 ref = f"refs/heads/{branch}"
-                if ref in heads:
+                tip = heads.get(ref) or self._case_variant(heads, ref)
+                if tip is not None:
                     if explicit:
                         raise WtctlError(
                             "refused",
                             f"branch {branch} already exists",
                             reason="branch_exists",
-                            details={"tip": heads[ref]},
+                            details={"tip": tip},
                         )
                     continue
                 return name, branch, path
@@ -407,6 +424,14 @@ class Creator:
             if local is not None:
                 return Plan("existing", branch, tip, None, None, False)
             return Plan("track", branch, tip, None, None, True)
+        variant = self._case_variant(heads, f"refs/heads/{branch}")
+        if variant is not None:
+            raise WtctlError(
+                "refused",
+                f"branch {branch} already exists under a name that differs only by case",
+                reason="branch_exists",
+                details={"tip": variant},
+            )
         base = base_sha = None
         if o.ref is None or o.base is not None:
             base, base_sha = self._resolve_base(heads, tips)
@@ -440,17 +465,27 @@ class Creator:
 
     # -- the path (step 10) ------------------------------------------------------------------
 
-    def _known_dirs(self, live: list[Record]) -> list[str]:
+    def _known_dirs(self) -> list[str]:
+        """Every directory a new worktree must not lie in or around: the clones, and the worktrees
+        of every repo (live records of all repos, and the worktree list of each known clone)."""
         dirs = [self.res.clone_path]
         dirs += [c.clone for c in map(self.config.repo, self.config.repos) if c.clone]
-        with contextlib.suppress(Exception):
-            dirs += [row["path"] for row in self._clone_rows()]
+        try:
+            rows = self._clone_rows()
+        except sqlite3.Error as exc:
+            raise WtctlError("internal", f"cannot read the known clones: {exc}") from exc
+        own = os.path.realpath(self.res.common_dir)
+        for row in rows:
+            dirs.append(row["path"])
+            common = row.get("common_dir")
+            if common and os.path.realpath(common) != own and os.path.isdir(common):
+                dirs += [e.path for e in worktrees.worktree_entries(self.git, common)]
         dirs += [e.path for e in worktrees.worktree_entries(self.git, self.res.common_dir)]
-        dirs += [r["path"] for r in live]
+        dirs += [r["path"] for r in self.state.records()]
         return [os.path.realpath(d) for d in dirs if d]
 
     def _clone_rows(self) -> list[dict[str, Any]]:
-        rows = self.state._conn.execute("SELECT path FROM clones").fetchall()  # noqa: SLF001
+        rows = self.state._conn.execute("SELECT path, common_dir FROM clones").fetchall()  # noqa: SLF001
         return [dict(r) for r in rows]
 
     def _check_path(self, live: list[Record]) -> None:
@@ -475,9 +510,15 @@ class Creator:
                 ) from None
             raise WtctlError("refused", f"{path} cannot be used", reason="path_exists") from None
         else:
-            if not stat.S_ISDIR(st.st_mode) or os.listdir(path):
+            try:
+                occupied = not stat.S_ISDIR(st.st_mode) or bool(os.listdir(path))
+            except OSError as exc:
+                raise WtctlError(
+                    "create_failed", f"cannot examine {path}: {exc.strerror}"
+                ) from None
+            if occupied:
                 raise WtctlError("refused", f"{path} already exists", reason="path_exists")
-        for known in self._known_dirs(live):
+        for known in self._known_dirs():
             if _within(path, known):
                 raise UsageError(f"{path} lies inside the existing worktree {known}")
             if _within(known, path):
@@ -523,7 +564,13 @@ class Creator:
         return root
 
     def _root_error(
-        self, root: str, recorded: str | None, exc: fsafe.FsafeError | None
+        self,
+        root: str,
+        recorded: str | None,
+        exc: fsafe.FsafeError | None,
+        *,
+        message: str | None = None,
+        changed: bool = True,
     ) -> WtctlError:
         if exc is not None and exc.kind not in ("identity", "mount_point"):
             return WtctlError(
@@ -540,14 +587,14 @@ class Creator:
             "path": fsafe.escape_for_details(root),
             "recorded": recorded or current,
             "current": current,
-            "changed": True,
+            "changed": changed,
             **info,
         }
         if recorded is None:
             entry["recorded"] = "0:0" if current != "0:0" else "0:1"
         return WtctlError(
             "create_failed",
-            f"the worktree root {root} is not the directory wtctl recorded for it",
+            message or f"the worktree root {root} is not the directory wtctl recorded for it",
             details={"cause": "anchor_changed", "anchors": [entry]},
         )
 
@@ -653,7 +700,7 @@ class Creator:
     def _add(self, plan: Plan, record: Record, lease: Lease) -> None:
         git, common = self.wgit, self.res.common_dir
         created_sha: str | None = None
-        wrote_upstream = False
+        written: dict[str, str] = {}
         added = False
         try:
             start = plan.start
@@ -661,30 +708,27 @@ class Creator:
             if plan.action != "existing" and not clone_has_commit(self.git, common, start):
                 self._transfer(lease, start)
             self._driver_config_check(plan, early=False)
+            if plan.created_branch:
+                # The ref is created create-only, so a branch this call owns was never anybody
+                # else's and the unwind may delete it; one that exists is a refusal.
+                assert plan.branch is not None
+                worktrees.create_branch_ref(self.git, common, plan.branch, start)
+                created_sha = start
             if plan.action == "track":
                 assert plan.branch is not None
-                worktrees.write_upstream(self.git, common, plan.branch, self.settings.remote)
-                wrote_upstream = True
-            if plan.created_branch:
-                created_sha = start
-            spec = AddSpec(
-                self.path,
-                plan.branch,
-                start,
-                new_branch=plan.created_branch,
-            )
+                worktrees.write_upstream(
+                    self.git, common, plan.branch, self.settings.remote, written
+                )
+            spec = AddSpec(self.path, plan.branch, None if plan.branch else start)
             try:
                 worktrees.worktree_add(git, common, spec)
             finally:
+                # git is dead here (the gateway kills its group on any exception)
                 added = self._added_on_disk()
             if not added:
                 raise WtctlError("create_failed", "git worktree add did not create the worktree")
+            dir_id = self._verify_placement()
             info = worktrees.inspect_added(self.git, common, self.path)
-            fd = fsafe_open_dir(self.path)
-            try:
-                dir_id = identity_str(os.fstat(fd))
-            finally:
-                os.close(fd)
             self.state.transition(
                 record["id"],
                 "creating",
@@ -696,21 +740,86 @@ class Creator:
                 reflog_start_sha=info.reflog_start_sha,
             )
             self.state.set_stash_ids(record["id"], info.stash_ids)
-        except BaseException:
+        except BaseException as exc:
             if added:
-                # The worktree exists: the record stays `creating` for reconcile to settle
-                # (a record that says `active` or vanishes would lie about the directory).
-                raise
-            self._unwind(record, plan, created_sha, wrote_upstream)
+                # The worktree exists: branch, directory and the `creating` record stay for
+                # reconcile to settle (a record that says `active` or vanishes would lie).
+                raise self._kept(exc, record, plan) from exc
+            notes = self._unwind(record, plan, created_sha, written)
+            self._annotate(exc, notes)
             raise
 
+    def _kept(self, exc: BaseException, record: Record, plan: Plan) -> BaseException:
+        """The error for a failure after git created the worktree: ``create_failed`` naming the
+        record that was kept (an interrupt is passed through)."""
+        if not isinstance(exc, Exception):
+            return exc
+        if isinstance(exc, WtctlError) and exc.code == "create_failed" and "details" in exc.fields:
+            exc.fields["details"].setdefault("record", record["id"])
+            exc.fields["details"].setdefault("branch", plan.branch)
+            exc.fields["details"].setdefault("path", self.path)
+            return exc
+        what = exc.message if isinstance(exc, WtctlError) else f"{type(exc).__name__}: {exc}"
+        return WtctlError(
+            "create_failed",
+            f"{what} (the worktree was added; record {record['id']} stays `creating`)",
+            details={"record": record["id"], "branch": plan.branch, "path": self.path},
+        )
+
     def _added_on_disk(self) -> bool:
-        """The worktree's `.git` pointer exists (git created the directory)."""
+        """git created the worktree: its `.git` pointer exists, or an admin entry names the
+        path (the entry is written first, so it also covers a pointer that is gone again)."""
         try:
             st = os.lstat(os.path.join(self.path, ".git"))
         except OSError:
-            return False
-        return stat.S_ISREG(st.st_mode)
+            pass
+        else:
+            if stat.S_ISREG(st.st_mode):
+                return True
+        mine = os.path.join(self.path, ".git")
+        return any(g == mine for g in worktrees.admin_gitdirs(self.res.common_dir))
+
+    def _verify_placement(self) -> str:
+        """After the add: walk from the root anchor to the worktree without following a symlink
+        and return the worktree directory's identity (``dir_id``). git created the parents by
+        path, so a parent swapped between our checks and its ``mkdir`` shows up here as
+        ``anchor_changed``; the record stays ``creating`` (the worktree exists)."""
+        root = self._worktree_base_dir()
+        recorded = self.state.anchor_identity(root)
+        expected = None
+        if recorded is not None:
+            dev, _, ino = recorded.partition(":")
+            expected = fsafe.Identity(int(dev), int(ino))
+        try:
+            anchor = fsafe.open_anchor(root, expected=expected)
+        except fsafe.FsafeError as exc:
+            raise self._root_error(root, recorded, exc) from None
+        with anchor:
+            fd = os.dup(anchor.fd)
+            try:
+                for part in os.path.relpath(self.path, root).split(os.sep):
+                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                    try:
+                        nfd = os.open(part, flags, dir_fd=fd)
+                    except OSError:
+                        raise self._root_error(
+                            root,
+                            recorded,
+                            None,
+                            message=f"a parent of {self.path} was replaced while git created it",
+                            changed=False,
+                        ) from None
+                    os.close(fd)
+                    fd = nfd
+                try:
+                    dotgit = os.stat(".git", dir_fd=fd, follow_symlinks=False)
+                except OSError:
+                    dotgit = None
+                if dotgit is None or not stat.S_ISREG(dotgit.st_mode):
+                    raise WtctlError("create_failed", f"{self.path} has no .git file after the add")
+                return identity_str(os.fstat(fd))
+            finally:
+                os.close(fd)
 
     def _transfer(self, lease: Lease, start: str) -> None:
         cid = self.res.recorded_id
@@ -719,17 +828,39 @@ class Creator:
         transfer_base(self.mirror, lease, common_id=fsafe.Identity(int(dev), int(ino)), start=start)
 
     def _unwind(
-        self, record: Record, plan: Plan, created_sha: str | None, wrote_upstream: bool
-    ) -> None:
-        """A failed create leaves no branch this call created, no upstream section it wrote and
-        no record (nothing was added to disk)."""
+        self, record: Record, plan: Plan, created_sha: str | None, written: dict[str, str]
+    ) -> list[str]:
+        """A failed create (nothing was added to disk) leaves no branch this call created, no
+        upstream key it wrote and no record. Returns what could not be undone."""
         common = self.res.common_dir
-        with contextlib.suppress(Exception):
-            if plan.created_branch and plan.branch and created_sha:
-                worktrees.delete_created_branch(self.git, common, plan.branch, created_sha)
-            if wrote_upstream and plan.branch:
-                worktrees.remove_upstream(self.git, common, plan.branch)
-        self.state.delete_record(record["id"], expected="creating")
+        notes: list[str] = []
+        if plan.created_branch and plan.branch and created_sha:
+            try:
+                if not worktrees.delete_created_branch(self.git, common, plan.branch, created_sha):
+                    notes.append(
+                        f"branch {plan.branch} was left (it moved, or could not be deleted)"
+                    )
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask the original error
+                notes.append(f"branch {plan.branch} was left ({exc})")
+        if written and plan.branch:
+            try:
+                notes += worktrees.remove_upstream(self.git, common, plan.branch, written)
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"the upstream of {plan.branch} was left ({exc})")
+        try:
+            self.state.delete_record(record["id"], expected="creating")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"record {record['id']} was left `creating` ({exc})")
+        return notes
+
+    def _annotate(self, exc: BaseException, notes: list[str]) -> None:
+        """Make an incomplete cleanup visible: in the error's message, and as warnings."""
+        if not notes:
+            return
+        self.warnings += notes
+        if isinstance(exc, WtctlError):
+            exc.message += "; cleanup incomplete: " + "; ".join(notes)
+            exc.args = (exc.message,)
 
     # -- activation and output (step 14 to 16) ----------------------------------------------
 
@@ -740,8 +871,19 @@ class Creator:
             self.warnings.append(
                 "bootstrap steps are configured but bootstrap is not implemented yet"
             )
+        if o.copy_env:
+            # TODO(#16): --copy-env copies the env files (Bootstrap steps 1, 2, 4, 5).
+            self.warnings.append("--copy-env was ignored: bootstrap not implemented yet (#16)")
         # TODO(#17): record the baseline here (after bootstrap).
-        active = self.state.transition(record["id"], "creating", "active")
+        try:
+            active = self.state.transition(record["id"], "creating", "active")
+        except WtctlError as exc:
+            if exc.code != "busy":
+                raise
+            # no other actor changes a record whose lease is held: a lost compare-and-set is a bug
+            raise WtctlError(
+                "internal", f"record {record['id']} changed while create held its lease"
+            ) from None
         out = record_object(active)
         payload = hooks.build_payload(
             "post-create",
@@ -817,12 +959,6 @@ class Creator:
             record_object(rec), plan.action, {**EMPTY_BOOTSTRAP, "tracked_changes": []},
             reused=False, human=f"would create {fields['name']} ({plan.action})",
         )  # fmt: skip
-
-
-def fsafe_open_dir(path: str) -> int:
-    from ..locate import open_dir_nofollow
-
-    return open_dir_nofollow(path)
 
 
 def run(ctx: Context) -> Result:

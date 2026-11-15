@@ -57,11 +57,9 @@ def test_a_branch_leaked_by_a_failed_add_is_deleted(w: CW, capsys) -> None:  # n
     before = settled(w)
 
     def make_then_fail(sub, argv, kw):  # noqa: ANN001, ANN202
-        if sub == "worktree" and "-b" in argv:
-            branch = argv[argv.index("-b") + 1]
-            sha = argv[-1]
-            g = ["--git-dir", str(w.clone / ".git")]
-            plain_git([*g, "update-ref", f"refs/heads/{branch}", sha], cwd=w.tmp, home=w.home)
+        if (
+            sub == "worktree" and "add" in argv
+        ):  # the branch already exists (create-only ref), then the add fails
             return GitResult(128, b"", b"fatal: injected\n")
         return None
 
@@ -74,9 +72,8 @@ def test_the_leaked_branch_is_deleted_only_if_it_did_not_move(w: CW, capsys) -> 
     moved = {}
 
     def make_move_fail(sub, argv, kw):  # noqa: ANN001, ANN202
-        if sub == "worktree" and "-b" in argv:
-            branch = argv[argv.index("-b") + 1]
-            moved["ref"] = f"refs/heads/{branch}"
+        if sub == "worktree" and "add" in argv:
+            moved["ref"] = "refs/heads/" + argv[-1]
             g = ["--git-dir", str(w.clone / ".git")]
             plain_git([*g, "update-ref", moved["ref"], w.shas["c1"]], cwd=w.tmp, home=w.home)
             return GitResult(128, b"", b"fatal: injected\n")
@@ -91,14 +88,16 @@ def test_the_leaked_branch_is_deleted_only_if_it_did_not_move(w: CW, capsys) -> 
 
 def test_a_failed_track_add_removes_the_upstream_section(w: CW, capsys) -> None:  # noqa: ANN001
     before = settled(w)
-    r = cli_spy(w, Spy(before=fail_sub("worktree")), "--branch", "feature/remote-only")
+    r = cli_spy(
+        w, Spy(before=fail_sub("worktree", containing="add")), "--branch", "feature/remote-only"
+    )
     assert refused(r, 12)["code"] == "create_failed"
     assert settled(w) == before and w.records() == []
 
 
 def test_a_stale_branch_section_of_a_new_branch_is_not_ours_to_remove(w: CW, capsys) -> None:  # noqa: ANN001
     w.g(["config", "branch.mine.remote", "elsewhere"])
-    r = cli_spy(w, Spy(before=fail_sub("worktree")), "--branch", "mine")
+    r = cli_spy(w, Spy(before=fail_sub("worktree", containing="add")), "--branch", "mine")
     refused(r, 12)
     assert w.g(["config", "branch.mine.remote"]) == "elsewhere"
 
@@ -107,7 +106,7 @@ def test_an_unexpected_exception_still_unwinds(w: CW, capsys) -> None:  # noqa: 
     before = settled(w)
 
     def boom(sub, argv, kw):  # noqa: ANN001, ANN202
-        if sub == "worktree":
+        if sub == "worktree" and "add" in argv:
             raise RuntimeError("boom")
 
     r = cli_spy(w, Spy(before=boom))
@@ -119,7 +118,7 @@ def test_an_interrupt_unwinds_and_releases_the_leases(w: CW, capsys) -> None:  #
     before = settled(w)
 
     def interrupt(sub, argv, kw):  # noqa: ANN001, ANN202
-        if sub == "worktree":
+        if sub == "worktree" and "add" in argv:
             raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
@@ -437,10 +436,7 @@ def test_two_creates_for_one_holder_both_succeed(w: CW) -> None:
 
 def test_many_creates_with_derived_names_get_distinct_names(w: CW) -> None:
     w.top["lease_wait"] = "120s"
-    procs = [run_create(w, "--branch", "topic") for _ in range(1)] + [
-        run_create(w, "--detach"),
-        run_create(w, "--detach"),
-    ]
+    procs = [run_create(w, "--detach") for _ in range(3)]
     codes = [finish(p)[0] for p in procs]
     assert codes == [0, 0, 0]
     assert len({r["name"] for r in w.records()}) == 3

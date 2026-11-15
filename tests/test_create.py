@@ -258,7 +258,7 @@ def test_derived_names_get_suffixes_against_records(w: CW, capsys) -> None:  # n
 
 
 def test_name_collisions_ignore_case(w: CW, capsys) -> None:  # noqa: ANN001
-    ok(w.create(capsys, "--branch", "Topic"))
+    ok(w.create(capsys, "--detach", "--name", "Topic"))
     b = ok(w.create(capsys, "--branch", "topic"))
     assert b["record"]["name"] == "topic-2"
 

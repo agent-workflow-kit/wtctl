@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass
 
+from . import urls
 from .errors import UsageError, WtctlError
 from .gitsetup import private_dir
 from .hardgit import Git, PorcelainError, WorktreeEntry, parse_config_list, parse_worktree_list
@@ -92,15 +94,52 @@ def local_heads(git: Git, common_dir: str) -> dict[str, str]:
     return heads
 
 
-def worktree_entries(git: Git, common_dir: str) -> list[WorktreeEntry]:
-    """Every worktree of the clone (the main one first), cross-checked against the number of
-    admin entries (a path with a newline can forge entries)."""
+_URL_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
+def scrub_urls(text: str) -> str:
+    """``text`` with the userinfo (user and password) removed from every URL in it: git echoes
+    the URLs it was given, and a clone's remote may carry credentials."""
+
+    def one(m: re.Match[str]) -> str:
+        out = urls.strip_userinfo(m.group(0))
+        scheme, sep, rest = out.partition("://")
+        authority, slash, path = rest.partition("/")
+        return f"{scheme}{sep}{authority.rpartition('@')[2]}{slash}{path}"
+
+    return _URL_TOKEN.sub(one, text)
+
+
+def admin_gitdirs(common_dir: str) -> list[str]:
+    """The ``gitdir`` file content (the worktree's ``.git`` path) of every admin entry that has
+    one; an admin directory without a regular ``gitdir`` file is not an entry."""
     admin = os.path.join(common_dir, "worktrees")
+    found: list[str] = []
     try:
-        with os.scandir(admin) as it:
-            n = sum(1 for e in it if e.is_dir(follow_symlinks=False))
+        it = os.scandir(admin)
     except FileNotFoundError:
-        n = 0
+        return found
+    with it:
+        for e in it:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            try:
+                fd = os.open(os.path.join(e.path, "gitdir"), os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            with os.fdopen(fd, "rb") as fh:
+                if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    continue
+                found.append(fh.read(1 << 16).decode("utf-8", "surrogateescape").rstrip("\n"))
+    return found
+
+
+def worktree_entries(git: Git, common_dir: str) -> list[WorktreeEntry]:
+    """Every worktree of the clone (the main one first), cross-checked against the admin entries
+    (a path with a newline can forge entries): their number, and their paths when every
+    ``gitdir`` file holds an absolute path."""
+    gitdirs = admin_gitdirs(common_dir)
+    n = len(gitdirs)
     r = git.run(["worktree", "list", "--porcelain"], git_dir=common_dir, cwd=common_dir, timeout=60)
     if r.returncode != 0 or r.timed_out:
         raise create_failed("cannot list the worktrees of the clone")
@@ -109,12 +148,16 @@ def worktree_entries(git: Git, common_dir: str) -> list[WorktreeEntry]:
     except PorcelainError as exc:
         raise WtctlError("internal", f"unexpected worktree listing: {exc}") from exc
     bare = bool(entries) and entries[0].bare
+    forged = WtctlError(
+        "internal",
+        f"git worktree list returned {len(entries)} entries for {n} admin entries"
+        " (a path with a newline can forge entries)",
+    )
     if len(entries) != n + (0 if bare else 1):
-        raise WtctlError(
-            "internal",
-            f"git worktree list returned {len(entries)} entries for {n} admin entries"
-            " (a path with a newline can forge entries)",
-        )
+        raise forged
+    if all(os.path.isabs(g) and g.endswith("/.git") for g in gitdirs):
+        if sorted(g[: -len("/.git")] for g in gitdirs) != sorted(e.path for e in entries[1:]):
+            raise forged
     return entries
 
 
@@ -131,8 +174,20 @@ def unsafe_driver_keys(git: Git, common_dir: str, start: str | None) -> list[str
     keys += [k for k, _ in parse_config_list(r.stdout) if UNSAFE_LFS_KEYS.fullmatch(k)]
     if start is not None:
         spec = f"{start}:.lfsconfig"
-        present = git.run(["cat-file", "-e", spec], git_dir=common_dir, cwd=common_dir, timeout=60)
-        if present.returncode == 0:
+        ls = git.run(
+            ["ls-tree", "-z", start, "--", ".lfsconfig"], git_dir=common_dir, cwd=common_dir,
+            timeout=60,
+        )  # fmt: skip
+        if ls.returncode != 0 or ls.timed_out:
+            raise create_failed("cannot read .lfsconfig of the checkout commit")
+        if ls.stdout:
+            mode = ls.stdout.split(b" ", 1)[0]
+            if mode not in (b"100644", b"100755"):
+                raise WtctlError(
+                    "unsafe_repo_config",
+                    ".lfsconfig of the checkout commit is not a regular file",
+                    details={"keys": []},
+                )
             c = git.run(
                 ["config", "--no-includes", f"--blob={spec}", "--list", "-z"],
                 git_dir=common_dir,
@@ -140,7 +195,7 @@ def unsafe_driver_keys(git: Git, common_dir: str, start: str | None) -> list[str
                 timeout=60,
             )
             if c.returncode != 0 or c.timed_out:
-                raise WtctlError("internal", "cannot read .lfsconfig of the checkout commit")
+                raise create_failed("cannot read .lfsconfig of the checkout commit")
             keys += [k for k, _ in parse_config_list(c.stdout) if UNSAFE_LFS_KEYS.fullmatch(k)]
     return sorted(set(keys))
 
@@ -148,28 +203,99 @@ def unsafe_driver_keys(git: Git, common_dir: str, start: str | None) -> list[str
 # -- writing ----------------------------------------------------------------------------------
 
 
-def write_upstream(git: Git, common_dir: str, branch: str, remote: str) -> None:
+def _local_config(git: Git, common_dir: str) -> dict[str, list[str]]:
+    r = git.run(
+        ["config", "--local", "--list", "-z"], git_dir=common_dir, cwd=common_dir, timeout=60
+    )
+    if r.returncode != 0 or r.timed_out:
+        raise create_failed("cannot read the clone's config")
+    out: dict[str, list[str]] = {}
+    for key, value in parse_config_list(r.stdout):
+        out.setdefault(key, []).append(value or "")
+    return out
+
+
+def create_branch_ref(git: Git, common_dir: str, branch: str, start: str) -> None:
+    """Create ``refs/heads/<branch>`` at ``start`` only if it does not exist (``update-ref`` with
+    the all-zero old value), so a branch this call owns was never anybody else's. A branch that
+    exists (also one a case-insensitive file system folds onto) is ``branch_exists``."""
+    ref = f"refs/heads/{branch}"
+    r = git.run(
+        ["update-ref", ref, start, "0" * 40], git_dir=common_dir, cwd=common_dir, timeout=60
+    )
+    if r.returncode == 0 and not r.timed_out:
+        return
+    if not r.timed_out:
+        have = git.run(
+            ["rev-parse", "--verify", "-q", ref], git_dir=common_dir, cwd=common_dir, timeout=60
+        )
+        tip = have.out.strip()
+        if have.returncode == 0 and SHA.fullmatch(tip):
+            raise WtctlError(
+                "refused",
+                f"branch {branch} already exists",
+                reason="branch_exists",
+                details={"tip": tip},
+            )
+    raise create_failed(f"cannot create the branch {branch}")
+
+
+def write_upstream(
+    git: Git, common_dir: str, branch: str, remote: str, written: dict[str, str]
+) -> None:
     """Explicit upstream for a branch created from a remote-only one (git's own remote-branch
-    guessing is never used)."""
-    for key, value in (("remote", remote), ("merge", f"refs/heads/{branch}")):
+    guessing is never used). ``written`` receives each key this call added (a key that already
+    existed is overwritten but not listed: the unwind leaves it alone)."""
+    current = _local_config(git, common_dir)
+    for var, value in (("remote", remote), ("merge", f"refs/heads/{branch}")):
+        key = f"branch.{branch}.{var}"
         r = git.run(
-            ["config", "--local", f"branch.{branch}.{key}", value],
+            ["config", "--local", key, value], git_dir=common_dir, cwd=common_dir, timeout=60
+        )
+        if r.returncode != 0 or r.timed_out:
+            raise create_failed(f"cannot write the upstream of {branch}")
+        if key not in current:
+            written[key] = value
+
+
+def remove_upstream(git: Git, common_dir: str, branch: str, written: dict[str, str]) -> list[str]:
+    """Undo :func:`write_upstream`: unset each key in ``written`` whose value is still the one
+    written, then drop the ``branch.<b>`` section if nothing is left in it. Returns what could not
+    be undone (empty when all went well)."""
+    problems: list[str] = []
+    try:
+        current = _local_config(git, common_dir)
+    except WtctlError as exc:
+        return [f"upstream of {branch}: {exc.message}"]
+    unset = False
+    for key, value in written.items():
+        if current.get(key) != [value]:
+            continue
+        r = git.run(
+            ["config", "--local", "--unset-all", key],
             git_dir=common_dir,
             cwd=common_dir,
             timeout=60,
         )
         if r.returncode != 0 or r.timed_out:
-            raise create_failed(f"cannot write the upstream of {branch}")
-
-
-def remove_upstream(git: Git, common_dir: str, branch: str) -> None:
-    """Best effort: drop the ``branch.<b>`` section this create wrote."""
-    git.run(
-        ["config", "--local", "--remove-section", f"branch.{branch}"],
-        git_dir=common_dir,
-        cwd=common_dir,
-        timeout=60,
-    )
+            problems.append(f"could not unset {key}")
+        else:
+            unset = True
+    if unset and not problems:
+        try:
+            left = _local_config(git, common_dir)
+        except WtctlError as exc:
+            return [f"upstream of {branch}: {exc.message}"]
+        if not any(k.startswith(f"branch.{branch}.") for k in left):
+            r = git.run(
+                ["config", "--local", "--remove-section", f"branch.{branch}"],
+                git_dir=common_dir,
+                cwd=common_dir,
+                timeout=60,
+            )
+            if r.returncode != 0 or r.timed_out:
+                problems.append(f"could not remove the empty section branch.{branch}")
+    return problems
 
 
 def delete_created_branch(git: Git, common_dir: str, branch: str, sha: str) -> bool:
@@ -186,25 +312,27 @@ def delete_created_branch(git: Git, common_dir: str, branch: str, sha: str) -> b
 @dataclass(frozen=True)
 class AddSpec:
     path: str
-    branch: str | None
-    start: str | None
-    new_branch: bool  # `-b`: the branch is created by `worktree add`
+    branch: str | None  # an existing branch (this call created it, for a new one); None: detached
+    start: str | None  # the commit of a detached worktree
+
+
+# `worktree add` may check out a large tree: the longest git call create makes.
+ADD_TIMEOUT = 600
 
 
 def worktree_add(git: Git, common_dir: str, spec: AddSpec) -> None:
-    """``git worktree add`` (protocols ``none``, filters honored per ``create.allow_filters``)."""
-    if spec.new_branch:
-        assert spec.branch is not None and spec.start is not None
-        args = ["worktree", "add", "--no-track", "-b", spec.branch, "--", spec.path, spec.start]
-    elif spec.branch is not None:
+    """``git worktree add`` (protocols ``none``, filters honored per ``create.allow_filters``).
+    A branch is always the existing-branch form: it was created before, create-only."""
+    if spec.branch is not None:
         args = ["worktree", "add", "--", spec.path, spec.branch]
     else:
         assert spec.start is not None
         args = ["worktree", "add", "--detach", "--", spec.path, spec.start]
-    r = git.run(args, git_dir=common_dir, cwd=common_dir, honor_filters=True, timeout=600)
+    r = git.run(args, git_dir=common_dir, cwd=common_dir, honor_filters=True, timeout=ADD_TIMEOUT)
     if r.returncode != 0 or r.timed_out:
-        why = "timed out" if r.timed_out else r.err.strip().splitlines()[-1:] or ["failed"]
-        raise create_failed(f"git worktree add failed: {why if isinstance(why, str) else why[0]}")
+        last = r.err.strip().splitlines()[-1:] or ["failed"]
+        why = "timed out" if r.timed_out else scrub_urls(last[0])
+        raise create_failed(f"git worktree add failed: {why}")
 
 
 @dataclass(frozen=True)
