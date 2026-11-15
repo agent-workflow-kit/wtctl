@@ -1010,3 +1010,8 @@ def _check_holder(holder: str) -> None:
 def open_state(ctx: Context) -> State:
     """The seam ``Context.state`` calls (lazily, once): ``state.db`` under the XDG state dir."""
     return State(state_path(), ctx.gateway, heartbeat=True)
+
+
+def check_holder(holder: str) -> None:
+    """Usage error (exit 2) unless ``holder`` matches the holder grammar (1 to 64 characters)."""
+    _check_holder(holder)
