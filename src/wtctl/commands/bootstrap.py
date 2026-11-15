@@ -3,7 +3,7 @@ CLI's actor gate has already run).
 
 A change in either baseline class refuses ``repo_config_changed`` (as ``baseline check`` does,
 after the record-state checks and under the lease), and a successful run re-records the baseline.
-TODO(#19): refuse ``in_use`` when a process runs in the worktree.
+A process with its cwd or an open file in the worktree refuses ``in_use``.
 TODO(#5): log the ``bootstrap`` event.
 """
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .. import baselinesvc, bootstrapper, fsafe, repobaseline
+from .. import baselinesvc, bootstrapper, fsafe, inuse, repobaseline
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
 from ..gitsetup import open_git, with_filters
@@ -54,6 +54,7 @@ def run(ctx: Context) -> Result:
         _check(record)
     if ctx.dry_run:
         baselinesvc.verify_unchanged(config, state, record)
+        inuse.require_unused(ctx.gateway, state, record, limit=config.remove.nested_scan_limit)
         return _dry(ctx, record)
     with state.lease(record_lease(record["id"]), wait=config.lease_wait_s) as lease:
         record = state.get_record(record["id"])
@@ -61,9 +62,10 @@ def run(ctx: Context) -> Result:
             raise WtctlError("not_found", f"no record for {a.target}")
         _check(record)
         baselinesvc.verify_unchanged(config, state, record)
-        # TODO(#19): in_use refusal goes here.
+        warnings: list[str] = inuse.require_unused(
+            ctx.gateway, state, record, limit=config.remove.nested_scan_limit
+        )
         settings = config.repo(record["repo"])
-        warnings: list[str] = []
         git = with_filters(git, settings.allow_filters, ctx.gateway, warnings.append)
         if not a.copy_env and not settings.bootstrap.steps:
             warnings.append("no bootstrap steps are configured; only the snapshots were taken")

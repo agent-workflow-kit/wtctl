@@ -1,0 +1,65 @@
+{
+ "id": "<id>",
+ "object_type": "worktree",
+ "would_remove": true,
+ "reason": null,
+ "human_required": false,
+ "checks": {
+  "integrity": {
+   "status": "pass",
+   "details": []
+  },
+  "locked": {
+   "status": "pass",
+   "details": []
+  },
+  "baseline": {
+   "status": "pass",
+   "details": []
+  },
+  "in_use": {
+   "status": "pass",
+   "details": []
+  },
+  "held": {
+   "status": "pass",
+   "details": []
+  },
+  "fetch": {
+   "status": "pass",
+   "details": []
+  },
+  "tracked": {
+   "status": "pass",
+   "details": []
+  },
+  "untracked": {
+   "status": "pass",
+   "details": []
+  },
+  "ignored": {
+   "status": "pass",
+   "details": []
+  },
+  "nested_repos": {
+   "status": "pass",
+   "details": []
+  },
+  "stash": {
+   "status": "pass",
+   "details": []
+  },
+  "unpushed_head": {
+   "status": "pass",
+   "details": []
+  },
+  "unpushed_branches": {
+   "status": "pass",
+   "details": []
+  }
+ },
+ "force_overrides": [],
+ "head": "<head>",
+ "current_branch": "work",
+ "warnings": []
+}

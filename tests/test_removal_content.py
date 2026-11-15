@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from tests.removallib import RW, inproc  # noqa: F401
+from tests.removallib import RW
 from tests.vectorlib import plain_git
 
 PY = sys.executable
@@ -150,7 +150,15 @@ def test_untracked_file_is_dirty(w: RW, capsys) -> None:  # noqa: ANN001
 
 @pytest.mark.parametrize(
     "name",
-    ["new\nline.txt", "ünï-☃.txt", "with space.txt", "-dash.txt", "tab\there", "\x1b[31mred", ".GIT-x"],
+    [
+        "new\nline.txt",
+        "ünï-☃.txt",
+        "with space.txt",
+        "-dash.txt",
+        "tab\there",
+        "\x1b[31mred",
+        ".GIT-x",
+    ],
 )
 def test_hostile_untracked_names_are_reported(w: RW, capsys, name: str) -> None:  # noqa: ANN001
     w.start(capsys)
@@ -206,7 +214,6 @@ def test_forged_untracked_cache_does_not_hide_a_new_file(w: RW, capsys) -> None:
 
 
 # -- bootstrap-created exemptions -----------------------------------------------------------
-
 
 
 def test_bootstrap_created_untracked_file_is_exempt_while_unchanged(w: RW, capsys) -> None:  # noqa: ANN001
@@ -290,7 +297,9 @@ def commit_gitignore(w: RW, text: str) -> None:
 )
 def test_disposable_globs(w: RW, capsys, rel: str, disposable: bool) -> None:  # noqa: ANN001
     w.start(capsys)
-    commit_gitignore(w, "node_modules/\n*.pyc\n__pycache__/\nbuild/\nbuild2/\nxbuild/\nbuilds/\nnotbuild\n")
+    commit_gitignore(
+        w, "node_modules/\n*.pyc\n__pycache__/\nbuild/\nbuild2/\nxbuild/\nbuilds/\nnotbuild\n"
+    )
     f = w.wt / rel
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text("x")
@@ -324,7 +333,15 @@ def test_bootstrap_created_ignored_dir_is_exempt_on_a_component_boundary(w: RW, 
     base_ignore(w, "cache/\ncache2/\n")
     w.repo_cfg["remove"] = {"disposable": ["nothing-matches-this/"]}
     w.repo_cfg["bootstrap"] = {
-        "steps": [{"argv": [PY, "-c", "import os; os.makedirs('cache/x'); open('cache/x/f','w').write('1')"]}]
+        "steps": [
+            {
+                "argv": [
+                    PY,
+                    "-c",
+                    "import os; os.makedirs('cache/x'); open('cache/x/f','w').write('1')",
+                ]
+            }
+        ]
     }
     w.start_built(capsys)
     (w.wt / "cache2").mkdir()
@@ -366,9 +383,7 @@ def test_nested_repository_inside_an_ignored_directory_is_found(w: RW, capsys) -
     (w.wt / "node_modules" / "p").mkdir(parents=True)
     w.g(["init", "-q"], w.wt / "node_modules" / "p")
     d = w.st(capsys)
-    assert [x["path"] for x in d["checks"]["nested_repos"]["details"]] == [
-        "node_modules/p/.git"
-    ]
+    assert [x["path"] for x in d["checks"]["nested_repos"]["details"]] == ["node_modules/p/.git"]
     assert d["checks"]["ignored"]["status"] == "pass"  # node_modules/ is disposable
 
 
@@ -406,10 +421,14 @@ def test_initialized_submodule_is_reported_as_submodule(w: RW, capsys, tmp_path:
     (sub / "f").write_text("f")
     w.g(["add", "."], sub)
     w.g(["commit", "-q", "-m", "s"], sub)
-    w.g(["-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor/sub"], w.wt)
+    w.g(
+        ["-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor/sub"], w.wt
+    )
     w.g(["commit", "-q", "-m", "add submodule"], w.wt)
     d = w.st(capsys)
-    assert {"detail": "submodule", "path": "vendor/sub/.git"} in d["checks"]["nested_repos"]["details"]
+    assert {"detail": "submodule", "path": "vendor/sub/.git"} in d["checks"]["nested_repos"][
+        "details"
+    ]
 
 
 def test_a_dotgit_file_pointing_outside_modules_is_a_nested_repo_not_a_submodule(  # noqa: ANN201
@@ -434,10 +453,10 @@ def test_walk_beyond_the_limit_is_incomplete(w: RW, capsys) -> None:  # noqa: AN
 
 
 def test_mount_point_below_the_root_fails_nested_repos(w: RW, capsys, monkeypatch) -> None:  # noqa: ANN001
-    from wtctl import fsafe_child, removalfs
+    from wtctl import fsafe_child, removalfs, repobaseline
 
     w.start(capsys)
-    real = removalfs.RUNNER
+    real = repobaseline.inproc
 
     def fake(op: str, args: dict, **kw: Any):  # noqa: ANN202
         res = real(op, args, **kw)

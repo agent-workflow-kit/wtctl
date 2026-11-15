@@ -186,3 +186,23 @@ def check_in_use(
             f"{uninspected} process(es) could not be inspected (other users or unreadable)"
         )
     return InUse("fail" if found else "pass", found, warnings)
+
+
+def require_unused(
+    gateway: Gateway, state: Any, record: dict[str, Any], *, limit: int
+) -> list[str]:
+    """Refuse ``in_use`` (exit 20) when a process has its cwd or an open file inside the record's
+    directory; returns the warnings (an unavailable scanner is one: the callers that use this
+    change nothing a process could lose, unlike ``remove``)."""
+    from .errors import WtctlError
+
+    ids, warning = collect_dir_ids(state, record, limit=limit)
+    result = check_in_use(gateway, record["path"], ids)
+    if result.status == "fail":
+        raise WtctlError(
+            "refused",
+            f"{record['id']} is in use by {len(result.processes)} process(es)",
+            reason="in_use",
+            processes=result.processes,
+        )
+    return ([warning] if warning else []) + result.warnings

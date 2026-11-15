@@ -11,7 +11,6 @@ import pytest
 from tests.createlib import CW
 from tests.schemacheck import validate
 from tests.test_create import ok
-from wtctl import baselinesvc, removalfs, repobaseline
 from wtctl.gateway import Gateway, ProcessInfo, ScannerUnavailable
 
 
@@ -30,20 +29,13 @@ class FakeScanner:
         return list(self.procs)
 
 
-@pytest.fixture
-def inproc(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(baselinesvc, "RUNNER", repobaseline.inproc)
-    monkeypatch.setattr(removalfs, "RUNNER", repobaseline.inproc)
-
-
 class RW(CW):
     """``CW`` with one created worktree."""
 
     scanner: FakeScanner
+    git_runner: Any = None
 
-    def start(
-        self, capsys: pytest.CaptureFixture[str], *argv: str, bootstrap: bool = False
-    ) -> RW:
+    def start(self, capsys: pytest.CaptureFixture[str], *argv: str, bootstrap: bool = False) -> RW:
         self.build()
         return self.start_built(capsys, *argv, bootstrap=bootstrap)
 
@@ -72,8 +64,11 @@ class RW(CW):
 
         actor = ["--actor", "human:tester" if human else "auto:tester"]
         out, err = io.StringIO(), io.StringIO()
+        extra: dict[str, Any] = {} if self.git_runner is None else {"git_runner": self.git_runner}
         rt = Runtime(
-            stdin_isatty=False, me_name="alice", gateway=Gateway(scanner=self.scanner)
+            stdin_isatty=False,
+            me_name="alice",
+            gateway=Gateway(scanner=self.scanner, **extra),
         )
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = main(
