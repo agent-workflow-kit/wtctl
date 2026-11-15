@@ -698,6 +698,11 @@ def classify_fetch(result: GitResult) -> FetchOutcome:
             return FetchOutcome(FetchKind.FAILED, "prune_incomplete")
         return FetchOutcome(FetchKind.OK)
     if result.returncode == 1:
+        # Newer git (2.56) exits 1 where older git exits 0 for a prune blocked by a ref lock.
+        if "error: could not delete reference" in err and any(
+            line.lstrip().startswith("- [deleted]") for line in err.splitlines()
+        ):
+            return FetchOutcome(FetchKind.FAILED, "prune_incomplete")
         if any(marker in err for marker in LOCK_MARKERS):
             return FetchOutcome(FetchKind.LOCK_CONTENTION)
         return FetchOutcome(FetchKind.FAILED)

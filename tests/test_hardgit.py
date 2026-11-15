@@ -296,6 +296,17 @@ def test_check_version_on_the_installed_git(private_home: Path, tmp_path: Path) 
         (res(0), FetchKind.OK, None),
         (res(0, "From x\n * branch\n"), FetchKind.OK, None),
         (res(0, "error: unable to delete 'refs/heads/a'\n"), FetchKind.FAILED, "prune_incomplete"),
+        (
+            res(1, "error: could not delete reference refs/heads/a: x\nFrom x\n - [deleted] a\n"),
+            FetchKind.FAILED,
+            "prune_incomplete",
+        ),
+        (
+            res(0, "error: could not delete reference refs/heads/a: x\nFrom x\n - [deleted] a\n"),
+            FetchKind.FAILED,
+            "prune_incomplete",
+        ),
+        (res(1, "error: could not delete reference refs/heads/a: x"), FetchKind.FAILED, None),
         (res(1, "error: cannot lock ref 'refs/heads/a'"), FetchKind.LOCK_CONTENTION, None),
         (res(1, "error: unable to update local ref"), FetchKind.LOCK_CONTENTION, None),
         (res(1, "something else"), FetchKind.FAILED, None),
@@ -775,7 +786,8 @@ def test_markers_in_remote_lines_do_not_classify_as_auth() -> None:
 def test_prune_blocked_by_packed_refs_lock_in_real_git(
     git: Git, tmp_path: Path, private_home: Path
 ) -> None:
-    # Spike F4: a --prune that cannot delete a ref exits 0 with an `error:` line.
+    # Spike F4: a --prune that cannot delete a ref exits 0 (git 2.34) or 1 (git 2.56) with an
+    # `error:` line.
     def pg(args: list[str], cwd: Path) -> None:
         r = plain_git(args, cwd=cwd, home=private_home)
         assert r.returncode == 0, (args, r.stderr)
@@ -801,7 +813,7 @@ def test_prune_blocked_by_packed_refs_lock_in_real_git(
     pg(["update-ref", "-d", "refs/heads/gone"], rem)
     (mirror / "packed-refs.lock").write_text("")
     r = fetch()
-    assert r.returncode == 0 and "error:" in r.err
+    assert r.returncode in (0, 1) and "error:" in r.err
     outcome = classify_fetch(r)
     assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, "prune_incomplete")
     e = outcome_error(outcome, r)

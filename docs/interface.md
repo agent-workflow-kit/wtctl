@@ -312,7 +312,7 @@ The order of [`remove`](#remove) for a worktree. [`status`](#status) runs steps 
    - exit 1 with `cannot lock ref` or `unable to update local ref` in stderr: ref-lock contention, retried up to `remove.fetch_retries` times, 1 second apart; contention that outlasts the retries, and any other exit 1, is `fetch_failed`;
    - exit 128: a transport failure, `auth_required` when stderr contains `could not read Username`, `terminal prompts disabled`, `Authentication failed`, `Permission denied (publickey` or `Host key verification failed`, else `fetch_failed`;
    - the [timeout](#hardened-git) kill: `fetch_failed` with `details.cause: timeout`;
-   - exit 0 with any stderr line starting with `error:`: `fetch_failed` with `details.cause: prune_incomplete` (a `--prune` that could not delete a ref exits 0 and leaves the stale ref);
+   - exit 0 with any stderr line starting with `error:`: `fetch_failed` with `details.cause: prune_incomplete` (a `--prune` that could not delete a ref exits 0 and leaves the stale ref; newer git (2.56) exits 1 here, and exit 1 with `error: could not delete reference` and a `[deleted]` line is `prune_incomplete` too);
    - exit 0 otherwise: success. Any other exit status is `fetch_failed`.
 
    Failure exits 12 with that code. With a human `--force` either failure is a warning (`checks.fetch` fails and is overridden): nothing is [pushed](#reachability), so the unpushed checks fail and step 10 keeps the branch.

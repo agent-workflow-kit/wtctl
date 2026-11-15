@@ -117,19 +117,29 @@ class Spec:
     wt: bool = False
     stdin: Callable[[Hostile], bytes | None] = lambda h: None
     rc: tuple[int, ...] = (0,)
-    err: str | None = None
+    err: str | tuple[str, ...] | None = None
     out: Callable[[Hostile], str] | None = None
 
 
 NOT_ALLOWED = "not allowed"  # fatal: transport 'file' not allowed (GIT_ALLOW_PROTOCOL=none)
 LAZY_OFF = "lazy fetching disabled"
+# Git 2.56 honors GIT_NO_LAZY_FETCH on these paths and reports the plain missing object instead.
+LAZY_OFF_OR_MISSING = (LAZY_OFF, "Not a valid object name")
+LAZY_OFF_OR_MISSING_QUIET = (*LAZY_OFF_OR_MISSING, "")  # `cat-file -e` may print nothing
 
 MATRIX: list[Spec] = [
     Spec("rev-parse-head", lambda h: ["rev-parse", "HEAD"], out=lambda h: h.c2),
     Spec("rev-parse-common-dir", lambda h: ["rev-parse", "--git-common-dir"], out=lambda h: ".git"),
     Spec("rev-parse-tree", lambda h: ["rev-parse", f"{h.c2}^{{tree}}"], out=lambda h: ""),
-    Spec("cat-file-e-missing", lambda h: ["cat-file", "-e", h.b3], rc=(1,), err=LAZY_OFF),
-    Spec("cat-file-p-missing", lambda h: ["cat-file", "-p", h.b3], rc=(128,), err=LAZY_OFF),
+    Spec(
+        "cat-file-e-missing",
+        lambda h: ["cat-file", "-e", h.b3],
+        rc=(1,),
+        err=LAZY_OFF_OR_MISSING_QUIET,
+    ),
+    Spec(
+        "cat-file-p-missing", lambda h: ["cat-file", "-p", h.b3], rc=(128,), err=LAZY_OFF_OR_MISSING
+    ),
     Spec("cat-file-t-commit", lambda h: ["cat-file", "-t", h.c2], out=lambda h: "commit"),
     Spec(
         "cat-file-batch-check",
@@ -278,7 +288,8 @@ def test_hostile_clone_runs_nothing(hostile: Hostile, git: Git, spec: Spec) -> N
     # config error, say) would also leave no marker.
     assert r.returncode in spec.rc, (r.returncode, r.err)
     if spec.err is not None:
-        assert spec.err in r.err, r.err
+        accepted = (spec.err,) if isinstance(spec.err, str) else spec.err
+        assert any(e in r.err for e in accepted), r.err
     if spec.out is not None:
         assert spec.out(hostile) in r.out, r.out
 
