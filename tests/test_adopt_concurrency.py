@@ -92,15 +92,20 @@ def test_forget_and_adopt_holder_race_never_loses_a_live_holder(w: CW, capsys) -
     assert all(r[0] in (0, 10, 12) for r in results), results
     state = w.rows("SELECT state FROM records WHERE id = ?", rid)[0][0]
     holders = sorted(x[0] for x in w.rows("SELECT holder FROM holders WHERE record_id = ?", rid))
-    # either the adopt won the race (record live with "new"), or the forget did first and the
-    # adopt created a second record; a live record with "new" must exist in both cases
     if state == "forgotten":
+        # the forget won. The adopt either saw the live record first (and then lost it, exit 10),
+        # or ran after the tombstone and made a second record carrying only "new".
         live = w.rows("SELECT id FROM records WHERE state = 'active'")
-        assert len(live) == 1
-        assert [
-            x[0] for x in w.rows("SELECT holder FROM holders WHERE record_id = ?", live[0][0])
-        ] == ["new"]
+        assert len(live) <= 1
+        if live:
+            assert results[1][0] == 0, results
+            assert [
+                x[0] for x in w.rows("SELECT holder FROM holders WHERE record_id = ?", live[0][0])
+            ] == ["new"]
+        else:
+            assert results[1][0] == 10, results
     else:
+        assert results[1][0] == 0, results
         assert holders == ["new"]
 
 

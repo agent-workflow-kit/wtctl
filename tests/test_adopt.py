@@ -533,6 +533,88 @@ def test_a_tombstoned_path_is_adopted_anew(w: CW, capsys, state: str) -> None:  
     assert again["record"]["name"] == "ext"  # the tombstone does not hold the name
 
 
+@pytest.mark.parametrize(
+    ("state", "code", "reason"),
+    [
+        ("active", 0, None),
+        ("creating", 20, "path_exists"),
+        ("unlinked", 20, "unlinked"),
+        ("partial", 20, "unlinked"),
+        ("missing", 10, None),
+    ],
+)
+def test_a_recorded_path_follows_its_record_state_even_when_the_directory_is_gone(
+    w: CW,
+    capsys,
+    state: str,
+    code: int,
+    reason: str | None,  # noqa: ANN001
+) -> None:
+    import shutil
+
+    path, r = adopted(w, capsys)
+    w.set_state(r["id"], state)
+    shutil.rmtree(path)
+    out = adopt(w, capsys, path)
+    if code == 0:
+        assert ok_adopt(out)["existing"] is True
+    else:
+        err_of(out, code, reason)
+
+
+@pytest.mark.parametrize("state", ["creating", "unlinked", "missing"])
+def test_dry_run_on_a_recorded_path_reports_the_record_state(w: CW, capsys, state: str) -> None:  # noqa: ANN001
+    path, r = adopted(w, capsys)
+    w.set_state(r["id"], state)
+    expect = {"creating": (20, "path_exists"), "unlinked": (20, "unlinked"), "missing": (10, None)}
+    code, reason = expect[state]
+    err_of(adopt(w, capsys, path, "--dry-run"), code, reason)
+
+
+def test_a_lost_clone_lease_refuses_busy_and_stores_nothing(
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    from wtctl import baselinesvc
+
+    path = foreign(w)
+    real = baselinesvc.record_current
+
+    def steal(*a, **kw):  # noqa: ANN002, ANN003
+        out = real(*a, **kw)
+        conn = sqlite3.connect(w.db)
+        conn.execute("UPDATE leases SET pid = pid + 1000000, start_time = 'other'")
+        conn.commit()
+        conn.close()
+        return out
+
+    monkeypatch.setattr(baselinesvc, "record_current", steal)
+    assert err_of(adopt(w, capsys, path), 12)["code"] == "busy"
+    assert w.count("records") == 0
+
+
+def test_a_path_that_is_not_utf8_encodable_is_a_usage_error_before_any_lease(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    err_of(adopt(w, capsys, "/tmp/bad\udcffname"), 2)
+    assert w.count("records") == 0
+
+
+def test_a_submodule_gitdir_under_a_path_containing_worktrees_is_still_a_submodule(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    sub = w.tmp / "subm2"
+    sub.mkdir()
+    gd = w.tmp / "worktrees" / "super" / ".git" / "modules" / "subm2"
+    gd.mkdir(parents=True)
+    (sub / ".git").write_text(f"gitdir: {gd}\n")
+    err = err_of(adopt(w, capsys, sub), 2)
+    assert "submodule" in err["message"]
+
+
 # -- dry runs ------------------------------------------------------------------------------------
 
 

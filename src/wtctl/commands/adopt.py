@@ -28,6 +28,7 @@ from ..locate import Resolution, Resolver, describe_mount, is_fuse
 from ..state import (
     LIVE_STATES,
     Conflict,
+    Lease,
     Record,
     State,
     check_holder,
@@ -83,6 +84,10 @@ class Adopter:
         # usage (exit 2)
         if "\0" in a.path or not a.path:
             raise UsageError("the path is empty or contains a NUL byte")
+        try:
+            a.path.encode("utf-8")
+        except UnicodeEncodeError:
+            raise UsageError("a path that is not valid UTF-8 cannot be adopted") from None
         if a.name is not None and not naming.NAME_RE.fullmatch(a.name):
             raise UsageError(
                 f"invalid name {a.name!r}: expected ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$"
@@ -106,6 +111,9 @@ class Adopter:
     # -- entry ---------------------------------------------------------------------------------
 
     def run(self) -> Result:
+        rec = self._recorded()  # a recorded path follows its record state, even if the dir is gone
+        if rec is not None:
+            return self._existing(rec)
         try:
             st = os.lstat(self.path)
         except OSError:
@@ -115,9 +123,6 @@ class Adopter:
         if not stat.S_ISDIR(st.st_mode):
             raise WtctlError("not_found", f"{_shown(self.path)} is not a git worktree")
         self.git: Git = open_git(self.config, self.ctx.gateway)  # git_too_old (exit 12)
-        rec = self._recorded()
-        if rec is not None:
-            return self._existing(rec)
         layout = self._layout()
         repo = self.repo or self._derive_repo(layout.common)
         resolver = Resolver(self.config, self.state, self.git, readonly=self.dry)
@@ -131,11 +136,13 @@ class Adopter:
                 f"{_shown(self.path)} belongs to {_shown(layout.common)}, not to the clone of "
                 f"{repo} that wtctl resolved ({_shown(res.common_dir)})",
             )
-        if self.dry:
-            return self._fresh(resolver, repo, res, layout)
         try:
-            with self.state.lease(clone_lease(res.clone_path), wait=self.config.lease_wait_s):
-                return self._fresh(resolver, repo, res, layout)
+            if self.dry:
+                return self._fresh(resolver, repo, res, layout, None)
+            with self.state.lease(
+                clone_lease(res.clone_path), wait=self.config.lease_wait_s
+            ) as lease:
+                return self._fresh(resolver, repo, res, layout, lease)
         except _Existing as e:
             return self._existing(e.record)
 
@@ -228,7 +235,8 @@ class Adopter:
         value = value[:-1] if value.endswith("\n") else value
         if "\n" in value or "\0" in value:
             raise _unlinked(f"{_shown(self.path)}/.git is not a single gitdir line")
-        if "/modules/" in value and "/worktrees/" not in value:
+        vparts = value.split("/")
+        if os.path.basename(os.path.dirname(value)) != "worktrees" and "modules" in vparts[:-1]:
             raise UsageError(
                 f"{_shown(self.path)} is a submodule checkout; adopt the superproject's "
                 "worktree instead"
@@ -290,7 +298,9 @@ class Adopter:
 
     # -- under the per-clone lease -----------------------------------------------------------------
 
-    def _fresh(self, resolver: Resolver, repo: str, res: Resolution, layout: Layout) -> Result:
+    def _fresh(
+        self, resolver: Resolver, repo: str, res: Resolution, layout: Layout, lease: Lease | None
+    ) -> Result:
         state = self.state
         again, _ = resolver.find(repo)
         if again is None or (again.common_dir, again.fetch_url) != (res.common_dir, res.fetch_url):
@@ -352,6 +362,8 @@ class Adopter:
             return self._result(
                 self._projected(fields), existing=False, human=f"would adopt {name}"
             )
+        if lease is not None:
+            lease.renew()  # busy: the clone lease was taken over while the baseline ran
         try:
             record = state.insert_record(
                 fields,
