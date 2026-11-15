@@ -1,7 +1,6 @@
 """``wtctl create``: a worktree (docs/interface.md, Create order).
 
 TODO(#21): ``create --throwaway`` (the throwaway create order) lives in its own issue.
-TODO(#16): bootstrap (create order step 14) is a seam: the record keeps ``bootstrap.state: none``.
 TODO(#17): the baseline (create order step 15) is a seam: ``baseline_digest`` stays null.
 TODO(#5): log ``create``, ``fetch``, ``hook`` and ``refused`` events (create is logged, not
 audited).
@@ -16,12 +15,12 @@ import sqlite3
 import stat
 from typing import Any
 
-from .. import fsafe, hooks, naming, worktrees
+from .. import bootstrapper, fsafe, hooks, naming, worktrees
 from .. import labels as labelmod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
-from ..gitsetup import open_git
-from ..hardgit import Git, load_filter_policy
+from ..gitsetup import open_git, with_filters
+from ..hardgit import Git
 from ..locate import Resolver, describe_mount, identity_str
 from ..mirror import Mirror, Tips
 from ..packs import clone_has_commit, transfer_base
@@ -42,11 +41,13 @@ FIELDS = (
 ).split()
 
 
-def record_object(record: Record) -> dict[str, Any]:
+def record_object(record: Record, bootstrap: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The record object. ``bootstrap`` is ``State.bootstrap_summary``; without it (a record that
+    is not stored) the bootstrap is the empty one."""
     full = dict(record)
-    full["bootstrap"] = {
+    full["bootstrap"] = bootstrap or {
         "state": record.get("bootstrap_state", "none"),
-        "steps": [],  # TODO(#16): the steps of the last run
+        "steps": [],
         "created_paths_count": 0,
     }
     return {k: full.get(k) for k in FIELDS}
@@ -173,23 +174,9 @@ class Creator:
             return self._result_reused(r.record)
 
     def _git_with_filters(self) -> Git:
-        allow = self.settings.allow_filters
-        if not allow:
-            return self.git
-        from ..gitsetup import private_dir
-
-        with private_dir() as p:
-            policy = load_filter_policy(
-                self.ctx.gateway,
-                self.git.git_bin,
-                home=os.environ.get("HOME") or os.path.expanduser("~"),
-                xdg_config_home=os.environ.get("XDG_CONFIG_HOME"),
-                allow=allow,
-                path_env=os.environ.get("PATH", ""),
-                private_dir=p,
-            )
-        self.warnings += policy.warnings
-        return dataclasses.replace(self.git, filters=policy)
+        return with_filters(
+            self.git, self.settings.allow_filters, self.ctx.gateway, self.warnings.append
+        )
 
     # -- under the per-clone lease (steps 5 to 13) -------------------------------------------
 
@@ -253,7 +240,7 @@ class Creator:
             raise
         lease.release()
         with rlease:
-            return self._finish(record, plan, decision_ids)
+            return self._finish(record, plan, decision_ids, rlease)
 
     # -- names (step 7) ----------------------------------------------------------------------
 
@@ -889,16 +876,56 @@ class Creator:
 
     # -- activation and output (step 14 to 16) ----------------------------------------------
 
-    def _finish(self, record: Record, plan: Plan, decision_ids: list[str]) -> Result:
-        o = self.o
-        if self.settings.bootstrap.steps and self.settings.bootstrap.auto and not o.no_bootstrap:
-            # TODO(#16): run the steps; until then the record says bootstrap never ran.
-            self.warnings.append(
-                "bootstrap steps are configured but bootstrap is not implemented yet"
+    def _bootstrap(
+        self, record: Record, plan: Plan, rlease: Lease, run_the_steps: bool
+    ) -> bootstrapper.Outcome:
+        """Create order step 14: bootstrap steps 1 to 5 under the record lease, stored in one
+        transaction. A failure of wtctl itself (not of a step) keeps the `creating` record and
+        the worktree, like any failure after git created the worktree."""
+        current = self.state.get_record(record["id"])
+        assert current is not None
+        try:
+            outcome = bootstrapper.run_bootstrap(
+                git=self.wgit,
+                config=self.config,
+                settings=self.settings,
+                record=current,
+                copy_env=self.o.copy_env,
+                run_the_steps=run_the_steps,
+                rerun=False,
+                warn=self.warnings.append,
+                on_tick=bootstrapper.lease_ticker(rlease),
             )
-        if o.copy_env:
-            # TODO(#16): --copy-env copies the env files (Bootstrap steps 1, 2, 4, 5).
-            self.warnings.append("--copy-env was ignored: bootstrap not implemented yet (#16)")
+            if rlease.lost:
+                raise WtctlError(
+                    "busy", f"the lease on {record['id']} was lost during bootstrap; nothing stored"
+                )
+            self.state.record_bootstrap(
+                record["id"],
+                expected="creating",
+                state=outcome.state,
+                steps=outcome.steps,
+                paths=outcome.paths,
+                nested=outcome.nested,
+            )
+        except BaseException as exc:
+            if not rlease.lost:
+                with contextlib.suppress(Exception):
+                    self.state.set_bootstrap_state(record["id"], "interrupted", expected="creating")
+            kept = self._kept(exc, record, plan)
+            if kept is exc:
+                raise
+            raise kept from exc
+        return outcome
+
+    def _finish(self, record: Record, plan: Plan, decision_ids: list[str], rlease: Lease) -> Result:
+        o = self.o
+        run_the_steps = bool(
+            self.settings.bootstrap.steps and self.settings.bootstrap.auto and not o.no_bootstrap
+        )
+        outcome: bootstrapper.Outcome | None = None
+        if o.copy_env or run_the_steps:
+            outcome = self._bootstrap(record, plan, rlease, run_the_steps)
         # TODO(#17): record the baseline here (after bootstrap).
         try:
             active = self.state.transition(record["id"], "creating", "active")
@@ -909,7 +936,9 @@ class Creator:
             raise WtctlError(
                 "internal", f"record {record['id']} changed while create held its lease"
             ) from None
-        out = record_object(active)
+        summary = self.state.bootstrap_summary(active["id"])
+        boot = {**summary, "tracked_changes": outcome.tracked_changes if outcome else []}
+        out = record_object(active, summary)
         payload = hooks.build_payload(
             "post-create",
             object_type="worktree",
@@ -917,7 +946,7 @@ class Creator:
             repo=o.repo,
             labels=active["labels"],
             record=out,
-            bootstrap={**EMPTY_BOOTSTRAP, "tracked_changes": []},
+            bootstrap=boot,
         )
         env = hooks.hook_env(
             self.config,
@@ -933,13 +962,23 @@ class Creator:
             "post-create", specs, payload, env=env, decision_ids=decision_ids
         )
         self.warnings += post.warnings
-        return self._result(
+        result = self._result(
             out,
             plan.action,
-            {**EMPTY_BOOTSTRAP, "tracked_changes": []},
+            boot,
             reused=False,
             human=f"created {active['name']} on {active['branch'] or 'a detached HEAD'}",
         )
+        if outcome is not None and outcome.failed_step is not None:
+            n = len(outcome.steps)
+            err = WtctlError(
+                "bootstrap_failed",
+                f"bootstrap step {n} failed; the worktree {active['path']} was kept",
+                details={"record": out, "step": outcome.failed_step},
+            )
+            err.stdout_text = active["path"]
+            raise err
+        return result
 
     def _result(
         self,
@@ -965,7 +1004,8 @@ class Creator:
         # the same with or without --dry-run (nothing is changed either way).
         self.dry = False
         return self._result(
-            record_object(record), None, None, reused=True,
+            record_object(record, self.state.bootstrap_summary(record["id"])),
+            None, None, reused=True,
             human=f"reused {record['name']} (a retry)",
         )  # fmt: skip
 

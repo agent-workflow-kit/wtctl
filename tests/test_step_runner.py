@@ -358,3 +358,85 @@ def test_a_flooding_writer_outside_the_group_cannot_stall_the_post_timeout_colle
     r = run_step(sh_argv(cmd), env=ENV, timeout=1)
     assert r.timed_out
     assert time.monotonic() - t0 < 5
+
+
+# -- TERM grace and merged output (bootstrap steps, issue #16) -------------------------------
+
+
+def test_term_grace_lets_a_step_exit_on_term_and_still_kills_the_group(tmp_path: Path) -> None:
+    pidfile = tmp_path / "gc.pid"
+    marker = tmp_path / "got-term"
+    # the leader handles TERM by writing a marker and exiting; a TERM-ignoring grandchild stays
+    cmd = (
+        f"(trap '' TERM; exec sleep 300) >/dev/null 2>&1 </dev/null & echo $! > {pidfile}; "
+        f"trap 'echo x > {marker}; exit 7' TERM; while :; do sleep 0.1; done"
+    )
+    with reap_pid_file(pidfile):
+        t0 = time.monotonic()
+        r = run_step(sh_argv(cmd), env=ENV, timeout=1.0, term_grace=3.0)
+        took = time.monotonic() - t0
+        assert 3.0 <= took < 8.0  # the straggler is killed at the end of the grace, not before
+        assert r.timed_out
+        assert r.returncode == 7
+        assert marker.exists()
+        assert wait_gone(int(pidfile.read_text()))  # the straggler got SIGKILL
+
+
+def test_term_grace_gives_a_child_time_to_clean_up_after_the_leader_exits(tmp_path: Path) -> None:
+    marker = tmp_path / "child-cleaned"
+    # the leader exits on TERM at once; the child traps TERM and finishes its cleanup after 0.5 s
+    cmd = (
+        f"(trap 'sleep 0.5; echo done > {marker}; exit 0' TERM; "
+        "while :; do sleep 0.1; done) >/dev/null 2>&1 </dev/null & "
+        "trap 'exit 7' TERM; while :; do sleep 0.1; done"
+    )
+    r = run_step(sh_argv(cmd), env=ENV, timeout=1.0, term_grace=8.0)
+    assert r.timed_out and r.returncode == 7
+    assert marker.exists()
+
+
+def test_a_tick_that_returns_true_stops_the_step_and_kills_the_group(tmp_path: Path) -> None:
+    pidfile = tmp_path / "gc.pid"
+    cmd = f"sleep 300 & echo $! > {pidfile}; wait"
+    with reap_pid_file(pidfile):
+        t0 = time.monotonic()
+        r = run_step(sh_argv(cmd), env=ENV, timeout=60.0, on_tick=lambda: True)
+        assert time.monotonic() - t0 < 10.0
+        assert r.returncode == -signal.SIGKILL and not r.timed_out
+        assert wait_gone(int(pidfile.read_text()))
+
+
+def test_term_grace_escalates_to_kill_after_the_grace(tmp_path: Path) -> None:
+    pidfile = tmp_path / "gc.pid"
+    cmd = f"trap '' TERM; sleep 300 & echo $! > {pidfile}; while :; do sleep 0.1; done"
+    with reap_pid_file(pidfile):
+        t0 = time.monotonic()
+        r = run_step(sh_argv(cmd), env=ENV, timeout=0.5, term_grace=1.0)
+        took = time.monotonic() - t0
+        assert 1.0 <= took < 8.0
+        assert r.timed_out
+        assert r.returncode == -signal.SIGKILL
+        assert wait_gone(int(pidfile.read_text()))
+
+
+def test_without_term_grace_a_timeout_is_an_immediate_kill() -> None:
+    r = run_step(sh_argv("trap 'exit 7' TERM; sleep 300"), env=ENV, timeout=0.5)
+    assert r.returncode == -signal.SIGKILL
+
+
+def test_merge_stderr_interleaves_in_one_stream() -> None:
+    code = (
+        "import sys\n"
+        "sys.stdout.write('a\\n'); sys.stdout.flush()\n"
+        "sys.stderr.write('b\\n'); sys.stderr.flush()\n"
+        "sys.stdout.write('c\\n'); sys.stdout.flush()\n"
+    )
+    r = run_step(py(code), env=ENV, timeout=10, merge_stderr=True)
+    assert r.stdout == b"a\nb\nc\n"
+    assert r.stderr == b""
+
+
+def test_merge_stderr_tail_keeps_the_last_bytes() -> None:
+    code = "import sys; sys.stderr.write('x' * 5000 + 'END')"
+    r = run_step(py(code), env=ENV, timeout=10, merge_stderr=True, max_stdout=100, tail=True)
+    assert len(r.stdout) == 100 and r.stdout.endswith(b"END") and r.stdout_truncated

@@ -18,7 +18,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,6 +36,12 @@ LIVE_STATES = ("creating", "active", "unlinked", "missing", "clone_missing", "pa
 TOMBSTONE_STATES = ("gone", "removed", "forgotten")
 STATES = LIVE_STATES + TOMBSTONE_STATES
 OBJECT_TYPES = ("worktree", "throwaway")
+BOOTSTRAP_STATES = ("none", "ok", "failed", "interrupted")
+# untracked: exempt by exact path while its content hash is unchanged; ignored_dir: exempt by
+# prefix (everything below it); ignored_file: exempt by exact path.
+BOOTSTRAP_PATH_KINDS = ("untracked", "ignored_file", "ignored_dir")
+
+_RUN_MARKER = -1  # the ``step`` of the row that numbers a bootstrap run (no argv)
 
 GLOBAL_LEASE = "global"
 LEASE_TTL = 600.0  # 10 minutes, renewed while held (docs/design.md, Concurrency)
@@ -643,6 +649,156 @@ class State:
         assert got is not None
         return got
 
+    # -- bootstrap (docs/interface.md, Bootstrap) ------------------------------------------
+
+    def record_bootstrap(
+        self,
+        record_id: str,
+        *,
+        expected: str | Collection[str],
+        state: str,
+        steps: Sequence[dict[str, Any]],
+        paths: Iterable[tuple[str, str, str | None]],
+        nested: Iterable[str],
+    ) -> Record:
+        """Store one bootstrap run in a single transaction: its steps (a new run number), the
+        paths it created (``(path, kind, digest)``: ``untracked`` with the SHA-256 of its content,
+        ``ignored_file`` or ``ignored_dir`` with none; an existing path gets the newest values),
+        the ``.git`` entries inside its directories, and the record's ``bootstrap_state``.
+
+        A compare-and-set on the record's state like ``transition`` (a lost race raises ``busy``
+        and stores nothing). The sets only grow; the steps shown are those of the last run.
+        """
+        if state not in BOOTSTRAP_STATES:
+            raise ValueError(f"unknown bootstrap state {state!r}")
+        rows = list(paths)
+        for path, kind, _digest in rows:
+            if kind not in BOOTSTRAP_PATH_KINDS:
+                raise ValueError(f"unknown bootstrap path kind {kind!r}")
+            _check_text(path)
+        nested_rows = list(nested)
+        for path in nested_rows:
+            _check_text(path)
+        exp = [expected] if isinstance(expected, str) else list(expected)
+        for s in exp:
+            _check_state(s)
+        marks = ",".join("?" * len(exp))
+        now = self._now()
+        with self._txn() as c:
+            cur = c.execute(
+                f"UPDATE records SET bootstrap_state = ?, updated = ? "
+                f"WHERE id = ? AND state IN ({marks})",
+                [state, now, record_id, *exp],
+            )
+            if cur.rowcount == 0:
+                row = c.execute(
+                    "SELECT state, removed_at FROM records WHERE id = ?", (record_id,)
+                ).fetchone()
+                if row is None or row[0] in TOMBSTONE_STATES:
+                    raise _not_found(record_id, row)
+                raise WtctlError(
+                    "busy",
+                    f"record {record_id} is {row[0]}, not {'/'.join(exp)}: "
+                    "another command changed it first",
+                )
+            run = (
+                c.execute(
+                    "SELECT COALESCE(MAX(run), 0) FROM bootstrap_runs WHERE record_id = ?",
+                    (record_id,),
+                ).fetchone()[0]
+                + 1
+            )
+            c.executemany(
+                'INSERT INTO bootstrap_runs(record_id, run, step, argv_json, "exit", '
+                "duration_ms, output_tail, started) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        record_id,
+                        run,
+                        i,
+                        json.dumps(st["argv"]),
+                        st["exit"],
+                        st["duration_ms"],
+                        st["output_tail"],
+                        now,
+                    )
+                    for i, st in enumerate(steps)
+                ],
+            )
+            # A marker row (step -1) carries the run number, so a run without steps still
+            # supersedes the steps of the previous run.
+            c.execute(
+                'INSERT INTO bootstrap_runs(record_id, run, step, argv_json, "exit", '
+                "duration_ms, output_tail, started) VALUES (?, ?, ?, '[]', NULL, NULL, NULL, ?)",
+                (record_id, run, _RUN_MARKER, now),
+            )
+            c.executemany(
+                "INSERT OR REPLACE INTO bootstrap_paths(record_id, path, kind, digest) "
+                "VALUES (?, ?, ?, ?)",
+                [(record_id, p, k, d) for p, k, d in rows],
+            )
+            c.executemany(
+                "INSERT OR IGNORE INTO bootstrap_nested(record_id, path) VALUES (?, ?)",
+                [(record_id, p) for p in nested_rows],
+            )
+        got = self.get_record(record_id)
+        assert got is not None
+        return got
+
+    def set_bootstrap_state(self, record_id: str, state: str, *, expected: str) -> Record:
+        """Set ``bootstrap_state`` alone (an interrupted run), a compare-and-set on the state."""
+        if state not in BOOTSTRAP_STATES:
+            raise ValueError(f"unknown bootstrap state {state!r}")
+        return self.transition(record_id, expected, expected, bootstrap_state=state)
+
+    def bootstrap_paths(self, record_id: str) -> list[tuple[str, str, str | None]]:
+        """The bootstrap-created set: ``(path, kind, digest)``, sorted by path."""
+        return [
+            (r[0], r[1], r[2])
+            for r in self._conn.execute(
+                "SELECT path, kind, digest FROM bootstrap_paths WHERE record_id = ? ORDER BY path",
+                (record_id,),
+            )
+        ]
+
+    def bootstrap_nested(self, record_id: str) -> list[str]:
+        return [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT path FROM bootstrap_nested WHERE record_id = ? ORDER BY path", (record_id,)
+            )
+        ]
+
+    def bootstrap_summary(self, record_id: str) -> dict[str, Any]:
+        """The record's ``bootstrap`` object: state, the steps of the last run, set size."""
+        row = self._conn.execute(
+            "SELECT bootstrap_state FROM records WHERE id = ?", (record_id,)
+        ).fetchone()
+        if row is None:
+            raise _not_found(record_id, None)
+        last = self._conn.execute(
+            "SELECT MAX(run) FROM bootstrap_runs WHERE record_id = ?", (record_id,)
+        ).fetchone()[0]
+        steps: list[dict[str, Any]] = []
+        if last is not None:
+            for r in self._conn.execute(
+                'SELECT argv_json, "exit", duration_ms, output_tail FROM bootstrap_runs '
+                "WHERE record_id = ? AND run = ? AND step >= 0 ORDER BY step",
+                (record_id, last),
+            ):
+                steps.append(
+                    {
+                        "argv": json.loads(r[0]),
+                        "exit": r[1],
+                        "duration_ms": r[2],
+                        "output_tail": r[3] or "",
+                    }
+                )
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM bootstrap_paths WHERE record_id = ?", (record_id,)
+        ).fetchone()[0]
+        return {"state": row[0], "steps": steps, "created_paths_count": count}
+
     def delete_record(self, record_id: str, *, expected: str) -> bool:
         """Delete a record still in state ``expected`` (a compare-and-set); False if it is not.
 
@@ -1060,6 +1216,16 @@ def _check_id(record_id: str) -> None:
     )
     if not ok:
         raise ValueError(f"invalid record id {record_id!r}")
+
+
+def _check_text(path: str) -> None:
+    """A path stored as text must be valid UTF-8 (no lone surrogates, no NUL)."""
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"path is not representable as UTF-8 text: {path!r}") from None
+    if "\0" in path:
+        raise ValueError("path contains a NUL")
 
 
 def _check_state(state: str) -> None:

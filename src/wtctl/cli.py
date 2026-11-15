@@ -147,6 +147,9 @@ def _emit_error(err: WtctlError, *, as_json: bool, verbose: bool = False) -> int
         errtext = escape_text_lines(err.usage) + errtext
     if out:
         _write(sys.stdout, out + "\n")
+    elif err.stdout_text:
+        # e.g. `create` after bootstrap_failed: the worktree exists, so its path is still output
+        _write(sys.stdout, escape_text_lines(err.stdout_text) + "\n")
     _write(sys.stderr, errtext)
     if verbose and err.__cause__ is not None:
         _write(sys.stderr, escape_text_lines(_trace(err.__cause__)))

@@ -268,8 +268,8 @@ def run_token_command(
     echoed). The child is a process-group leader; on timeout, or output beyond ``max_bytes``,
     the whole group gets SIGKILL through the pid captured at launch.
     """
-    # TODO(#16): switch to the step runner (run_step) once it lands; this block is only the
-    # credentials seam (bounded stdout capture) it does not yet offer.
+    # Not on run_step on purpose: a token command must be killed at the first byte over the cap
+    # (``too_large``), while run_step keeps reading and discards the excess.
     try:
         proc = subprocess.Popen(
             argv,
@@ -519,10 +519,6 @@ def chmod_opath_fd(fd: int, mode: int) -> None:
     os.chmod(f"/proc/self/fd/{fd}", mode)
 
 
-# TODO(#9): the hardened git runner (clean environment, overrides) builds on ``run``.
-# TODO(#16): the step runner (process groups, timeouts) is added here.
-
-
 class Clock(Protocol):
     def now(self) -> dt.datetime:
         """Current time, timezone-aware."""
@@ -684,7 +680,7 @@ def disable_dumpable() -> bool:
 # Step runner (issue #6). A separate block on purpose: other issues edit the top of this file.
 #
 # ``run_step`` runs one command in its own session and process group, with a timeout, capped
-# output and an exact environment. Hooks use it now; bootstrap steps (#16) and token commands
+# output and an exact environment. Hooks use it now; bootstrap steps (#16)
 # reuse it. It never uses a shell unless the caller passes ``sh_argv(cmd)``.
 #
 # Signalling: only the group this function created, by the leader pid captured at launch. The
@@ -766,6 +762,25 @@ _COLLECT_SECONDS = 0.2
 _COLLECT_BYTES = 1 << 20
 
 
+def _group_empty(pgid: int) -> bool:
+    """True when no process is left in group ``pgid`` (the leader has been reaped)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def _term_group(pgid: int) -> None:
+    """SIGTERM the process group ``pgid`` (same ownership rules as ``_kill_group``)."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def _raise_system_exit(signum: int, _frame: object) -> None:
     raise SystemExit(128 + signum)
 
@@ -782,7 +797,9 @@ def run_step(
     tail: bool = False,
     drain_grace: float = 1.0,
     on_start: Callable[[int], None] | None = None,
-    on_tick: Callable[[], None] | None = None,
+    on_tick: Callable[[], bool | None] | None = None,
+    term_grace: float | None = None,
+    merge_stderr: bool = False,
 ) -> StepResult:
     """Run ``argv`` (no shell) in a new session; see ``StepResult`` for the outcome.
 
@@ -792,7 +809,14 @@ def run_step(
     ``tail=True``); the rest is read and discarded so the child never blocks on a full pipe.
     ``on_start`` receives the leader pid (= process group id) right after launch, for callers
     that record it. ``on_tick`` is called about once a second while waiting (lease renewal);
-    its exceptions are ignored. A failure to start is a result, not an exception.
+    its exceptions are ignored, and a return value of True ends the step (the group gets
+    SIGKILL at once). A failure to start is a result, not an exception.
+
+    At the timeout the group gets SIGKILL at once. With ``term_grace`` (seconds) it gets SIGTERM
+    first and then the whole grace to leave: the step ends when the group is empty (the leader and
+    everything it started have exited), and at the end of the grace the group gets SIGKILL,
+    stragglers that ignored SIGTERM included. ``merge_stderr`` sends stderr into
+    the stdout pipe (one interleaved stream; ``stderr`` of the result stays empty).
     """
     t0 = time.monotonic()
     saved: dict[int, object] = {}
@@ -814,7 +838,7 @@ def run_step(
                 list(argv),
                 stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
                 env=dict(env),
                 cwd=cwd,
                 start_new_session=True,
@@ -825,8 +849,9 @@ def run_step(
         pid = proc.pid
         if on_start is not None:
             on_start(pid)
-        assert proc.stdout is not None and proc.stderr is not None
-        for stream, cap in ((proc.stdout, out), (proc.stderr, err)):
+        assert proc.stdout is not None and (merge_stderr or proc.stderr is not None)
+        streams = [(proc.stdout, out)] + ([] if proc.stderr is None else [(proc.stderr, err)])
+        for stream, cap in streams:
             os.set_blocking(stream.fileno(), False)
             sel.register(stream, selectors.EVENT_READ, cap)
         pending = memoryview(stdin) if stdin else None
@@ -839,24 +864,44 @@ def run_step(
         deadline = t0 + timeout
         exited_at: float | None = None
         last_tick = t0
+        kill_at: float | None = None  # set once SIGTERM went out (term_grace)
         while True:
             now = time.monotonic()
             if on_tick is not None and now - last_tick >= 1.0:
                 last_tick = now
                 try:
-                    on_tick()
+                    stop = on_tick() is True
                 except Exception:  # noqa: BLE001 - a heartbeat must not abort the step
-                    pass
+                    stop = False
+                if stop:  # the caller lost what it ticks for (a lease): end the step
+                    _kill_group(pid)
+                    break
             if exited_at is None and _leader_exited(proc):
                 exited_at = now
-            if exited_at is not None and not sel.get_map():
+            if kill_at is not None:
+                # SIGTERM was sent: the group keeps the grace. Once the leader is gone and
+                # reaped (a zombie leader would keep the group "alive" for ever; a live member
+                # keeps the process-group id from being reused) the group is done when
+                # killpg(.., 0) finds nobody; at the end of the grace the rest gets SIGKILL.
+                if exited_at is not None:
+                    proc.poll()
+                if now >= kill_at:
+                    _kill_group(pid)
+                    break
+                if proc.returncode is not None and _group_empty(pid):
+                    break
+            elif exited_at is not None and not sel.get_map():
                 break
-            if exited_at is not None and now - exited_at >= drain_grace:
+            elif exited_at is not None and now - exited_at >= drain_grace:
                 incomplete = True
                 break
-            if now >= deadline:
+            elif now >= deadline:
                 if exited_at is None:
                     timed_out = True
+                    if term_grace:
+                        _term_group(pid)
+                        kill_at = now + term_grace
+                        continue
                     _kill_group(pid)
                 else:
                     incomplete = True
