@@ -392,16 +392,108 @@ def test_r8_a_lease_lost_during_the_admin_deletion_does_not_mark_the_record_remo
 
 def test_r9_the_remove_audit_is_committed_before_the_branch_is_deleted(w: RR, capsys) -> None:  # noqa: ANN001
     w.start(capsys)
-    seen: list[list[str]] = []
+    seen: list[tuple[list[str], str]] = []
 
     def before(sub: str, argv: list[str], kw: dict[str, Any]) -> None:
         if sub == "update-ref" and "-d" in argv:
-            seen.append([f"{a['action']}:{a['result']}" for a in w.audit_records()])
+            seen.append(([f"{a['action']}:{a['result']}" for a in w.audit_records()], w.state_of()))
 
     w.git_runner = Spy(before=before)
     d = w.removed()
     assert d["branch_deleted"] is True
-    assert seen == [["remove:ok"]]
+    assert seen == [(["remove:ok"], "partial")]
+    assert w.state_of() == "removed"
+    assert [a["action"] for a in w.audit_records()] == ["remove", "branch_delete"]
+
+
+def test_r9_a_failure_in_the_branch_step_leaves_partial_with_the_remove_audit(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    w.start(capsys)
+
+    def boom(*a: Any, **k: Any) -> bool:
+        raise RuntimeError("branch step failed")
+
+    monkeypatch.setattr(remover.worktrees, "delete_created_branch", boom)
+    assert w.rm().code == 1
+    assert w.state_of() == "partial"
+    assert [f"{a['action']}:{a['result']}" for a in w.audit_records()] == ["remove:ok"]
+
+
+# -- round 2 F1: audit append failures after the deletion are warnings, not lies ------------------
+
+
+def fail_audit_append(mp: pytest.MonkeyPatch, nth: int) -> None:
+    real = audit.Journal.commit_audit
+    calls = {"n": 0}
+
+    def commit(self: Any, prepared: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == nth:
+            raise audit.JournalIOError("disk full")
+        return real(self, prepared)
+
+    mp.setattr(audit.Journal, "commit_audit", commit)
+
+
+def last_error(w: RR) -> str | None:
+    return w.rows("SELECT last_error FROM records WHERE id = ?", w.rid)[0]["last_error"]
+
+
+def test_f1_a_failed_remove_audit_append_is_a_warning_and_the_removal_finishes(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    w.start(capsys)
+    fail_audit_append(monkeypatch, 1)
+    d = w.removed()
+    assert d["branch_deleted"] is True
+    assert any("audit record not written" in x for x in d["warnings"])
+    assert w.state_of() == "removed" and last_error(w) is None
+    assert not w.wt.exists() and not w.admin.exists()
+    assert [a["action"] for a in w.audit_records()] == ["branch_delete"]
+
+
+def test_f1_a_failed_branch_audit_append_is_a_warning_and_the_removal_finishes(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    w.start(capsys)
+    fail_audit_append(monkeypatch, 2)
+    d = w.removed()
+    assert d["branch_deleted"] is True and d["branch_kept_reason"] is None
+    assert any("audit record not written" in x for x in d["warnings"])
+    assert w.state_of() == "removed"
+    assert [a["action"] for a in w.audit_records()] == ["remove"]
+
+
+def test_f1_a_failed_final_flip_leaves_partial_with_a_truthful_last_error(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    w.start(capsys)
+    from wtctl import state as state_mod
+    from wtctl.errors import WtctlError
+
+    real = state_mod.State.transition
+
+    def transition(self: Any, rid: str, expected: Any, new: str, **kw: Any) -> Any:
+        if new == "removed":
+            raise WtctlError("busy", "lost the race")
+        return real(self, rid, expected, new, **kw)
+
+    monkeypatch.setattr(state_mod.State, "transition", transition)
+    r = w.rm()
+    assert r.code == 12
+    assert w.state_of() == "partial"
+    le = last_error(w) or ""
+    assert "in progress" not in le and "deleted" in le
+    assert not w.wt.exists() and not w.admin.exists()
     assert [a["action"] for a in w.audit_records()] == ["remove", "branch_delete"]
 
 

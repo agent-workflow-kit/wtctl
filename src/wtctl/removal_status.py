@@ -355,7 +355,9 @@ class Status:
         r = self.record
         expected = removal_content._ident(r["dir_id"])
         base = r["base_dir"]
-        if r["owned"] and base:
+        if r["owned"]:
+            if not base:
+                raise fsafe.FsafeError("identity", f"no root is recorded for {r['path']}")
             rel = os.path.relpath(r["path"], base)
             if rel in (".", "..") or rel.startswith("../") or os.path.isabs(rel):
                 raise fsafe.FsafeError("identity", f"{r['path']} is not below its root {base}")

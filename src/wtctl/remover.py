@@ -499,7 +499,7 @@ class Remover:
             self._check_lease()
             self._finish_admin(rec, prepared)
             self._check_lease()
-            self.journal.commit_audit(prepared.ok)  # before the branch is touched
+            self._late_audit(rec, prepared.ok, "remove")  # before the branch is touched
             branch_deleted, kept = self._branch(rec, plan, prepared)
         return self._finish(rec, branch_deleted, kept)
 
@@ -539,7 +539,7 @@ class Remover:
             self._check_lease()
             self._finish_admin(rec, prepared)
             self._check_lease()
-            self.journal.commit_audit(prepared.ok)
+            self._late_audit(rec, prepared.ok, "remove")
         return self._finish(rec, False, plan.kept_reason)
 
     def _locked_gate(self, rec: Record, lock: dict[str, Any]) -> None:
@@ -691,8 +691,27 @@ class Remover:
         )
         prepared.branch_deleted = True
         if prepared.branch is not None:
-            self.journal.commit_audit(prepared.branch)
+            self._late_audit(rec, prepared.branch, "branch_delete")
         return True, None
+
+    def _late_audit(self, rec: Record, entry: Any, what: str) -> None:
+        """Append an audit record after the deletion happened. A failure cannot undo the change,
+        so it is a warning, and (for the ``remove`` record) the record's ``last_error`` stops
+        claiming the removal is still in progress."""
+        try:
+            self.journal.commit_audit(entry)
+        except audit.JournalIOError as exc:
+            self.warnings.append(
+                f"{what}: deleted; audit record not written: {_escape(exc.message)}"
+            )
+            if what == "remove":
+                self._set_last_error(rec, "deleted; audit record not written")
+
+    def _set_last_error(self, rec: Record, message: str) -> None:
+        try:
+            self.state.transition(rec["id"], ("active", "partial"), "partial", last_error=message)
+        except WtctlError:
+            pass  # best effort: the caller is already reporting a failure
 
     # -- audit --------------------------------------------------------------------------------
 
@@ -737,9 +756,13 @@ class Remover:
 
     def _finish(self, rec: Record, branch_deleted: bool, kept: str | None) -> Result:
         self._check_lease()
-        removed = self.state.transition(
-            rec["id"], ("active", "partial"), "removed", last_error=None
-        )
+        try:
+            removed = self.state.transition(
+                rec["id"], ("active", "partial"), "removed", last_error=None
+            )
+        except WtctlError:
+            self._set_last_error(rec, "deleted; the record could not be marked removed")
+            raise
         out = record_object(removed, self.state.bootstrap_summary(removed["id"]))
         payload = hooks.build_payload(
             "post-remove",

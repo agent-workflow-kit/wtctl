@@ -583,3 +583,11 @@ def test_status_end_to_end_with_child_walks_and_the_real_process_scanner(
         ]
     finally:
         sleeper.stop()  # killed by its recorded PID only
+
+
+def test_f2_an_owned_partial_record_without_a_base_dir_is_not_removable(w: RW, capsys) -> None:  # noqa: ANN001
+    w.start(capsys)
+    w.db_exec("UPDATE records SET state = 'partial', base_dir = NULL WHERE id = ?", w.rid)
+    (w.wt / ".git").unlink()
+    d = w.st(capsys)
+    assert (d["would_remove"], d["reason"]) == (False, "unlinked")
