@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import datetime as dt
 import os
+import selectors
 import signal
 import subprocess
 import sys
@@ -119,6 +120,108 @@ def run_git(
         proc.wait()
         return GitResult(proc.returncode, out, err, timed_out=was_running)
     return GitResult(proc.returncode, out, err)
+
+
+@dataclass(frozen=True)
+class TokenCommandResult:
+    """Outcome of a ``token_command``: the stdout is a secret, so it is kept out of ``repr``.
+
+    ``failure`` is a category only (``not_found``, ``os_error``, ``timeout``, ``too_large``,
+    ``exit``), never the program's own text: its stderr is discarded unread and its stdout is the
+    token.
+    """
+
+    returncode: int | None
+    stdout: bytes = field(default=b"", repr=False, compare=False)
+    failure: str | None = None
+
+
+def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+    """SIGKILL the group this call created. The leader is unreaped (no ``poll``/``wait`` yet),
+    so its pid still names that group even if the leader is a zombie."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_token_command(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    timeout: float,
+    max_bytes: int,
+) -> TokenCommandResult:
+    """Run a credential helper without a shell and return at most ``max_bytes`` of its stdout.
+
+    stdin is ``/dev/null`` and stderr is discarded unread (it may hold secrets and is never
+    echoed). The child is a process-group leader; on timeout, or output beyond ``max_bytes``,
+    the whole group gets SIGKILL through the pid captured at launch.
+    """
+    # TODO(#16): switch to the step runner (run_step) once it lands; this block is only the
+    # credentials seam (bounded stdout capture) it does not yet offer.
+    try:
+        proc = subprocess.Popen(
+            argv,
+            env=dict(env),
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return TokenCommandResult(None, failure="not_found")
+    except (OSError, ValueError):
+        return TokenCommandResult(None, failure="os_error")
+    assert proc.stdout is not None
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+    size = 0
+    failure: str | None = None
+    fd = proc.stdout.fileno()
+    with selectors.DefaultSelector() as sel:
+        sel.register(fd, selectors.EVENT_READ)
+        leader_gone = False
+        while failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "timeout"
+                break
+            # Poll in short slices so a leader that exited is noticed even while a descendant
+            # still holds the pipe open (end-of-file would then never come).
+            if not sel.select(0 if leader_gone else min(remaining, 0.1)):
+                if leader_gone:
+                    break  # everything already written has been read
+                leader_gone = proc.poll() is not None
+                continue
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            size += len(data)
+            if size > max_bytes:
+                failure = "too_large"
+                break
+            chunks.append(data)
+    if failure is None:
+        # EOF: the program closed stdout; it may still run.
+        try:
+            proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
+        except subprocess.TimeoutExpired:
+            failure = "timeout"
+    if failure is not None and proc.returncode is None:
+        # Only while the leader is unreaped does its pid certainly still name our group.
+        _kill_group(proc)
+    try:
+        proc.wait(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        pass  # a leader that survives SIGKILL is reported, not chased
+    proc.stdout.close()
+    if failure is not None:
+        return TokenCommandResult(proc.returncode, failure=failure)
+    if proc.returncode != 0:
+        return TokenCommandResult(proc.returncode, failure="exit")
+    return TokenCommandResult(0, b"".join(chunks))
 
 
 # TODO(#16): the step runner (process groups, timeouts) is added here.
@@ -242,6 +345,7 @@ class Gateway:
     scanner: ProcessScanner = field(default_factory=UnavailableScanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
     git_runner: Callable[..., GitResult] = run_git
+    token_runner: Callable[..., TokenCommandResult] = run_token_command
 
     def run(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return self.runner(argv, **kwargs)
@@ -249,6 +353,10 @@ class Gateway:
     def git(self, argv: list[str], **kwargs: object) -> GitResult:
         """Run a fully built git command line (see ``wtctl.hardgit``, the only caller)."""
         return self.git_runner(argv, **kwargs)
+
+    def token_command(self, argv: list[str], **kwargs: object) -> TokenCommandResult:
+        """Run a ``token_command`` (see ``wtctl.credentials``, the only caller)."""
+        return self.token_runner(argv, **kwargs)
 
 
 _PR_SET_DUMPABLE = 4
