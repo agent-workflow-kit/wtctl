@@ -308,7 +308,7 @@ Spikes ran on 2026-10-30 against git 2.34.1 on Ubuntu 22.04.5 (native Linux), in
 
 ## Dependencies
 
-- Runtime: Python 3.12+, `pyyaml` (config), `pydantic` (config validation); git 2.34+; on macOS, `lsof` (in-use detection, optional).
+- Runtime: Python 3.12+, `pyyaml` (config; the standard library has no YAML parser, and the loader refuses anchors, aliases, duplicate keys and deep nesting), `pydantic` (config validation: the models mirror `schemas/config.json`, and a test checks both accept and reject the same values; `jsonschema` is test-only); git 2.34+; on macOS, `lsof` (in-use detection, optional).
 - Test-only: `pytest`, `jsonschema` and `referencing`. The last two validate every golden `--json` output and hook payload against `schemas/` with a registry keyed by each schema's `$id`; the schemas use `$ref` across files and `if`/`then` conditions that a hand-written check would not cover. They are not imported by the package.
 - No awkit tool dependencies. git is called directly (binding A to a third-party CLI); no git library (`GitPython`, `pygit2`) is used, because the hardened invocation must control git's environment and arguments exactly.
 
