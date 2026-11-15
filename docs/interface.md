@@ -585,7 +585,7 @@ Each command's section lists the codes it can exit with; this table maps each `e
 
 ## Hooks
 
-Hooks follow design guide section 8: configured under `hooks.<name>` as a list of `{cmd, timeout, async}` (timeout default 30 seconds; `async` only for post-hooks), run with `sh -c` in their own process group, the payload as JSON on stdin, the environment of wtctl minus every `hosts.*.token_env` variable. `--hook NAME=CMD` (repeatable, on `create` and `remove`) adds a hook for this invocation after the configured ones.
+Hooks follow design guide section 8: configured under `hooks.<name>` as a list of `{cmd, timeout, async}` (timeout in whole seconds, 1 to 86400, default 30; `async` only for post-hooks), run with `sh -c` in their own process group, the payload as JSON on stdin, the environment of wtctl minus every `hosts.*.token_env` variable. `--hook NAME=CMD` (repeatable, on `create` and `remove`) adds a hook for this invocation after the configured ones.
 
 | Hook | Fires | Can veto/escalate | Payload |
 |---|---|---|---|
@@ -601,6 +601,8 @@ Every payload carries `tool: "wtctl"`, `hook`, `object_type` (`worktree` or `thr
 **Outcomes.** Pre-hooks run in order: exit 0 continues; exit 13 escalates (the remaining hooks still run); any other non-zero exit, or a timeout, vetoes immediately (exit 11). If none vetoed and any escalated, the command exits 13 (`escalated`) having changed nothing. With `--override-escalation` (a [human-only flag](#audit-and-log)), a hook's exit 13 counts as allow; other outcomes are unchanged. Post-hook failures are logged and warned, never fatal.
 
 **Decision ids.** A hook that prints a JSON object with `decision_id` (a string or a list) on stdout has it recorded in the log record of the step and, for audited actions, in the audit record ([Identifiers](#identifiers)).
+
+**Execution details.** Each hook runs as `/bin/sh -c <cmd>` in a new session, so its process group is the one wtctl created and knows by the leader pid captured at launch. On timeout wtctl sends SIGKILL to that group only (never by name or pattern), so the hook's descendants die with it; a hook that finishes normally but leaves descendants running is not killed. Output is read with caps (stdout 64 KiB, stderr 4096 bytes): a larger stdout is never parsed for decision ids (warning), and `hook_stderr` is escaped (control characters, bidi overrides) before it reaches an error object. After a hook exits wtctl waits at most 1 second for its pipes to close, so a descendant that keeps them open delays nothing for long (warning). A hook that cannot be started vetoes a pre-hook and warns for a post-hook; a hook killed by a signal vetoes. `async: true` starts the hook detached through a small supervisor that enforces the timeout on its group while the hook's leader command runs (descendants that outlive the leader are left alone, as for a synchronous hook); the outcome of an async hook is never seen, so it cannot warn. Hooks are never run for a dry run. The payload is ASCII-only JSON. Duplicate decision ids are recorded once. Hooks run through `gateway.run_step` with an immediate SIGKILL on timeout; bootstrap steps use the same runner, and #16 adds their SIGTERM-then-SIGKILL grace ([Bootstrap](#bootstrap) step 3).
 
 ## Config
 
