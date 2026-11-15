@@ -240,5 +240,7 @@ def test_a_source_root_whose_git_dir_has_another_identity_copies_nothing(r: Repo
 def test_a_source_root_with_the_recorded_identity_copies(r: Repo) -> None:
     r.write(".env", "x", root=r.main)
     st = os.stat(r.main / ".git")
-    got, _ = copy(r, [".env"], common_dir=str(r.main / ".git"), common_id=f"{st.st_dev}:{st.st_ino}")
+    got, _ = copy(
+        r, [".env"], common_dir=str(r.main / ".git"), common_id=f"{st.st_dev}:{st.st_ino}"
+    )
     assert [c.path for c in got] == [".env"]

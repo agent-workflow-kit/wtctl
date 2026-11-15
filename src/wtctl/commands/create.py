@@ -19,8 +19,8 @@ from .. import bootstrapper, fsafe, hooks, naming, worktrees
 from .. import labels as labelmod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
-from ..gitsetup import open_git
-from ..hardgit import Git, load_filter_policy
+from ..gitsetup import open_git, with_filters
+from ..hardgit import Git
 from ..locate import Resolver, describe_mount, identity_str
 from ..mirror import Mirror, Tips
 from ..packs import clone_has_commit, transfer_base
@@ -174,23 +174,9 @@ class Creator:
             return self._result_reused(r.record)
 
     def _git_with_filters(self) -> Git:
-        allow = self.settings.allow_filters
-        if not allow:
-            return self.git
-        from ..gitsetup import private_dir
-
-        with private_dir() as p:
-            policy = load_filter_policy(
-                self.ctx.gateway,
-                self.git.git_bin,
-                home=os.environ.get("HOME") or os.path.expanduser("~"),
-                xdg_config_home=os.environ.get("XDG_CONFIG_HOME"),
-                allow=allow,
-                path_env=os.environ.get("PATH", ""),
-                private_dir=p,
-            )
-        self.warnings += policy.warnings
-        return dataclasses.replace(self.git, filters=policy)
+        return with_filters(
+            self.git, self.settings.allow_filters, self.ctx.gateway, self.warnings.append
+        )
 
     # -- under the per-clone lease (steps 5 to 13) -------------------------------------------
 
@@ -927,9 +913,7 @@ class Creator:
             raise kept from exc
         return outcome
 
-    def _finish(
-        self, record: Record, plan: Plan, decision_ids: list[str], rlease: Lease
-    ) -> Result:
+    def _finish(self, record: Record, plan: Plan, decision_ids: list[str], rlease: Lease) -> Result:
         o = self.o
         run_the_steps = bool(
             self.settings.bootstrap.steps and self.settings.bootstrap.auto and not o.no_bootstrap

@@ -439,7 +439,7 @@ def copy_env_files(
     try:
         src = fsafe.open_anchor(source_root)
     except fsafe.FsafeError as exc:
-        warn(f"copy_env: the clone's main worktree cannot be opened safely ({exc.kind}); nothing copied")
+        warn(f"copy_env: the clone's main worktree cannot be opened ({exc.kind}); nothing copied")
         return []
     try:
         if common_dir is not None and common_id and common_dir == source_root.rstrip("/") + "/.git":
@@ -453,7 +453,9 @@ def copy_env_files(
             finally:
                 os.close(gfd)
             if f"{ident.dev}:{ident.ino}" != common_id:
-                warn("copy_env: the clone's main worktree is not the recorded clone; nothing copied")
+                warn(
+                    "copy_env: the clone's main worktree is not the recorded clone; nothing copied"
+                )
                 return []
         matches: set[tuple[str, ...]] = set()
         budget = [ENV_WALK_LIMIT]

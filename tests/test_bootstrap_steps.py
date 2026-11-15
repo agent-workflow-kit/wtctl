@@ -23,8 +23,10 @@ def r(tmp_path: Path, private_home: Path) -> Repo:
 
 
 def cfg(tokens: tuple[str, ...] = ("GH_TOKEN",), mask: tuple[str, ...] = ()) -> NS:
-    return NS(hosts={f"h{i}": NS(token_env=t) for i, t in enumerate(tokens)} | {"x": NS(token_env=None)},
-              mask_env=list(mask))  # fmt: skip
+    return NS(
+        hosts={f"h{i}": NS(token_env=t) for i, t in enumerate(tokens)} | {"x": NS(token_env=None)},
+        mask_env=list(mask),
+    )
 
 
 def settings(steps=(), pass_env=(), env=None) -> NS:  # noqa: ANN001
@@ -43,7 +45,9 @@ def run(r: Repo, steps: list[NS], env: dict[str, str] | None = None, **kw):  # n
     base = env if env is not None else {"PATH": os.environ["PATH"]}
     warns: list[str] = []
     with r.open() as wt:
-        out = b.run_steps(steps, env=base, cwd=wt.cwd, mask=kw.pop("mask", ()), warn=warns.append, **kw)
+        out = b.run_steps(
+            steps, env=base, cwd=wt.cwd, mask=kw.pop("mask", ()), warn=warns.append, **kw
+        )
     return out, warns
 
 
@@ -55,8 +59,10 @@ def test_environment_drops_every_token_variable_and_keeps_the_rest() -> None:
         cfg(("GH_TOKEN", "OTHER_TOKEN")),
         {"GH_TOKEN": "s1", "OTHER_TOKEN": "s2", "KEEP": "k", "PATH": "/usr/bin"},
         settings(),
-        record_id="wt-aaaaaaaa", path="/w/x", repo="o/r",
-    )  # fmt: skip
+        record_id="wt-aaaaaaaa",
+        path="/w/x",
+        repo="o/r",
+    )
     assert "GH_TOKEN" not in env and "OTHER_TOKEN" not in env
     assert env["KEEP"] == "k"
     assert env["WTCTL_ID"] == "wt-aaaaaaaa" and env["WTCTL_PATH"] == "/w/x"
@@ -65,30 +71,53 @@ def test_environment_drops_every_token_variable_and_keeps_the_rest() -> None:
 
 def test_pass_env_gives_back_named_variables_only_when_set() -> None:
     environ = {"GH_TOKEN": "s1", "PATH": "/usr/bin"}
-    env = b.step_env(cfg(), environ, settings(pass_env=["GH_TOKEN", "NOT_SET"]),
-                     record_id="wt-aaaaaaaa", path="/w", repo="r")  # fmt: skip
+    env = b.step_env(
+        cfg(),
+        environ,
+        settings(pass_env=["GH_TOKEN", "NOT_SET"]),
+        record_id="wt-aaaaaaaa",
+        path="/w",
+        repo="r",
+    )
     assert env["GH_TOKEN"] == "s1" and "NOT_SET" not in env
 
 
 def test_bootstrap_env_adds_and_wtctl_variables_win() -> None:
-    env = b.step_env(cfg(), {"WTCTL_ID": "evil", "A": "caller"},
-                     settings(env={"A": "cfg", "WTCTL_PATH": "evil"}),
-                     record_id="wt-aaaaaaaa", path="/w", repo="r")  # fmt: skip
+    env = b.step_env(
+        cfg(),
+        {"WTCTL_ID": "evil", "A": "caller"},
+        settings(env={"A": "cfg", "WTCTL_PATH": "evil"}),
+        record_id="wt-aaaaaaaa",
+        path="/w",
+        repo="r",
+    )
     assert env["A"] == "cfg"
     assert env["WTCTL_ID"] == "wt-aaaaaaaa" and env["WTCTL_PATH"] == "/w"
 
 
 def test_relative_and_empty_path_entries_are_dropped() -> None:
-    env = b.step_env(cfg(), {"PATH": ".:/usr/bin::bin:/bin:./x"}, settings(),
-                     record_id="wt-aaaaaaaa", path="/w", repo="r")  # fmt: skip
+    env = b.step_env(
+        cfg(),
+        {"PATH": ".:/usr/bin::bin:/bin:./x"},
+        settings(),
+        record_id="wt-aaaaaaaa",
+        path="/w",
+        repo="r",
+    )
     assert env["PATH"] == "/usr/bin:/bin"
 
 
 def test_a_repo_executable_is_not_found_through_a_relative_path_entry(r: Repo) -> None:
     exe = r.write("mytool", "#!/bin/sh\necho PWNED > pwned\n")
     exe.chmod(0o755)
-    env = b.step_env(cfg(), {"PATH": f".:{os.environ['PATH']}"}, settings(),
-                     record_id="wt-aaaaaaaa", path=str(r.wt), repo="r")  # fmt: skip
+    env = b.step_env(
+        cfg(),
+        {"PATH": f".:{os.environ['PATH']}"},
+        settings(),
+        record_id="wt-aaaaaaaa",
+        path=str(r.wt),
+        repo="r",
+    )
     out, _ = run(r, [step(["mytool"])], env=env)
     steps, failed = out
     assert failed and steps[0]["exit"] is None  # not found: never executed
@@ -188,7 +217,7 @@ def test_mask_env_values_are_masked_everywhere_in_the_tail(r: Repo) -> None:
 def test_a_secret_straddling_the_tail_boundary_is_not_partly_shown(r: Repo) -> None:
     secret = "S3CRETVALUE" * 4
     env = {"PATH": os.environ["PATH"], "SEC": secret}
-    code = f"import os; print('z' * (4096 - 20) + os.environ['SEC'] + 'tail')"
+    code = "import os; print('z' * (4096 - 20) + os.environ['SEC'] + 'tail')"
     (steps, _), _ = run(r, [py(code)], env=env, mask=("SEC",))
     tail = steps[0]["output_tail"]
     assert "S3CRET" not in tail and "CRETVAL" not in tail and "***" in tail
@@ -203,12 +232,15 @@ def test_token_values_are_masked_even_when_passed_and_not_listed() -> None:
 # -- timeout and process groups --------------------------------------------------------------
 
 
-def test_a_timeout_terminates_then_kills_the_whole_group(r: Repo, tmp_path: Path,
-                                                         monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+def test_a_timeout_terminates_then_kills_the_whole_group(
+    r: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(b, "TERM_GRACE", 1.0)
     gc = tmp_path / "gc.pid"
-    cmd = (f"(trap '' TERM; exec sleep 300) >/dev/null 2>&1 </dev/null & echo $! > {gc}; "
-           "trap '' TERM; while :; do sleep 0.1; done")  # fmt: skip
+    cmd = (
+        f"(trap '' TERM; exec sleep 300) >/dev/null 2>&1 </dev/null & echo $! > {gc}; "
+        "trap '' TERM; while :; do sleep 0.1; done"
+    )
     with reap_pid_file(gc):
         t0 = time.monotonic()
         (steps, failed), _ = run(r, [step([cmd], sh=True, timeout=1), py("print('never')")])

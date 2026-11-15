@@ -19,19 +19,45 @@ def r(tmp_path: Path, private_home: Path) -> Repo:
     return Repo(tmp_path, private_home)
 
 
-def go(r: Repo, script: str = "", *, copy_env=False, rerun=False, patterns=(), limit=2_000_000,  # noqa: ANN001
-       steps=None):  # fmt: skip
+def go(
+    r: Repo,
+    script: str = "",
+    *,
+    copy_env=False,
+    rerun=False,
+    patterns=(),
+    limit=2_000_000,  # noqa: ANN001
+    steps=None,
+):
     cfg = NS(hosts={}, mask_env=[], remove=NS(nested_scan_limit=limit))
-    chosen = steps if steps is not None else (
-        [NS(argv=[sys.executable, "-c", script], sh=False, timeout=60)] if script else []
-    )  # fmt: skip
+    chosen = (
+        steps
+        if steps is not None
+        else ([NS(argv=[sys.executable, "-c", script], sh=False, timeout=60)] if script else [])
+    )
     st = NS(bootstrap=NS(steps=chosen, pass_env=[], env={}), copy_env=list(patterns))
-    rec = {"id": "wt-aaaaaaaa", "path": str(r.wt), "admin_dir": r.admin_dir, "dir_id": r.dir_id,
-           "clone_path": str(r.main), "repo": "o/r", "common_dir": None, "common_id": None}  # fmt: skip
+    rec = {
+        "id": "wt-aaaaaaaa",
+        "path": str(r.wt),
+        "admin_dir": r.admin_dir,
+        "dir_id": r.dir_id,
+        "clone_path": str(r.main),
+        "repo": "o/r",
+        "common_dir": None,
+        "common_id": None,
+    }
     warns: list[str] = []
-    out = b.run_bootstrap(git=r.git, config=cfg, settings=st, record=rec, copy_env=copy_env,
-                          run_the_steps=True, rerun=rerun, warn=warns.append,
-                          environ={"PATH": os.environ["PATH"]})  # fmt: skip
+    out = b.run_bootstrap(
+        git=r.git,
+        config=cfg,
+        settings=st,
+        record=rec,
+        copy_env=copy_env,
+        run_the_steps=True,
+        rerun=rerun,
+        warn=warns.append,
+        environ={"PATH": os.environ["PATH"]},
+    )
     return out, warns
 
 
@@ -91,7 +117,9 @@ def test_a_nested_repo_outside_created_directories_is_not_exempted(r: Repo) -> N
     assert out.nested == []
 
 
-def test_symlinks_in_created_directories_are_not_followed_by_the_scan(r: Repo, tmp_path: Path) -> None:
+def test_symlinks_in_created_directories_are_not_followed_by_the_scan(
+    r: Repo, tmp_path: Path
+) -> None:
     outside = tmp_path / "outside"
     (outside / "d" / ".git").mkdir(parents=True)
     code = f"import os; os.makedirs('build'); os.symlink({str(outside)!r}, 'build/link')"
@@ -158,4 +186,3 @@ def test_a_planted_hook_and_config_in_the_worktree_stay_inert(r: Repo, tmp_path:
     r.write(".gitattributes", "* filter=x\n")
     out, _ = go(r, "open('a.txt','w').write('a')")
     assert out.state == "ok" and not marker.exists()
-

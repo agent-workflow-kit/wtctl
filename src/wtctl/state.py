@@ -643,7 +643,7 @@ class State:
                 + 1
             )
             c.executemany(
-                "INSERT INTO bootstrap_runs(record_id, run, step, argv_json, \"exit\", "
+                'INSERT INTO bootstrap_runs(record_id, run, step, argv_json, "exit", '
                 "duration_ms, output_tail, started) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (

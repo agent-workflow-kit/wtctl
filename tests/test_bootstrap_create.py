@@ -58,7 +58,9 @@ def test_steps_run_and_the_created_set_is_recorded(w: CW, capsys) -> None:  # no
     assert [s["exit"] for s in boot["steps"]] == [0, 0]
     assert boot["steps"][1]["output_tail"] == "hello\n"
     assert boot["created_paths_count"] == 2
-    assert data["record"]["bootstrap"] == {k: boot[k] for k in ("state", "steps", "created_paths_count")}
+    assert data["record"]["bootstrap"] == {
+        k: boot[k] for k in ("state", "steps", "created_paths_count")
+    }
     rid = data["record"]["id"]
     assert paths(w, rid) == {
         "build/o.bin": ("untracked", hashlib.sha256(b"1").hexdigest()),
@@ -80,7 +82,9 @@ def test_ignored_directories_are_recorded_by_prefix(w: CW, capsys) -> None:  # n
 
 
 def test_steps_do_not_see_token_variables_but_see_pass_env(
-    w: CW, capsys, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
 ) -> None:
     monkeypatch.setenv("WT_TEST_TOKEN", "sekrit")
     monkeypatch.setenv("WT_TEST_PASS", "passed")
@@ -200,7 +204,9 @@ def test_a_symlinked_env_source_is_skipped_with_a_warning(w: CW, capsys) -> None
 
 
 def test_an_internal_failure_keeps_the_creating_record_as_interrupted(
-    w: CW, capsys, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
 ) -> None:
     def boom(**kw):  # noqa: ANN003, ANN202
         raise RuntimeError("git status exploded")
