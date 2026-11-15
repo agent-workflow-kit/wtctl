@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import resource
+import shutil
 import stat
 import threading
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from tests.mirrorlib import World
 from tests.packlib import (
@@ -21,10 +24,12 @@ from tests.packlib import (
     refreshed,
     tmp_entries,
 )
+from tests.schemacheck import SCHEMAS, _registry
 from tests.test_mirror import lease
 from tests.vectorlib import GIT, plain_git
 from wtctl import fsafe, packs
 from wtctl.errors import WtctlError
+from wtctl.gateway import Gateway, GitResult
 from wtctl.hardgit import Git
 
 
@@ -266,12 +271,17 @@ def test_planted_shallow_alternates_and_replace_cannot_make_a_wrong_checkout(w: 
     (gd / "objects/info/alternates").write_text(str(w.tmp / "nowhere") + "\n")
     (gd / "refs/replace").mkdir(exist_ok=True)
     (gd / f"refs/replace/{new[0]}").write_text(new[-1] + "\n")
-    try:
-        run_transfer(w, m, new[-1])
-    except WtctlError as e:
-        assert e.code == "create_failed"
-        return
-    assert cg(w, ["rev-list", "--objects", "--missing=print", new[-1]]).count("?") == 0
+    got = run_transfer(w, m, new[-1])  # the planted state does not stop the transfer
+    assert not got.already_present
+    # the clone, seen without the plants, holds everything the start commit reaches
+    (gd / "shallow").unlink()
+    (gd / "objects/info/alternates").unlink()
+    (gd / f"refs/replace/{new[0]}").unlink()
+    r = plain_git(
+        ["--git-dir", str(gd), "rev-list", "--objects", "--missing=print", new[-1]],
+        cwd=w.tmp, home=w.home, env={"GIT_NO_REPLACE_OBJECTS": "1"},
+    )  # fmt: skip
+    assert r.returncode == 0 and b"?" not in r.stdout
 
 
 # -- the clone's directories ----------------------------------
@@ -403,19 +413,75 @@ def test_a_forged_pack_name_is_refused(w: World, one_pack, bad: str) -> None:  #
     assert os.listdir(gd / "objects/pack") == []
 
 
-def test_an_existing_file_of_the_same_name_is_left_as_it_is(w: World, one_pack) -> None:  # noqa: ANN001
+def test_a_symlink_at_a_final_name_is_never_trusted_or_written_through(
+    w: World,
+    one_pack,  # noqa: ANN001
+) -> None:
     pack, idx, name = one_pack
     gd = empty_clone(w)
     victim = w.tmp / "victim"
     victim.write_text("keep")
     planted = gd / f"objects/pack/pack-{name}.idx"
-    planted.symlink_to(victim)  # a dangling-or-not link at the final name
-    got = packs.install_pack(
-        common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
-    )
-    assert got.pack_new and not got.idx_new
+    planted.symlink_to(victim)
+    with pytest.raises(WtctlError) as e:
+        packs.install_pack(
+            common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
+        )
+    assert e.value.code == "create_failed" and planted.name in str(e.value)
     assert victim.read_text() == "keep" and planted.is_symlink()
-    assert not [n for n in os.listdir(gd / "objects/pack") if n.startswith("tmp_")]
+    assert sorted(os.listdir(gd / "objects/pack")) == [planted.name]  # pack taken back, no tmp
+
+
+def test_a_garbage_index_at_the_final_name_is_a_failure(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    planted = gd / f"objects/pack/pack-{name}.idx"
+    planted.write_bytes(b"garbage")
+    with pytest.raises(WtctlError) as e:
+        packs.install_pack(
+            common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
+        )
+    assert e.value.code == "create_failed" and planted.name in str(e.value)
+    assert planted.read_bytes() == b"garbage"
+    assert os.listdir(gd / "objects/pack") == [planted.name]
+
+
+def test_a_same_sized_index_with_another_checksum_is_a_failure(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    data = bytearray(idx.read_bytes())
+    data[-1] ^= 1  # same size, other trailer
+    (gd / f"objects/pack/pack-{name}.idx").write_bytes(bytes(data))
+    with pytest.raises(WtctlError):
+        packs.install_pack(
+            common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
+        )
+
+
+def test_a_garbage_pack_at_the_final_name_is_a_failure_and_no_index_is_linked(
+    w: World,
+    one_pack,  # noqa: ANN001
+) -> None:
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    planted = gd / f"objects/pack/pack-{name}.pack"
+    planted.write_bytes(b"garbage")
+    with pytest.raises(WtctlError) as e:
+        packs.install_pack(
+            common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
+        )
+    assert e.value.code == "create_failed" and planted.name in str(e.value)
+    assert os.listdir(gd / "objects/pack") == [planted.name]
+
+
+def test_an_identical_pre_existing_pair_is_accepted(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    kw = dict(common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name)
+    packs.install_pack(**kw)  # type: ignore[arg-type]
+    again = packs.install_pack(**kw)  # type: ignore[arg-type]
+    assert not again.pack_new and not again.idx_new
+    assert sorted(os.listdir(gd / "objects/pack")) == [f"pack-{name}.idx", f"pack-{name}.pack"]
 
 
 def test_a_symlink_planted_at_a_temp_name_is_not_followed(w: World, one_pack, monkeypatch) -> None:  # noqa: ANN001
@@ -815,6 +881,453 @@ def test_local_blob_is_not_a_commit(w: World) -> None:
     )
     with pytest.raises(WtctlError):
         fill(w, repo, blob)
+
+
+# -- round 1 review: transfer ----------------------------------
+
+
+def delete_loose(w: World, rev: str) -> str:
+    blob = cg(w, ["rev-parse", rev])
+    obj = w.clone / ".git/objects" / blob[:2] / blob[2:]
+    assert obj.exists(), "the test needs a loose object"
+    os.chmod(obj, 0o644)
+    obj.unlink()
+    return blob
+
+
+def test_junk_refs_do_not_push_the_real_tip_out_of_the_cap(w: World) -> None:
+    _, new = lagging(w)
+    m = refreshed(w)
+    gd = w.clone / ".git"
+    blob = cg(w, ["hash-object", "-w", "--stdin"], stdin=b"junk")
+    packed = gd / "packed-refs"
+    old = (
+        [ln for ln in packed.read_text().splitlines() if ln and ln[0] != "#"]
+        if packed.exists()
+        else []
+    )
+    junk = [f"{blob} refs/heads/aaa{i:05d}" for i in range(2100)]
+    packed.write_text("# pack-refs with: peeled fully-peeled \n" + "\n".join([*old, *junk]) + "\n")
+    got = run_transfer(w, m, new[-1])
+    assert got.present_tips >= 1
+    assert got.commits == 2  # the range excludes the clone's own tip
+
+
+def test_a_clone_ref_the_mirror_does_not_have_is_not_a_bound(w: World) -> None:
+    _, new = lagging(w)
+    m = refreshed(w)
+    tree = cg(w, ["rev-parse", "HEAD^{tree}"])
+    only_here = cg(w, ["commit-tree", tree, "-m", "clone only"])
+    cg(w, ["update-ref", "refs/heads/ahead", only_here])
+    got = run_transfer(w, m, new[-1])
+    assert got.present_tips >= 1 and got.commits == 2
+
+
+def test_the_tree_fetch_uses_noop_negotiation(w: World) -> None:
+    rec = Recorder()
+    w = World(w.tmp, w.home, gateway=rec.gateway())
+    _, new = lagging(w)
+    m = refreshed(w)
+    rec.calls.clear()
+    run_transfer(w, m, new[-1])
+    tree_fetch = [c[0] for c in rec.calls if "fetch" in c[0] and "--stdin" in c[0]]
+    assert len(tree_fetch) == 1 and "fetch.negotiationAlgorithm=noop" in tree_fetch[0]
+
+
+def test_a_clone_missing_a_blob_below_its_tip_is_repaired_when_no_ref_bounds_it(w: World) -> None:
+    old, _ = lagging(w)
+    m = refreshed(w)
+    blob = delete_loose(w, f"{old[-1]}:c3.txt")
+    for ref in cg(w, ["for-each-ref", "--format=%(refname)"]).split():
+        cg(w, ["update-ref", "--no-deref", "-d", ref])
+    got = run_transfer(w, m, old[-1])
+    assert not got.already_present and got.pack
+    assert cg(w, ["cat-file", "-t", blob]) == "blob"
+    assert cg(w, ["rev-list", "--objects", "--missing=print", old[-1]]).count("?") == 0
+
+
+def test_a_clone_missing_a_blob_below_a_bounding_tip_fails_the_final_check(w: World) -> None:
+    old, _ = lagging(w)
+    m = refreshed(w)
+    delete_loose(w, f"{old[-1]}:c3.txt")  # refs still name the tip, so the range is empty
+    before = pack_dir_entries(w)
+    with pytest.raises(WtctlError) as e:
+        run_transfer(w, m, old[-1])
+    assert e.value.code == "create_failed"
+    assert len(pack_dir_entries(w)) >= len(before)
+
+
+def test_a_tampered_mirror_config_stops_the_tree_fetch(w: World, monkeypatch) -> None:  # noqa: ANN001
+    rec = Recorder()
+    w = World(w.tmp, w.home, gateway=rec.gateway())
+    _, new = lagging(w)
+    m = refreshed(w)
+    monkeypatch.setattr(type(m), "ensure", lambda self, lease: None)  # would rewrite the config
+    with open(Path(m.path) / "config", "a") as f:
+        f.write("[core]\n\tfsmonitor = /bin/true\n")
+    rec.calls.clear()
+    with pytest.raises(WtctlError) as e:
+        run_transfer(w, m, new[-1])
+    assert e.value.code == "unsafe_repo_config"
+    assert not any("fetch" in c[0] for c in rec.calls)
+
+
+def test_a_fetch_that_succeeds_without_the_commit_is_fetch_failed(w: World) -> None:
+    late: list[str] = []
+
+    def fake_fetch(argv: list[str], kw: dict[str, object]) -> GitResult | None:
+        if late and "fetch" in argv and late[0] in argv:
+            return GitResult(0, b"", b"")
+        return None
+
+    rec = Recorder(replace=fake_fetch)
+    w = World(w.tmp, w.home, gateway=rec.gateway())
+    w.build(2)
+    m = refreshed(w)
+    late.append(w.commit("late"))
+    w.g(["push", "-q", "origin", "HEAD:main"])
+    with pytest.raises(WtctlError) as e:
+        run_transfer(w, m, late[0])
+    assert e.value.code == "fetch_failed" and late[0] in str(e.value)
+
+
+def test_an_empty_root_tree_list_is_refused(w: World) -> None:
+    def empty_trees(argv: list[str], kw: dict[str, object]) -> GitResult | None:
+        if "--no-commit-header" in argv:
+            open(str(kw["stdout_path"]), "xb").close()
+            return GitResult(0, b"", b"")
+        return None
+
+    rec = Recorder(replace=empty_trees)
+    w = World(w.tmp, w.home, gateway=rec.gateway())
+    _, new = lagging(w)
+    m = refreshed(w)
+    with pytest.raises(WtctlError) as e:
+        run_transfer(w, m, new[-1])
+    assert e.value.code == "create_failed"
+    assert not any("pack-objects" in c[0] for c in rec.calls)
+
+
+def test_a_failed_tree_fetch_that_slips_past_classification_is_still_a_failure(
+    w: World,
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    def failing_tree_fetch(argv: list[str], kw: dict[str, object]) -> GitResult | None:
+        if "fetch" in argv and "--stdin" in argv:
+            return GitResult(128, b"", b"fatal: injected failure\n")
+        return None
+
+    rec = Recorder(replace=failing_tree_fetch)
+    w = World(w.tmp, w.home, gateway=rec.gateway())
+    _, new = lagging(w)
+    m = refreshed(w)
+    monkeypatch.setattr(packs, "rejected_token_error", lambda auth, err: None)
+    before = pack_dir_entries(w)
+    with pytest.raises(WtctlError) as e:
+        run_transfer(w, m, new[-1])
+    assert e.value.code == "create_failed" and "did not succeed" in str(e.value)
+    assert pack_dir_entries(w) == before
+
+
+def test_missing_objects_lists_what_the_repository_lacks(w: World) -> None:
+    repo, shas = local_repo(w)
+    blob = (
+        plain_git(["rev-parse", f"{shas[2]}:f2.txt"], cwd=repo, home=w.home).stdout.decode().strip()
+    )
+    obj = repo / ".git/objects" / blob[:2] / blob[2:]
+    os.chmod(obj, 0o644)
+    obj.unlink()
+    git = Git(w.gateway, GIT, str(w.home))
+    p = w.tmp / "P3"
+    p.mkdir()
+    assert packs.missing_objects(git, str(repo / ".git"), shas[2], p=str(p), timeout=60) == [blob]
+    assert packs.missing_objects(git, str(repo / ".git"), shas[0], p=str(p), timeout=60) == []
+
+
+# -- round 1 review: install ----------------------------------
+
+
+def test_the_pack_is_linked_before_the_index(w: World, one_pack, monkeypatch) -> None:  # noqa: ANN001
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    order: list[str] = []
+    real = packs._link_new
+
+    def spy(dir_fd: int, tmp: str, final: str) -> bool:
+        order.append(final)
+        return real(dir_fd, tmp, final)
+
+    monkeypatch.setattr(packs, "_link_new", spy)
+    packs.install_pack(
+        common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
+    )
+    assert order == [f"pack-{name}.pack", f"pack-{name}.idx"]
+
+
+def test_a_failed_index_link_takes_back_the_pack(w: World, one_pack, monkeypatch) -> None:  # noqa: ANN001
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    real = packs._link_new
+
+    def flaky(dir_fd: int, tmp: str, final: str) -> bool:
+        if final.endswith(".idx"):
+            raise OSError("injected")
+        return real(dir_fd, tmp, final)
+
+    monkeypatch.setattr(packs, "_link_new", flaky)
+    with pytest.raises(WtctlError) as e:
+        packs.install_pack(
+            common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
+        )
+    assert e.value.code == "create_failed"
+    assert os.listdir(gd / "objects/pack") == []
+
+
+def test_a_file_on_another_mount_is_refused_before_it_is_written(w: World, one_pack) -> None:  # noqa: ANN001
+    class RegularFilesElsewhere(fsafe.Fs):
+        def adjust(self, st: fsafe.FdStat) -> fsafe.FdStat:
+            if stat.S_ISREG(st.mode):
+                return fsafe.FdStat(st.dev + 1, st.ino, st.mode, st.uid, st.nlink)
+            return st
+
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    with pytest.raises(WtctlError) as e:
+        packs.install_pack(
+            common_dir=str(gd), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name,
+            fs=RegularFilesElsewhere(),
+        )  # fmt: skip
+    assert e.value.code == "create_failed"
+    assert os.listdir(gd / "objects/pack") == []
+
+
+def test_a_source_that_changes_size_while_copied_is_refused(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, _, _ = one_pack
+    gd = empty_clone(w)
+    with packs.open_common_dir(str(gd), cid_of(gd)) as anchor:
+        dir_fd = fsafe.open_chain(anchor, anchor.fd, ["objects", "pack"])
+        try:
+            size = pack.stat().st_size
+            got = packs._copy_to_new_file(anchor, dir_fd, "ok", str(pack), expected_size=size)
+            assert got.st_size == size
+            with pytest.raises(OSError):
+                packs._copy_to_new_file(anchor, dir_fd, "bad", str(pack), expected_size=size + 1)
+        finally:
+            os.close(dir_fd)
+
+
+def test_the_common_dir_is_reached_through_its_realpath(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    link = w.tmp / "link.git"
+    link.symlink_to(gd)
+    packs.open_common_dir(str(link), cid_of(gd)).close()
+    got = packs.install_pack(
+        common_dir=str(link), common_id=cid_of(gd), pack=str(pack), idx=str(idx), name=name
+    )
+    assert got.pack_new
+
+
+def test_anchor_changed_details_escape_a_newline_and_validate_against_the_schema(
+    w: World,
+    one_pack,  # noqa: ANN001
+) -> None:
+    pack, idx, name = one_pack
+    gd = w.tmp / "bare\nrepo.git"
+    plain_git(["init", "-q", "--bare", str(gd)], cwd=w.tmp, home=w.home)
+    wrong = fsafe.Identity(1, 2)
+    with pytest.raises(WtctlError) as e:
+        packs.install_pack(
+            common_dir=str(gd), common_id=wrong, pack=str(pack), idx=str(idx), name=name
+        )
+    (entry,) = e.value.fields["details"]["anchors"]
+    assert "\n" not in entry["path"] and "\\x0a" in entry["path"]
+    check_anchor_change(entry)
+
+
+def check_anchor_change(entry: dict[str, object]) -> None:
+    defs_id = json.loads((SCHEMAS / "defs.json").read_text())["$id"]
+    schema = {"$ref": f"{defs_id}#/$defs/anchor_change"}
+    Draft202012Validator(schema, registry=_registry()).validate(entry)
+
+
+def test_anchor_changed_when_the_anchor_cannot_be_reopened_names_another_current(
+    w: World,
+    one_pack,  # noqa: ANN001
+) -> None:
+    pack, idx, name = one_pack
+    gd = empty_clone(w)
+    cid = cid_of(gd)
+    shutil.rmtree(gd)
+    with pytest.raises(WtctlError) as e:
+        packs.install_pack(
+            common_dir=str(gd), common_id=cid, pack=str(pack), idx=str(idx), name=name
+        )
+    (entry,) = e.value.fields["details"]["anchors"]
+    assert entry["changed"] is True
+    assert entry["current"] != entry["recorded"]
+    check_anchor_change(entry)
+
+
+# -- round 1 review: helpers and index checks ----------------------------------
+
+
+def test_checked_refuses_a_timeout_and_an_output_limit() -> None:
+    with pytest.raises(WtctlError, match="timed out"):
+        packs._checked(GitResult(-9, b"", b"", timed_out=True), "git x")
+    with pytest.raises(WtctlError, match="more output"):
+        packs._checked(GitResult(0, b"", b"", output_limit=True), "git x")
+    with pytest.raises(WtctlError, match="exit 3"):
+        packs._checked(GitResult(3, b"", b"boom\n"), "git x")
+
+
+def test_an_object_list_with_a_line_that_is_not_an_id_is_refused(tmp_path: Path) -> None:
+    good, bad = tmp_path / "good", tmp_path / "bad"
+    good.write_text(("a" * 40 + "\n") * 3)
+    assert packs._sha_lines(str(good), what="git x") == 3
+    for line in ("A" * 40, "a" * 39, "a" * 40 + " name", "", "zz"):
+        bad.write_text(("a" * 40 + "\n") + line + "\n")
+        with pytest.raises(WtctlError):
+            packs._sha_lines(str(bad), what="git x")
+    with pytest.raises(WtctlError):
+        packs._sha_lines(str(good), what="git x", limit=2)
+
+
+def test_a_pack_without_a_version_2_header_is_refused(w: World, one_pack, monkeypatch) -> None:  # noqa: ANN001
+    pack, _, _ = one_pack
+    monkeypatch.setattr(packs, "PACK_HEADER", b"PACK\x00\x00\x00\x03")
+    with pytest.raises(WtctlError):
+        idx_of(w, pack)
+
+
+def test_an_index_without_a_version_2_header_is_refused(w: World, one_pack, monkeypatch) -> None:  # noqa: ANN001
+    pack, _, _ = one_pack
+    monkeypatch.setattr(packs, "IDX_HEADER", b"\xfftOc\x00\x00\x00\x03")
+    with pytest.raises(WtctlError):
+        idx_of(w, pack)
+
+
+def indexing_with(w: World, rec: Recorder, pack: Path) -> str:
+    git = Git(Gateway(git_runner=rec), GIT, str(w.home))
+    p = w.tmp / "P4"
+    p.mkdir(exist_ok=True)
+    return packs.index_pack(git, str(pack), str(p / "z.idx"), p=str(p), timeout=60)
+
+
+def test_an_index_pack_name_that_is_not_the_trailer_is_refused(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, _, name = one_pack
+
+    def other_name(argv: list[str], kw: dict[str, object], r: GitResult) -> GitResult:
+        return GitResult(r.returncode, b"a" * 40 + b"\n", r.stderr)
+
+    assert indexing_with(w, Recorder(), pack) == name
+    with pytest.raises(WtctlError):
+        indexing_with(w, Recorder(after=other_name), pack)
+
+
+def test_an_index_that_names_another_pack_is_refused(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, _, _ = one_pack
+
+    def corrupt_idx(argv: list[str], kw: dict[str, object], r: GitResult) -> GitResult:
+        idx = argv[argv.index("-o") + 1]
+        os.chmod(idx, 0o644)
+        with open(idx, "r+b") as f:
+            f.seek(-40, os.SEEK_END)
+            first = f.read(1)
+            f.seek(-40, os.SEEK_END)
+            f.write(bytes([first[0] ^ 1]))
+        return r
+
+    with pytest.raises(WtctlError):
+        indexing_with(w, Recorder(after=corrupt_idx), pack)
+
+
+# -- round 1 review: local throwaway ----------------------------------
+
+
+def test_local_depth_one_has_no_older_objects(w: World) -> None:
+    repo, shas = local_repo(w)
+    t = fill(w, repo, shas[2], depth=1)
+    for older in (shas[0], shas[1]):
+        r = plain_git(["--git-dir", str(t / ".git"), "cat-file", "-e", older], cwd=t, home=w.home)
+        assert r.returncode != 0
+
+
+def test_local_full_history_of_a_shallow_source_is_refused_early(w: World) -> None:
+    repo, shas = local_repo(w)
+    shallow = w.tmp / "shallow"
+    r = plain_git(
+        ["clone", "-q", "--depth=2", f"file://{repo}", str(shallow)], cwd=w.tmp, home=w.home
+    )
+    assert r.returncode == 0, r.stderr
+    tip = plain_git(["rev-parse", "HEAD"], cwd=shallow, home=w.home).stdout.decode().strip()
+    rec = Recorder()
+    w2 = World(w.tmp, w.home, gateway=rec.gateway())
+    git = Git(w2.gateway, GIT, str(w.home))
+    with pytest.raises(WtctlError, match="shallow") as e:
+        packs.fill_local_throwaway(
+            git, w.cfg, clone_dir=str(shallow / ".git"), throwaway=str(thrown(w)), sha=tip
+        )
+    assert e.value.code == "create_failed"
+    assert not any("pack-objects" in c[0] for c in rec.calls) and not thrown(w).exists()
+    packs.fill_local_throwaway(
+        git, w.cfg, clone_dir=str(shallow / ".git"), throwaway=str(thrown(w)), sha=tip, depth=1
+    )
+    assert (thrown(w) / ".git/shallow").read_text() == tip + "\n"
+
+
+def test_local_pack_over_the_limit_is_refused(w: World) -> None:
+    repo, shas = local_repo(w)
+    with pytest.raises(WtctlError) as e:
+        fill(w, repo, shas[2], max_pack_bytes=100)
+    assert e.value.code == "create_failed"
+    assert not thrown(w).exists() and tmp_entries() == []
+
+
+def test_local_unknown_commit_runs_nothing_against_the_clone_but_the_probe(w: World) -> None:
+    repo, _ = local_repo(w)
+    rec = Recorder()
+    w2 = World(w.tmp, w.home, gateway=rec.gateway())
+    with pytest.raises(WtctlError) as e:
+        fill(w2, repo, "1" * 40)
+    assert e.value.code == "create_failed" and "1" * 40 in str(e.value)
+    assert not any("rev-list" in c[0] or "pack-objects" in c[0] for c in rec.calls)
+
+
+def test_local_head_that_is_not_the_requested_commit_is_refused(w: World) -> None:
+    def wrong_head(argv: list[str], kw: dict[str, object]) -> GitResult | None:
+        if "rev-parse" in argv:
+            return GitResult(0, b"1" * 40 + b"\n", b"")
+        return None
+
+    repo, shas = local_repo(w)
+    w2 = World(w.tmp, w.home, gateway=Recorder(replace=wrong_head).gateway())
+    with pytest.raises(WtctlError) as e:
+        fill(w2, repo, shas[2])
+    assert e.value.code == "create_failed"
+
+
+@pytest.mark.parametrize("honor", [False, True])
+def test_local_read_tree_honors_filters_only_when_asked(w: World, honor: bool) -> None:
+    repo, shas = local_repo(w)
+    rec = Recorder()
+    gw = Gateway(git_runner=rec)
+    git = Git(gw, GIT, str(w.home), packs_filters())
+    packs.fill_local_throwaway(
+        git, w.cfg, clone_dir=str(repo / ".git"), throwaway=str(thrown(w)), sha=shas[2],
+        honor_filters=honor,
+    )  # fmt: skip
+    ((_, env, _),) = [c for c in rec.calls if "read-tree" in c[0]]
+    assert (FILTER_DIR in env["PATH"].split(os.pathsep)) is honor
+
+
+FILTER_DIR = "/opt/wtctl-test-filter-bin"
+
+
+def packs_filters():  # noqa: ANN201
+    from wtctl.hardgit import FilterPolicy
+
+    return FilterPolicy(path_dirs=(FILTER_DIR,))
 
 
 # -- misc ----------------------------------

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 
 from tests.mirrorlib import World
@@ -70,19 +71,30 @@ def tmp_entries() -> list[str]:
 class Recorder:
     """A git runner that records every argv and can fail chosen commands."""
 
-    def __init__(self, fail: str | None = None, env_override: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        fail: str | None = None,
+        env_override: dict[str, str] | None = None,
+        replace: Callable[[list[str], dict[str, object]], GitResult | None] | None = None,
+        after: Callable[[list[str], dict[str, object], GitResult], GitResult] | None = None,
+    ) -> None:
         self.calls: list[tuple[list[str], dict[str, str], str]] = []
         self.fail = fail
         self.env_override = env_override or {}
+        self.replace = replace  # returns a result instead of running git, or None
+        self.after = after  # may change the result of a git run
 
     def __call__(self, argv: list[str], **kw: object) -> GitResult:
         env: dict[str, str] = dict(kw["env"])  # type: ignore[call-overload]  # noqa: E501
         self.calls.append((list(argv), env, str(kw["cwd"])))
         if self.fail is not None and self.fail in argv:
             return GitResult(128, b"", b"fatal: injected failure\n")
+        if self.replace is not None and (fake := self.replace(argv, kw)) is not None:
+            return fake
         env.update(self.env_override)
         kw["env"] = env
-        return run_git(argv, **kw)  # type: ignore[arg-type]
+        result = run_git(argv, **kw)  # type: ignore[arg-type]
+        return result if self.after is None else self.after(argv, kw, result)
 
     def gateway(self) -> Gateway:
         return Gateway(git_runner=self)

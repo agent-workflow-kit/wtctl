@@ -300,3 +300,31 @@ def test_run_with_deadline_kills_the_child_when_on_start_raises(
     p = procs[0]
     assert p.stdin is not None and p.stdout is not None and p.stderr is not None
     assert p.stdin.closed and p.stdout.closed and p.stderr.closed
+
+
+def test_run_git_delivers_all_stdin_to_a_child_that_reads_late(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    start = time.monotonic()
+    r = gateway.run_git(
+        ["sh", "-c", "sleep 0.5; wc -c"],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+        stdin=b"x" * 5_000_000,
+        stdout_path=str(out),
+        max_stdout_bytes=10**9,
+        timeout=10,
+    )
+    assert not r.timed_out and r.returncode == 0
+    assert out.read_text().strip() == "5000000"
+    assert time.monotonic() - start < 5
+
+
+def test_run_git_stdin_of_a_child_that_reads_late_without_an_output_file(tmp_path: Path) -> None:
+    r = gateway.run_git(
+        ["sh", "-c", "sleep 0.3; wc -c"],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+        stdin=b"y" * 1_000_000,
+        timeout=10,
+    )
+    assert r.returncode == 0 and r.stdout.strip() == b"1000000"

@@ -17,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -107,6 +108,16 @@ def _open_input(path: str) -> int:
     return fd
 
 
+def _feed(fd: int, data: bytes) -> None:
+    """Write ``data`` to a child's stdin pipe and close it (a child that exits early or is
+    killed just ends the write)."""
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
+
+
 def run_git(
     argv: list[str],
     *,
@@ -134,36 +145,39 @@ def run_git(
         raise ValueError("stdin and stdin_path are exclusive")
     if max_stdout_bytes is not None and stdout_path is None:
         raise ValueError("max_stdout_bytes needs stdout_path")
-    in_fd = out_fd = -1
+    in_fd = out_fd = in_wfd = -1
     try:
         if stdin_path is not None:
             in_fd = _open_input(stdin_path)
+        elif stdin is not None:
+            # fed by a writer thread (below) so that the input is delivered whole and the pipe
+            # closed however the polling loop runs
+            in_fd, in_wfd = os.pipe()
         if stdout_path is not None:
             out_fd = _open_output(stdout_path)
         proc = subprocess.Popen(
             argv,
             env=dict(env),
             cwd=cwd,
-            stdin=in_fd
-            if in_fd >= 0
-            else (subprocess.PIPE if stdin is not None else subprocess.DEVNULL),
+            stdin=in_fd if in_fd >= 0 else subprocess.DEVNULL,
             stdout=out_fd if out_fd >= 0 else subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
     except BaseException:
-        for fd in (in_fd, out_fd):
+        for fd in (in_fd, in_wfd, out_fd):
             if fd >= 0:
                 os.close(fd)
         raise
     # The child has its own copies; the parent keeps out_fd only to measure the output.
     if in_fd >= 0:
         os.close(in_fd)
+    if in_wfd >= 0 and stdin is not None:
+        threading.Thread(target=_feed, args=(in_wfd, stdin), daemon=True).start()
     pgid = proc.pid
     deadline = None if timeout is None else time.monotonic() + timeout
     over = False
     try:
-        pending = stdin
         while True:
             if max_stdout_bytes is None:
                 step = None if deadline is None else max(deadline - time.monotonic(), 0.0)
@@ -172,10 +186,9 @@ def run_git(
                 if deadline is not None:
                     step = min(step, max(deadline - time.monotonic(), 0.0))
             try:
-                out, err = proc.communicate(pending, timeout=step)
+                out, err = proc.communicate(timeout=step)
                 break
             except subprocess.TimeoutExpired:
-                pending = None
                 if max_stdout_bytes is not None and os.fstat(out_fd).st_size > max_stdout_bytes:
                     over = True
                     raise

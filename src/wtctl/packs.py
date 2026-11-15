@@ -56,6 +56,7 @@ MAX_LIST_BYTES = 1024**3
 # How many of the clone's ref tips bound the range. The list is untrusted and only shrinks the
 # pack, so a clone with more refs than this just gets a larger pack.
 MAX_PRESENT_TIPS = 1000
+MAX_TIPS_BYTES = 64 * 1024**2
 COPY_CHUNK = 1024 * 1024
 PACK_HEADER = b"PACK\x00\x00\x00\x02"
 IDX_HEADER = b"\xfftOc\x00\x00\x00\x02"
@@ -150,11 +151,14 @@ def _anchor_changed(
     path: str, recorded: fsafe.Identity, exc: fsafe.FsafeError, fs: fsafe.Fs | None
 ) -> WtctlError:
     """``create_failed`` with ``cause: anchor_changed`` and the anchor table of the schema."""
+    # ``current`` is an identity that cannot be the recorded one until the anchor is re-opened:
+    # inode 0 is never a real directory, so ``changed: true`` always has current != recorded.
+    unknown = "0:0" if (recorded.dev, recorded.ino) != (0, 0) else "0:1"
     entry = {
         "anchor": "common_dir",
-        "path": path,
+        "path": fsafe.escape_for_details(path),
         "recorded": f"{recorded.dev}:{recorded.ino}",
-        "current": f"{recorded.dev}:{recorded.ino}",
+        "current": unknown,
         "changed": True,
         "fs_type": "unknown",
         "mount_source": "",
@@ -168,7 +172,7 @@ def _anchor_changed(
             if desc is not None:
                 entry["fs_type"] = desc.fstype or "unknown"
                 entry["mount_source"] = desc.source
-                entry["mount_point"] = desc.mount_point
+                entry["mount_point"] = fsafe.escape_for_details(desc.mount_point)
     return _fail(
         f"the clone's common git dir is not what was recorded ({exc.message}); "
         "nothing was written to the clone",
@@ -234,6 +238,28 @@ def _link_new(dir_fd: int, tmp: str, final: str) -> bool:
     return True
 
 
+def _size_and_trailer(dir_fd: int, name: str) -> tuple[int, bytes]:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size < 20:
+            return st.st_size, b""
+        return st.st_size, os.pread(fd, 20, st.st_size - 20)
+    finally:
+        os.close(fd)
+
+
+def _require_same(dir_fd: int, final: str, tmp: str) -> None:
+    """A file already installed under ``final`` (a concurrent install, or a planted file) must be
+    the one we hold: same size and same trailing checksum, else ``create_failed``."""
+    try:
+        same = _size_and_trailer(dir_fd, final) == _size_and_trailer(dir_fd, tmp)
+    except OSError:
+        same = False
+    if not same:
+        raise _fail(f"{final} exists in the clone's objects/pack and is not the file to install")
+
+
 def install_pack(
     *,
     common_dir: str,
@@ -294,7 +320,11 @@ def _install_into(anchor: fsafe.Anchor, dir_fd: int, pack: str, idx: str, name: 
         pack_new = _link_new(dir_fd, tmp_pack, final_pack)
         if pack_new:
             linked_pack = final_pack
+        else:
+            _require_same(dir_fd, final_pack, tmp_pack)
         idx_new = _link_new(dir_fd, tmp_idx, final_idx)
+        if not idx_new:
+            _require_same(dir_fd, final_idx, tmp_idx)
         linked_pack = None  # complete (or the index was there already)
         with contextlib.suppress(OSError):
             os.fsync(dir_fd)
@@ -368,19 +398,32 @@ class Transfer:
     present_tips: int = 0  # clone tips that bounded the range
 
 
-def _present_tips(mirror: Mirror) -> list[str]:
-    """The clone's ref tips that the mirror has as commits (untrusted: only shrinks the pack)."""
+def _present_tips(mirror: Mirror, p: str) -> list[str]:
+    """The clone's ref tips that the mirror has as commits (untrusted: only shrinks the pack).
+
+    Only branches, remote-tracking branches and tags are listed, newest commit first. The cap is
+    applied after the refs that do not name a commit are dropped, so a flood of junk refs cannot
+    push the real tips out.
+    """
     git, clone = mirror.git, mirror.common_dir
-    r = _checked(
-        git.run(
-            ["for-each-ref", f"--count={MAX_PRESENT_TIPS * 2}", "--format=%(objectname)"],
-            git_dir=clone,
-            cwd=clone,
-            timeout=120,
-        ),
-        "git for-each-ref in the clone",
-    )
-    wanted = list(dict.fromkeys(ln for ln in r.out.split("\n") if _SHA.fullmatch(ln)))
+    out = os.path.join(p, "tips")
+    r = git.run(
+        ["for-each-ref", "--sort=-committerdate", "--format=%(objectname) %(objecttype)",
+         "refs/heads", "refs/remotes", "refs/tags"],
+        git_dir=clone, cwd=clone, stdout_path=out, max_stdout_bytes=MAX_TIPS_BYTES, timeout=120,
+    )  # fmt: skip
+    if r.timed_out or (r.returncode != 0 and not r.output_limit):
+        raise _fail("git for-each-ref in the clone failed")
+    # past the byte limit the file holds the newest refs (sorted before printing); its last line
+    # may be cut and then fails the object-id test below
+    wanted: dict[str, None] = {}
+    with open(out, "rb") as f:
+        for raw in f:
+            sha, _, kind = raw.decode("ascii", "replace").rstrip("\n").partition(" ")
+            if kind == "commit" and _SHA.fullmatch(sha):
+                wanted[sha] = None
+                if len(wanted) >= MAX_PRESENT_TIPS * 2:
+                    break
     if not wanted:
         return []
     c = _checked(
@@ -428,7 +471,8 @@ class _Network:
         err = rejected_token_error(auth, outcome_error(outcome, result))
         if err is not None:
             raise err
-        assert classify_fetch(result).ok
+        if not classify_fetch(result).ok:  # outcome_error above already covers this
+            raise _fail("git fetch into the mirror did not succeed")
 
 
 def _mirror_has_commit(mirror: Mirror, sha: str) -> bool:
@@ -479,7 +523,7 @@ def transfer_base(
             net.fetch(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", "origin", start])
             if not _mirror_has_commit(mirror, start):
                 raise WtctlError("fetch_failed", f"the remote did not supply commit {start}")
-        present = _present_tips(mirror)
+        present = _present_tips(mirror, p)
 
         # 2. the commits and the root trees needed (rev-list, never log: no tree is read)
         need = os.path.join(p, "need")
@@ -554,6 +598,18 @@ def transfer_base(
 # --------------------------------------------------------------------------------------------
 
 
+def _is_shallow(git_dir: str) -> bool:
+    try:
+        return os.stat(os.path.join(git_dir, "shallow")).st_size > 0
+    except OSError:
+        return False
+
+
+# todo(#21): fill_local_throwaway initializes the throwaway itself (_init_fresh), while
+# interface.md "Throwaway create order" step 7 has the caller create and init it (template,
+# info/attributes `* -filter`, core.logAllRefUpdates=false, none of which is written here) before
+# the fill. #21 reconciles the ownership, and anchors the throwaway directory's identity between
+# the init and the read-tree (TOCTOU: a same-user symlink swap of the directory).
 def fill_local_throwaway(
     git: Git,
     cfg: Config,
@@ -584,6 +640,11 @@ def fill_local_throwaway(
     timeout = _local_timeout(cfg)
     if not clone_has_commit(git, clone_dir, sha):
         raise _fail(f"the clone does not hold commit {sha}")
+    if depth == 0 and _is_shallow(clone_dir):
+        raise _fail(
+            "source repository is shallow: its full history cannot be copied "
+            "(use depth 1 or another source)"
+        )
     with private_dir() as p:
         listing = os.path.join(p, "list")
         walk = ["rev-list", "--objects", *(["--no-walk"] if depth == 1 else []), sha]
