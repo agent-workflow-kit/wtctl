@@ -186,3 +186,39 @@ def test_a_planted_hook_and_config_in_the_worktree_stay_inert(r: Repo, tmp_path:
     r.write(".gitattributes", "* filter=x\n")
     out, _ = go(r, "open('a.txt','w').write('a')")
     assert out.state == "ok" and not marker.exists()
+
+
+def test_lease_renewal_hook_is_passed_to_the_step_runner(r: Repo) -> None:
+    ticks: list[int] = []
+    seen: dict = {}
+
+    def fake(argv, **kw):  # noqa: ANN001, ANN202
+        seen.update(kw)
+        kw["on_tick"]()
+        from wtctl.gateway import StepResult
+
+        return StepResult(0, stdout=b"", pid=1, pgid=1)
+
+    cfg = NS(hosts={}, mask_env=[], remove=NS(nested_scan_limit=1000))
+    st = NS(
+        bootstrap=NS(steps=[NS(argv=["x"], sh=False, timeout=5)], pass_env=[], env={}),
+        copy_env=[],
+    )
+    rec = {"id": "wt-aaaaaaaa", "path": str(r.wt), "admin_dir": r.admin_dir, "dir_id": r.dir_id,
+           "clone_path": str(r.main), "repo": "o/r"}  # fmt: skip
+    b.run_bootstrap(git=r.git, config=cfg, settings=st, record=rec, copy_env=False,
+                    run_the_steps=True, rerun=False, warn=lambda m: None, runner=fake,
+                    on_tick=lambda: ticks.append(1), environ={"PATH": "/usr/bin"})  # fmt: skip
+    assert ticks == [1]
+
+
+@pytest.mark.parametrize("failing", [0, 1])
+def test_a_failure_at_any_step_keeps_the_worktree_and_what_was_made(r: Repo, failing: int) -> None:
+    steps = [
+        NS(argv=[sys.executable, "-c", f"open('s{i}','w'); raise SystemExit({int(i == failing)})"],
+           sh=False, timeout=30)
+        for i in range(2)
+    ]  # fmt: skip
+    out, _ = go(r, steps=steps)
+    assert (out.state == "failed") and len(out.steps) == failing + 1
+    assert r.wt.is_dir() and set(paths(out)) == {f"s{i}" for i in range(failing + 1)}

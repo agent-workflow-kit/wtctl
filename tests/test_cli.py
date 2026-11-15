@@ -208,7 +208,8 @@ def test_human_only_commands_exit_13_without_human_actor(
         assert obj["error"]["code"] == "confirmation_required"
 
 
-@pytest.mark.parametrize("argv", HUMAN_ONLY_COMMANDS)
+# `bootstrap` is implemented (issue #16): tests/test_bootstrap_cmd.py covers its handler.
+@pytest.mark.parametrize("argv", [c for c in HUMAN_ONLY_COMMANDS if c[0] != "bootstrap"])
 @pytest.mark.parametrize(
     ("extra", "tty"), [(["--actor", "human:bob"], False), ([], True)], ids=["flag", "tty"]
 )

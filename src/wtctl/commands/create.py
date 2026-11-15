@@ -971,7 +971,7 @@ class Creator:
                 f"bootstrap step {n} failed; the worktree {active['path']} was kept",
                 details={"record": out, "step": outcome.failed_step},
             )
-            err.stdout_text = active["path"]  # type: ignore[attr-defined]
+            err.stdout_text = active["path"]
             raise err
         return result
 

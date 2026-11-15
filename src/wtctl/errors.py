@@ -186,6 +186,9 @@ class WtctlError(Exception):
         self.code = code
         self.message = message
         self.fields = fields
+        # Text for stdout in human mode when the command still has output (create's path after
+        # bootstrap_failed); never part of the error object.
+        self.stdout_text = ""
 
     @property
     def exit_code(self) -> int:

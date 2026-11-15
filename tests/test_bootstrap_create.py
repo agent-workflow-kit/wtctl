@@ -155,7 +155,7 @@ def test_no_bootstrap_and_auto_false_run_nothing(w: CW, capsys) -> None:  # noqa
     w.repo_cfg["bootstrap"] = {"steps": [pystep(f"open({str(marker)!r},'w')")]}
     data = ok(w.create(capsys, "--no-bootstrap"))
     assert data["bootstrap"]["state"] == "none" and not marker.exists()
-    w.repo_cfg["bootstrap"]["auto"] = False
+    w.repo_cfg["bootstrap"] = {**w.repo_cfg["bootstrap"], "auto": False}
     data = ok(w.create(capsys))
     assert data["bootstrap"]["state"] == "none" and not marker.exists()
 

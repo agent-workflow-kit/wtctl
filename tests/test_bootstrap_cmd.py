@@ -59,7 +59,8 @@ def set_row(w: CW, rid: str, **cols: object) -> None:
 
 
 def test_a_rerun_records_new_ignored_entries_and_copied_env_not_other_untracked(
-    w: CW, capsys  # noqa: ANN001
+    w: CW,
+    capsys,  # noqa: ANN001
 ) -> None:
     (w.work / ".gitignore").write_text("node_modules/\n.env\n")
     w.g(["add", ".gitignore"], w.work)
@@ -158,7 +159,8 @@ def test_a_symlink_swapped_in_for_the_worktree_is_refused(w: CW, capsys) -> None
 
 
 def test_a_failing_rerun_exits_12_keeps_the_record_active_and_the_old_sets(
-    w: CW, capsys  # noqa: ANN001
+    w: CW,
+    capsys,  # noqa: ANN001
 ) -> None:
     rec = made(w, capsys)
     w.repo_cfg["bootstrap"] = {"steps": [pystep("open('a','w')")]}
@@ -207,7 +209,8 @@ def test_bootstrap_auto_false_does_not_block_a_rerun(w: CW, capsys) -> None:  # 
 def test_a_rerun_without_steps_says_so(w: CW, capsys) -> None:  # noqa: ANN001
     rec = made(w, capsys)
     data = good(rerun(w, capsys, rec["id"]))
-    assert data["bootstrap"]["steps"] == [] and any("no bootstrap steps" in m for m in data["warnings"])
+    assert data["bootstrap"]["steps"] == []
+    assert any("no bootstrap steps" in m for m in data["warnings"])
 
 
 def test_tracked_changes_are_reported(w: CW, capsys) -> None:  # noqa: ANN001
