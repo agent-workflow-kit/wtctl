@@ -499,13 +499,11 @@ def test_planted_clone_config_and_hooks_are_inert(
         ("remote.origin.receivepack", cmd),
         ("remote.origin.vcs", "evil"),
         ("alias.rev-parse", f"!{cmd}"),
-        ("include.path", str(clone / "inc")),
         ("filter.x.smudge", cmd),
         ("diff.external", cmd),
         ("extensions.worktreeConfig", "true"),
     ]:
         g(["config", key, value], clone, w.home)
-    (clone / "inc").write_text(f"[core]\n\tfsmonitor = {cmd}\n")
     for hook in ("pre-commit", "post-checkout", "reference-transaction", "fsmonitor-watchman"):
         p = clone / ".git" / "hooks" / hook
         p.parent.mkdir(exist_ok=True)
@@ -517,6 +515,18 @@ def test_planted_clone_config_and_hooks_are_inert(
     w.top["search_roots"] = [str(w.tmp / "search")]
     r = w.cli(capsys, "locate", REPO)
     assert r.code == 0, r.out
+    assert not marker.exists()
+
+
+def test_a_configured_clones_included_config_is_inert(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine")
+    marker = w.tmp / "pwned"
+    (clone / "inc").write_text(f"[core]\n\tfsmonitor = touch {marker}\n")
+    g(["config", "include.path", str(clone / "inc")], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    assert w.cli(capsys, "locate", REPO).code == 0
     assert not marker.exists()
 
 
@@ -1246,16 +1256,77 @@ def test_the_deadline_is_checked_between_children_and_before_each_candidate(w: W
     assert budget.truncated and len(found) < 3
 
 
-def test_discovery_does_not_hang_on_an_include_of_a_fifo(
-    w: World, capsys: pytest.CaptureFixture[str]
-) -> None:
+def _discover_hostile(w: World, capsys: pytest.CaptureFixture[str], extra: bytes) -> int:
+    """Append raw bytes to a discovery candidate's config and locate it; an alarm turns a hang
+    (git blocking on a FIFO) into a failure."""
+    import signal
+
     clone = w.stub(w.tmp / "search" / "repo")
+    with open(clone / ".git" / "config", "ab") as fh:
+        fh.write(extra)
+    w.top["search_roots"] = [str(w.tmp / "search")]
+
+    def on_alarm(signum: int, frame: object) -> None:
+        raise AssertionError("discovery hung")
+
+    old = signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(20)
+    try:
+        return w.cli(capsys, "locate", REPO).code
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_discovery_skips_an_include_of_a_fifo(w: World, capsys: pytest.CaptureFixture[str]) -> None:
     fifo = w.tmp / "fifo"
     os.mkfifo(fifo)
-    g(["config", "include.path", str(fifo)], clone, w.home)
-    w.top["search_roots"] = [str(w.tmp / "search")]
-    r = w.cli(capsys, "locate", REPO)  # would block until git's config timeout without the guard
-    assert r.code == 10
+    assert _discover_hostile(w, capsys, f"[include]\n\tpath = {fifo}\n".encode()) == 10
+
+
+def test_discovery_skips_a_multiline_quoted_value_hiding_a_fifo_include(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fifo = w.tmp / "fifo"
+    os.mkfifo(fifo)
+    text = f'[include]\n foo = "bar \\\n[core]"\n path = {fifo}\n'
+    assert _discover_hostile(w, capsys, text.encode()) == 10
+
+
+@pytest.mark.parametrize(
+    "included",
+    [
+        '[remote "origin"]\n\tpushurl = https://evil.test/org/repo.git\n',
+        '[url "https://evil.test/"]\n\tinsteadOf = https://example.test/\n',
+    ],
+)
+def test_discovery_skips_an_included_file_hiding_a_redirect(
+    w: World, capsys: pytest.CaptureFixture[str], included: str
+) -> None:
+    (w.tmp / "inc").write_text(included)
+    assert _discover_hostile(w, capsys, f"[include]\n\tpath = {w.tmp / 'inc'}\n".encode()) == 10
+
+
+def test_discovery_skips_a_mixed_case_includeif(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _discover_hostile(w, capsys, b'[IncludeIf "gitdir:/"]\n\tpath = nowhere\n') == 10
+
+
+def test_discovery_skips_a_config_with_a_nul_byte(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _discover_hostile(w, capsys, b"[core]\n\tx = a\x00b\n") == 10
+
+
+def test_a_configured_clone_still_honors_an_include(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine")
+    (w.tmp / "inc").write_text("[core]\n\tbare = false\n")
+    g(["config", "include.path", str(w.tmp / "inc")], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    assert w.cli(capsys, "locate", REPO).code == 0
 
 
 def test_a_password_url_never_reaches_a_git_argv(

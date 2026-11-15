@@ -20,7 +20,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
-import re
 import secrets
 import shutil
 import stat
@@ -184,10 +183,7 @@ def _lstat_gitdir(gitdir: str) -> os.stat_result:
     return st
 
 
-_SECTION_LINE = re.compile(r"^\s*\[\s*([A-Za-z0-9.-]+)[^\]]*\](.*)$")
-_PATH_LINE = re.compile(r"^\s*path\s*=\s*([^\s\"\\;#][^\"\\;#]*?)\s*$", re.IGNORECASE)
 MAX_CLONE_CONFIG = 1 << 20
-MAX_INCLUDE_DEPTH = 10
 
 
 def _lstat_at(fd: int, name: str) -> os.stat_result | None:
@@ -200,16 +196,16 @@ def _lstat_at(fd: int, name: str) -> os.stat_result | None:
         raise NotAClone(f"cannot examine .git/{name}: {exc.strerror}") from exc
 
 
-def _check_layout(fd: int, gitdir: str, *, allow_includes: bool) -> None:
+def _check_layout(fd: int, *, allow_includes: bool) -> None:
     """Refuse a ``.git`` that borrows state from elsewhere or can hang a config read.
 
     Every check is a no-follow ``lstat`` below the opened ``.git`` directory: a ``commondir``
     file (a planted ``.git`` pointing at another repository's config and objects), a ``config``
     or ``HEAD`` that is not a regular file, ``objects`` or ``refs`` that are not real
     directories, and ``objects/info/alternates``. With ``allow_includes`` false (discovery,
-    where the candidate is somebody else's directory) a config with an ``[include]`` or
-    ``[includeIf]`` section is refused too, since git would open the included path (a FIFO
-    blocks until the config read times out).
+    where the candidate is somebody else's directory) a config whose text mentions ``include``
+    is refused too, since git would open the included path (a FIFO blocks until the config
+    read times out).
     """
     if _lstat_at(fd, "commondir") is not None:
         raise NotAClone(".git has a commondir file; only a self-contained clone is used")
@@ -228,67 +224,35 @@ def _check_layout(fd: int, gitdir: str, *, allow_includes: bool) -> None:
         if _lstat_at(fd, "objects/info/alternates") is not None:
             raise NotAClone(".git/objects/info/alternates exists; the clone borrows objects")
     if not allow_includes:
-        _check_includes_safe(fd, gitdir)
+        _check_includes_safe(fd)
 
 
-def _read_regular(path: str | None, *, fd: int | None = None, name: str = "") -> bytes:
-    """The bytes of a regular file (at most ``MAX_CLONE_CONFIG``), opened without blocking."""
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+def _read_config(fd: int) -> bytes:
+    """The bytes of ``.git/config`` (at most ``MAX_CLONE_CONFIG``), opened without blocking."""
     try:
-        if path is None:
-            rfd = os.open(name, flags, dir_fd=fd)
-        else:  # an included file may be a symlink: git follows it
-            rfd = os.open(path, flags & ~os.O_NOFOLLOW)
+        rfd = os.open("config", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     except OSError as exc:
-        raise NotAClone(f"cannot read a config file: {exc.strerror}") from exc
+        raise NotAClone(f"cannot read .git/config: {exc.strerror}") from exc
     try:
         if not stat.S_ISREG(os.fstat(rfd).st_mode):
-            raise NotAClone("a config file is not a regular file")
+            raise NotAClone(".git/config is not a regular file")
         data = os.read(rfd, MAX_CLONE_CONFIG + 1)
     finally:
         os.close(rfd)
     if len(data) > MAX_CLONE_CONFIG:
-        raise NotAClone("a config file is too large")
+        raise NotAClone(".git/config is too large")
     return data
 
 
-def _check_includes_safe(fd: int, gitdir: str) -> None:
-    """For a discovered candidate: every file its config includes (transitively) is absent or a
-    regular file, so reading the config cannot block on a FIFO or device. Any include syntax this
-    cannot read with certainty (quoting, escapes, ``~``) refuses the candidate."""
-    seen = 0
-    pending = [(_read_regular(None, fd=fd, name="config"), gitdir, 0)]  # (data, base dir, depth)
-    while pending:
-        data, base, depth = pending.pop()
-        section = ""
-        for raw_line in data.decode("utf-8", "replace").splitlines():
-            line = raw_line
-            m = _SECTION_LINE.match(line)
-            if m:
-                section, line = m.group(1).lower(), m.group(2)
-            if section not in ("include", "includeif"):
-                continue
-            pm = _PATH_LINE.match(line)
-            if pm is None:
-                if re.match(r"^\s*path\b", line, re.IGNORECASE):
-                    raise NotAClone("the clone's config has an include this cannot read safely")
-                continue
-            target = pm.group(1)
-            if target.startswith("~"):
-                raise NotAClone("the clone's config includes a file in a home directory")
-            seen += 1
-            if depth >= MAX_INCLUDE_DEPTH or seen > 100:
-                raise NotAClone("the clone's config has too many includes")
-            full = target if target.startswith("/") else os.path.join(base, target)
-            try:
-                st = os.stat(full)
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise NotAClone(f"cannot examine an included file: {exc.strerror}") from exc
-            if not stat.S_ISREG(st.st_mode):
-                raise NotAClone("the clone's config includes a file that is not a regular file")
-            pending.append((_read_regular(full), os.path.dirname(full), depth + 1))
+def _check_includes_safe(fd: int) -> None:
+    """For a discovered candidate: fail closed on any config that could make git open another
+    path. Config syntax (quoting, continuations) is not parsed here; a config whose raw text
+    contains ``include`` anywhere (case-insensitive) or a NUL byte is refused."""
+    data = _read_config(fd)
+    if b"\x00" in data:
+        raise NotAClone("the clone's config contains a NUL byte")
+    if b"include" in data.lower():
+        raise NotAClone("the clone's config mentions include")
 
 
 def verify_clone(
@@ -308,7 +272,7 @@ def verify_clone(
     ``pushurl``; the stripped URL must also come back unchanged from ``ls-remote --get-url``. The
     raw URL (it may hold a password) is never passed to git as an argument.
 
-    ``allow_includes`` false (discovery) refuses a clone whose config has include sections.
+    ``allow_includes`` false (discovery) refuses a clone whose config mentions include.
     """
     real = os.path.realpath(path)
     if "\n" in real or "\0" in real:
@@ -325,7 +289,7 @@ def verify_clone(
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                 raise NotAClone("the clone changed while it was being verified")
-            _check_layout(fd, gitdir, allow_includes=allow_includes)
+            _check_layout(fd, allow_includes=allow_includes)
             return opened
         finally:
             os.close(fd)
