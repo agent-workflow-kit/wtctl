@@ -267,6 +267,28 @@ def test_a_very_deep_tree_does_not_crash_the_walk(r: Repo) -> None:
     assert got or warns  # copied, or stopped with a warning
 
 
+def test_a_deep_tree_with_many_empty_dirs_is_walked_in_linear_time(r: Repo) -> None:
+    import time
+
+    fd = os.open(r.main, os.O_RDONLY)
+    try:
+        for _ in range(150):
+            os.mkdir("d", dir_fd=fd)
+            nfd = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        for i in range(2000):
+            os.mkdir(f"e{i}", dir_fd=fd)
+        with os.fdopen(os.open(".env", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd), "w") as f:
+            f.write("deep=1\n")
+    finally:
+        os.close(fd)
+    start = time.monotonic()
+    got, warns = copy(r, ["**/.env"])
+    assert time.monotonic() - start < 10
+    assert [c.path for c in got] == ["/".join(["d"] * 150) + "/.env"] and warns == []
+
+
 # -- R7: no spurious warnings -----------------------------------------------------------------
 
 

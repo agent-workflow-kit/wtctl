@@ -247,3 +247,30 @@ def test_the_shared_nested_budget_still_finds_what_fits(r: Repo) -> None:
     with r.open() as wt:
         found = b.find_nested(wt, ["a", "b"], limit=50, warn=warns.append)
     assert found == ["a/x/.git"] and warns == []
+
+
+def test_a_failed_nested_walk_still_charges_the_shared_budget(
+    r: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import bootstrapper as b
+    from wtctl import fsafe
+
+    for d in ("a", "b"):
+        for i in range(3):
+            r.write(f"{d}/f{i}")
+    real = fsafe.walk_tree
+    calls = []
+
+    def flaky(*args, progress=None, **kw):  # noqa: ANN002, ANN003, ANN202
+        calls.append(1)
+        if len(calls) == 1:
+            assert progress is not None
+            progress[0] = 3
+            raise fsafe.FsafeError("io", "disk went away")
+        return real(*args, progress=progress, **kw)
+
+    monkeypatch.setattr(fsafe, "walk_tree", flaky)
+    warns: list[str] = []
+    with r.open() as wt:
+        b.find_nested(wt, ["a", "b"], limit=5, warn=warns.append)
+    assert len(warns) == 2 and "(io)" in warns[0] and "(limit)" in warns[1]  # 3 + 3 > 5

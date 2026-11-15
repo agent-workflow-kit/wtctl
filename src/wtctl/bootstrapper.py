@@ -307,6 +307,9 @@ def _list_dir(dirfd: int, budget: list[int]) -> tuple[list[str], list[str]]:
     return sorted(dirs), sorted(others)
 
 
+_Task = tuple["str | None", tuple[str, ...]]
+
+
 def _match(
     anchor: fsafe.Anchor,
     root_fd: int,
@@ -317,36 +320,52 @@ def _match(
 ) -> None:
     """Collect the relative paths of non-directory entries matching ``comps`` below ``root_fd``.
 
-    Iterative (an explicit stack of ``(directory, remaining components)``; a directory is opened
-    through its chain from the root when its turn comes), so a hostile deep tree cannot exhaust
-    the interpreter stack. Directories deeper than ``ENV_WALK_DEPTH`` are not entered.
+    Iterative (an explicit stack of open-directory frames), so a hostile deep tree cannot exhaust
+    the interpreter stack. Each child is opened no-follow relative to its parent's fd and the fd
+    is carried down the walk, so the cost is linear in the number of directories; at most
+    ``ENV_WALK_DEPTH`` + 1 fds are open. Directories deeper than ``ENV_WALK_DEPTH`` are not entered.
     """
-    stack: list[tuple[tuple[str, ...], tuple[str, ...]]] = [((), tuple(comps))]
+    base = anchor.path.rstrip("/")
+    mounts = frozenset(anchor.mounts_below)
+    # frame: [dirfd, rel, path, tasks]; a task is (child name or None for this directory, comps)
+    frames: list[tuple[int, tuple[str, ...], str, list[_Task]]] = [
+        (root_fd, (), base, [(None, tuple(comps))])
+    ]
     too_deep = False
-    while stack:
-        rel, cs = stack.pop()
-        if len(rel) > ENV_WALK_DEPTH:
-            if not too_deep:
-                too_deep = True
-                warn(
-                    f"copy_env: not entering directories deeper than {ENV_WALK_DEPTH} levels; "
-                    "files below are not copied"
-                )
-            continue
-        owned = bool(rel)
-        try:
-            dirfd = (
-                fsafe.open_chain(anchor, root_fd, rel, start_path=anchor.path) if owned else root_fd
-            )
-        except fsafe.FsafeError as exc:
-            if exc.kind != "missing":
-                warn(f"copy_env: not entering {_esc('/'.join(rel))}: {exc.kind}")
-            continue
-        try:
-            _match_dir(anchor, dirfd, rel, cs, out, budget, stack)
-        finally:
-            if owned:
-                os.close(dirfd)
+    try:
+        while frames:
+            dirfd, rel, path, tasks = frames[-1]
+            if not tasks:
+                frames.pop()
+                if frames:  # the root frame's fd is the caller's
+                    os.close(dirfd)
+                continue
+            name, cs = tasks.pop()
+            if name is None:
+                _match_dir(anchor, dirfd, rel, cs, out, budget, tasks)
+                continue
+            crel = (*rel, name)
+            if len(crel) > ENV_WALK_DEPTH:
+                if not too_deep:
+                    too_deep = True
+                    warn(
+                        f"copy_env: not entering directories deeper than {ENV_WALK_DEPTH} "
+                        "levels; files below are not copied"
+                    )
+                continue
+            cpath = path + "/" + name
+            try:
+                if cpath in mounts:
+                    raise fsafe.FsafeError("mount_point", f"{cpath} is a mount point")
+                cfd = fsafe.open_dir(anchor, dirfd, name)
+            except fsafe.FsafeError as exc:
+                if exc.kind != "missing":
+                    warn(f"copy_env: not entering {_esc('/'.join(crel))}: {exc.kind}")
+                continue
+            frames.append((cfd, crel, cpath, [(None, cs)]))
+    finally:
+        for fd, *_ in frames[1:]:
+            os.close(fd)
 
 
 def _match_dir(
@@ -356,17 +375,18 @@ def _match_dir(
     comps: tuple[str, ...],
     out: set[tuple[str, ...]],
     budget: list[int],
-    stack: list[tuple[tuple[str, ...], tuple[str, ...]]],
+    stack: list[_Task],
 ) -> None:
-    """One directory of the walk: add the matches here, push the directories to visit."""
+    """One directory of the walk: add the matches here, push the tasks to run (this directory
+    again with fewer components, or a child directory by name)."""
     comp, rest = comps[0], comps[1:]
     if comp == "**":
         if rest:
-            stack.append((rel, rest))
+            stack.append((None, rest))
         dirs, others = _list_dir(dirfd, budget)
         if not rest:
             out.update((*rel, n) for n in others if not fsafe.is_dotgit(n))
-        stack.extend(((*rel, n), comps) for n in reversed(dirs) if not fsafe.is_dotgit(n))
+        stack.extend((n, comps) for n in reversed(dirs) if not fsafe.is_dotgit(n))
         return
     if _GLOB_CHARS & set(comp):
         dirs, others = _list_dir(dirfd, budget)
@@ -377,12 +397,12 @@ def _match_dir(
             if not rest:
                 out.add((*rel, name))
             elif name in subdirs:
-                stack.append(((*rel, name), rest))
+                stack.append((name, rest))
         return
     if fsafe.is_dotgit(comp):
         return
     if rest:
-        stack.append(((*rel, comp), rest))
+        stack.append((comp, rest))
         return
     try:
         anchor.fs.lstat_at(dirfd, comp)
@@ -708,15 +728,15 @@ def find_nested(wt: Worktree, dirs: Sequence[str], *, limit: int, warn: Warn) ->
                     text = _text("/".join((*parts, *e.path)))
                     if text is not None:
                         found.append(text)
-            left -= read[0]
         except fsafe.FsafeError as exc:
             if exc.kind == "limit":
-                left = 0
+                read[0] = left
             warn(
                 f"nested-repository scan of {_esc(rel)!r} stopped ({exc.kind}); "
                 "entries it did not list are not exempt"
             )
         finally:
+            left -= read[0]  # charged on every outcome
             os.close(fd)
     return sorted(set(found))
 
