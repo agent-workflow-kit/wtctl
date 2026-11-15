@@ -154,7 +154,12 @@ def test_the_host_is_what_follows_the_last_at_sign() -> None:
 
 
 def test_normalization_is_total_on_garbage() -> None:
-    for junk in ("\ud800", "https://\ud800/a/b", "a" * 100_000, "https://" + "a" * 100_000 + "/x/y"):
+    for junk in (
+        "\ud800",
+        "https://\ud800/a/b",
+        "a" * 100_000,
+        "https://" + "a" * 100_000 + "/x/y",
+    ):
         assert urls.normalize_url(junk) is None
 
 

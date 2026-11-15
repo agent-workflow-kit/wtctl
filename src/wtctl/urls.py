@@ -58,7 +58,7 @@ def _is_repo_id(text: str) -> bool:
 
 
 def validate_repo_id(text: str) -> str:
-    """The id unchanged if it matches the grammar of docs/interface.md (Identifiers), else exit 2."""
+    """The id unchanged if it matches the grammar (docs/interface.md, Identifiers), else exit 2."""
     if not _is_repo_id(text):
         shown = text if len(text) <= 100 else text[:100] + "..."
         raise UsageError(
@@ -314,4 +314,3 @@ def render_clone_url(repo_id: str, *, template: str) -> str:
             f"the clone URL template {template!r} does not give a URL for {repo_id}",
         )
     return url
-

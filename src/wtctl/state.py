@@ -756,6 +756,43 @@ class State:
             raise KeyError(name)
         return float(row[0])
 
+    # -- clones ---------------------------------------------------------------------------
+
+    def get_clone(self, repo: str) -> dict[str, Any] | None:
+        """The ``clones`` row of a repo id (one row per repo), or None."""
+        row = self._conn.execute("SELECT * FROM clones WHERE repo = ?", (repo,)).fetchone()
+        return None if row is None else dict(row)
+
+    def put_clone(self, repo: str, **fields: str | None) -> None:
+        """Insert or update the repo's row; only the columns given are written.
+
+        ``verified_at`` is always set to now. Callers decide whether ``common_id`` may change:
+        wtctl never re-records it by itself (docs/interface.md, Clone resolution > Anchor
+        identity), so a caller passes it only for the first recording or a human re-accept.
+        """
+        allowed = {
+            "path", "common_dir", "common_id", "source", "fetch_url", "mirror_path",
+            "default_branch",
+        }  # fmt: skip
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown clones columns: {sorted(unknown)}")
+        cols = {**fields, "verified_at": self._now()}
+        names = list(cols)
+        with self._txn() as c:
+            exists = c.execute("SELECT 1 FROM clones WHERE repo = ?", (repo,)).fetchone()
+            if exists:
+                sets = ", ".join(f"{n} = ?" for n in names)
+                c.execute(f"UPDATE clones SET {sets} WHERE repo = ?", [*cols.values(), repo])
+            else:
+                if "path" not in cols:
+                    raise ValueError("a new clones row needs a path")
+                marks = ", ".join("?" for _ in range(len(names) + 1))
+                c.execute(
+                    f"INSERT INTO clones (repo, {', '.join(names)}) VALUES ({marks})",
+                    [repo, *cols.values()],
+                )
+
 
 class Lease:
     """A held lease; use as a context manager. Renewed in the background when the state was
