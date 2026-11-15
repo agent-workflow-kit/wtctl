@@ -122,6 +122,9 @@ OVERRIDES: tuple[tuple[str, str], ...] = (
     # config: only the short summary is safe (`diff` and `log` formats run that child).
     ("diff.submodule", "short"),
 )
+# The only keys a caller may add to the override set (`Git.build(overrides=...)`), lowercase. The
+# tree fetch into the mirror needs `fetch.negotiationAlgorithm=noop` (interface.md, Mirror).
+CALLER_OVERRIDE_KEYS = frozenset({"fetch.negotiationalgorithm"})
 NETWORK_OVERRIDES: tuple[tuple[str, str], ...] = (
     ("http.lowSpeedLimit", "1000"),
     ("http.lowSpeedTime", "60"),
@@ -425,6 +428,7 @@ class Git:
         ssh_auth_sock: str | None,
         ceiling: str | None,
         extra_path: Sequence[str],
+        overrides: Sequence[tuple[str, str]] = (),
     ) -> GitCommand:
         if not args or not re.fullmatch(r"[a-z][a-z-]*", args[0]) or args[0] not in SUBCOMMANDS:
             raise ValueError(f"not a git subcommand wtctl runs: {args[:1]!r}")
@@ -446,8 +450,13 @@ class Git:
                 guards.append("--untracked-files=all")
         rest = guards + rest
         argv = [self.git_bin, "--no-pager"]
-        overrides = OVERRIDES + (NETWORK_OVERRIDES if scheme is not None else ())
         for key, value in overrides:
+            if key.lower() not in CALLER_OVERRIDE_KEYS or "\0" in value or "\n" in value:
+                raise ValueError(f"not an override a caller may add: {key!r}")
+        all_overrides = (
+            OVERRIDES + (NETWORK_OVERRIDES if scheme is not None else ()) + tuple(overrides)
+        )
+        for key, value in all_overrides:
             argv += ["-c", f"{key}={value}"]
         if git_dir is not None:
             argv.append(f"--git-dir={git_dir}")
@@ -478,6 +487,7 @@ class Git:
         ssh_auth_sock: str | None = None,
         honor_filters: bool = False,
         tool_owned: bool = False,
+        overrides: Sequence[tuple[str, str]] = (),
     ) -> GitCommand:
         """Build the argv, environment and cwd of one command (``run`` runs the result).
 
@@ -530,6 +540,7 @@ class Git:
             ssh_auth_sock=ssh_auth_sock,
             ceiling=ceiling,
             extra_path=extra_path,
+            overrides=overrides,
         )
 
     def run(
@@ -539,6 +550,9 @@ class Git:
         stdin: bytes | None = None,
         timeout: float | None = None,
         scheme: str | None = None,
+        stdin_path: str | None = None,
+        stdout_path: str | None = None,
+        max_stdout_bytes: int | None = None,
         **kwargs: object,
     ) -> GitResult:
         """Run one hardened git command through the gateway.
@@ -548,12 +562,26 @@ class Git:
         limit that kills their process group). Any other command runs under
         ``DEFAULT_TIMEOUT`` (300 seconds) unless the caller passes its own, so a stuck git can
         never hang wtctl forever.
+
+        ``stdin_path`` feeds a file to git's stdin and ``stdout_path`` sends its stdout to a new
+        file (created exclusively, no-follow, mode 0600; the result's ``stdout`` is empty), so a
+        pack or a long object list never sits in memory. ``max_stdout_bytes`` kills the command
+        once the file is larger (``GitResult.output_limit``).
         """
         if scheme is not None and timeout is None:
             raise ValueError("a network git command needs a timeout")
         cmd = self.build(args, scheme=scheme, **kwargs)  # type: ignore[arg-type]
         limit = DEFAULT_TIMEOUT if timeout is None else timeout
-        return self.gateway.git(cmd.argv, env=cmd.env, cwd=cmd.cwd, stdin=stdin, timeout=limit)
+        files: dict[str, object] = {}
+        if stdin_path is not None:
+            files["stdin_path"] = stdin_path
+        if stdout_path is not None:
+            files["stdout_path"] = stdout_path
+        if max_stdout_bytes is not None:
+            files["max_stdout_bytes"] = max_stdout_bytes
+        return self.gateway.git(
+            cmd.argv, env=cmd.env, cwd=cmd.cwd, stdin=stdin, timeout=limit, **files
+        )
 
 
 # --------------------------------------------------------------------------------------------
