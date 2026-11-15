@@ -255,6 +255,34 @@ def test_a_submodule_checkout_is_a_usage_error(w: CW, capsys) -> None:  # noqa: 
     assert "submodule" in err["message"]
 
 
+def test_a_relative_submodule_pointer_is_a_usage_error(w: CW, capsys) -> None:  # noqa: ANN001
+    sub = w.tmp / "relsub"
+    sub.mkdir()
+    (sub / ".git").write_text("gitdir: ../.git/modules/sub\n")
+    err = err_of(adopt(w, capsys, sub), 2)
+    assert "submodule" in err["message"]
+
+
+def test_a_submodule_named_like_a_worktree_entry_is_a_usage_error(w: CW, capsys) -> None:  # noqa: ANN001
+    sub = w.tmp / "nested"
+    sub.mkdir()
+    gd = w.clone / ".git" / "modules" / "a" / "worktrees" / "b"
+    gd.mkdir(parents=True)
+    (sub / ".git").write_text(f"gitdir: {gd}\n")
+    err = err_of(adopt(w, capsys, sub), 2)
+    assert "submodule" in err["message"]
+
+
+def test_a_separate_git_dir_under_a_modules_directory_is_not_a_submodule(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    path = w.tmp / "sepgit"
+    path.mkdir()
+    (path / ".git").write_text(f"gitdir: {w.tmp}/modules/proj.git\n")
+    err_of(adopt(w, capsys, path), 20, "unlinked")
+
+
 def test_a_path_in_the_throwaway_root_or_state_dir_is_a_usage_error(w: CW, capsys) -> None:  # noqa: ANN001
     tr = w.root / "throwaway" / "wt-aaaaaaaa"
     tr.mkdir(parents=True)

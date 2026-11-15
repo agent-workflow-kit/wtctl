@@ -236,7 +236,14 @@ class Adopter:
         if "\n" in value or "\0" in value:
             raise _unlinked(f"{_shown(self.path)}/.git is not a single gitdir line")
         vparts = value.split("/")
-        if os.path.basename(os.path.dirname(value)) != "worktrees" and "modules" in vparts[:-1]:
+        # A submodule's gitdir is <...>/.git/modules/<name...>: the first "modules" component
+        # directly follows a ".git" component and something follows it.
+        if "modules" in vparts[:-1]:
+            mod = vparts.index("modules")
+            is_submodule = mod >= 1 and vparts[mod - 1] == ".git"
+        else:
+            is_submodule = False
+        if is_submodule:
             raise UsageError(
                 f"{_shown(self.path)} is a submodule checkout; adopt the superproject's "
                 "worktree instead"
