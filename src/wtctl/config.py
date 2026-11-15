@@ -108,18 +108,18 @@ class Me(_Model):
 class PostHook(_Model):
     model_config = ConfigDict(extra="forbid", regex_engine="python-re", populate_by_name=False)
     cmd: NonEmpty
-    timeout: Annotated[StrictInt, Field(ge=1)] = 30
+    timeout: Annotated[StrictInt, Field(ge=1, le=86400)] = 30
     async_: StrictBool = Field(default=False, alias="async")
 
 
 class PreHook(_Model):
     cmd: NonEmpty
-    timeout: Annotated[StrictInt, Field(ge=1)] = 30
+    timeout: Annotated[StrictInt, Field(ge=1, le=86400)] = 30
 
 
 class Hooks(_Model):
     model_config = ConfigDict(extra="forbid", regex_engine="python-re", populate_by_name=False)
-    # TODO(#6): hooks consume these lists (order, veto, timeouts).
+    # Consumed by ``wtctl.hooks.configured_hooks`` (order, veto, timeouts).
     pre_create: list[PreHook] = Field(default_factory=list, alias="pre-create")
     post_create: list[PostHook] = Field(default_factory=list, alias="post-create")
     pre_remove: list[PreHook] = Field(default_factory=list, alias="pre-remove")
