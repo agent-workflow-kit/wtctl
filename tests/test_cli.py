@@ -30,11 +30,11 @@ MINIMAL: dict[str, list[str]] = {
     "forget": ["forget", SID],
     "locate": ["locate", "example.com/o/r"],
     "clone": ["clone", "example.com/o/r"],
+    "export": ["export"],
     "label_add": ["label", "add", SID, "k=v"],
     "label_remove": ["label", "remove", SID, "k=v"],
     "reconcile": ["reconcile"],
     "prune": ["prune", "--throwaways"],
-    "export": ["export"],
     "cron_install": ["cron", "install"],
     "cron_uninstall": ["cron", "uninstall"],
 }
