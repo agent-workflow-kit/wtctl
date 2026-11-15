@@ -278,3 +278,49 @@ def test_a_lost_lease_during_the_steps_is_busy_and_records_nothing(
     err = err_of(rerun(w, capsys, rec["id"]), 12)
     assert err["code"] == "busy" and time.monotonic() - t0 < 30
     assert w.count("bootstrap_runs") == 0
+
+
+def _ok_rerun_then(w: CW, capsys) -> dict:  # noqa: ANN001
+    rec = made(w, capsys)
+    w.repo_cfg["bootstrap"] = {"steps": [pystep("pass")]}
+    good(rerun(w, capsys, rec["id"]))
+    assert w.records()[0]["bootstrap_state"] == "ok"
+    return rec
+
+
+def test_a_rerun_failing_internally_leaves_the_previous_bootstrap_state(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wtctl import bootstrapper
+
+    rec = _ok_rerun_then(w, capsys)
+
+    def boom(**kw):  # noqa: ANN003, ANN202
+        raise RuntimeError("git status exploded")
+
+    monkeypatch.setattr(bootstrapper, "run_bootstrap", boom)
+    assert rerun(w, capsys, rec["id"]).code != 0
+    row = w.records()[0]
+    assert row["state"] == "active" and row["bootstrap_state"] == "ok"
+
+
+def test_a_rerun_that_lost_its_lease_leaves_the_previous_bootstrap_state(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wtctl.errors import WtctlError
+    from wtctl.state import Lease
+
+    rec = _ok_rerun_then(w, capsys)
+    w.repo_cfg["bootstrap"] = {"steps": [pystep("import time; time.sleep(60)")]}
+
+    def lost(self: Lease) -> None:
+        self.lost = True
+        raise WtctlError("busy", "lease was lost to another process")
+
+    monkeypatch.setattr(Lease, "renew", lost)
+    assert err_of(rerun(w, capsys, rec["id"]), 12)["code"] == "busy"
+    assert w.records()[0]["bootstrap_state"] == "ok"

@@ -283,3 +283,4 @@ def test_a_lost_lease_during_create_bootstrap_fails_busy_and_keeps_the_worktree(
     assert r.code == 12, (r.out, r.err)
     assert w.count("bootstrap_runs") == 0
     assert w.records()[0]["state"] == "creating"
+    assert w.records()[0]["bootstrap_state"] != "interrupted"

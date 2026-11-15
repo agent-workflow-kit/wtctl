@@ -9,7 +9,6 @@ TODO(#5): log the ``bootstrap`` event.
 
 from __future__ import annotations
 
-import contextlib
 from typing import Any
 
 from .. import bootstrapper, fsafe
@@ -97,10 +96,6 @@ def run(ctx: Context) -> Result:
                 f"{record['path']} is not the recorded worktree ({exc.kind})",
                 reason="unlinked",
             ) from exc
-        except BaseException:
-            with contextlib.suppress(Exception):
-                state.set_bootstrap_state(record["id"], "interrupted", expected=BOOTSTRAPPABLE)
-            raise
         summary = state.bootstrap_summary(record["id"])
         out = record_object(record, summary)
         if outcome.failed_step is not None:

@@ -909,8 +909,9 @@ class Creator:
                 nested=outcome.nested,
             )
         except BaseException as exc:
-            with contextlib.suppress(Exception):
-                self.state.set_bootstrap_state(record["id"], "interrupted", expected="creating")
+            if not rlease.lost:
+                with contextlib.suppress(Exception):
+                    self.state.set_bootstrap_state(record["id"], "interrupted", expected="creating")
             kept = self._kept(exc, record, plan)
             if kept is exc:
                 raise

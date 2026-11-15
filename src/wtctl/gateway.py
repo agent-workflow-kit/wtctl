@@ -640,7 +640,7 @@ def disable_dumpable() -> bool:
 # Step runner (issue #6). A separate block on purpose: other issues edit the top of this file.
 #
 # ``run_step`` runs one command in its own session and process group, with a timeout, capped
-# output and an exact environment. Hooks use it now; bootstrap steps (#16) and token commands
+# output and an exact environment. Hooks use it now; bootstrap steps (#16)
 # reuse it. It never uses a shell unless the caller passes ``sh_argv(cmd)``.
 #
 # Signalling: only the group this function created, by the leader pid captured at launch. The
