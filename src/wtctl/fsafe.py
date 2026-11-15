@@ -543,6 +543,8 @@ class Entry:
     kind: str
     nlink: int = 1
     errno: int | None = None
+    dev: int = field(default=0, compare=False)  # directories: the opened directory's identity
+    ino: int = field(default=0, compare=False)
 
 
 def _abs_join(root: str, parts: Sequence[str], name: str) -> str:
@@ -656,7 +658,7 @@ def walk_tree(
                 os.close(child)
                 yield Entry((*parts, name), "changed")
                 continue
-            entry = Entry((*parts, name), "dir", st.nlink)
+            entry = Entry((*parts, name), "dir", st.nlink, dev=cst.dev, ino=cst.ino)
             try:
                 yield entry
                 enter = descend is None or descend(entry)

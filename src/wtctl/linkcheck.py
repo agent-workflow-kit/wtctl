@@ -31,8 +31,27 @@ class Links:
     root: tuple[str, str | None, str] | None  # (base_dir, recorded identity, current), owned only
 
 
-def _unlinked(message: str) -> WtctlError:
-    return WtctlError("refused", message, reason="unlinked")
+class Unlinked(WtctlError):
+    """The refusal ``unlinked``, with the integrity ``step`` that failed (``status`` reports it,
+    ``schemas/defs.json#/$defs/checks`` ``integrity``) and what was expected and found there."""
+
+    def __init__(
+        self,
+        message: str,
+        step: str,
+        expected: str | None = None,
+        actual: str | None = None,
+    ) -> None:
+        super().__init__("refused", message, reason="unlinked")
+        self.step = step
+        self.expected = expected
+        self.actual = actual
+
+
+def _unlinked(
+    message: str, step: str = "path", expected: str | None = None, actual: str | None = None
+) -> WtctlError:
+    return Unlinked(message, step, expected, actual)
 
 
 def _ident(text: str | None) -> fsafe.Identity | None:
@@ -67,13 +86,20 @@ def _pointer_value(text: str, prefix: str = "") -> str | None:
     return None if "\n" in text else text
 
 
+def exc_step(exc: fsafe.FsafeError, record: dict[str, Any]) -> str:
+    """The integrity step an anchor or chain failure belongs to."""
+    return "root" if record.get("owned") and record.get("base_dir") else "path"
+
+
 def verify_links(record: dict[str, Any], state: Any, *, rebind: bool = False) -> Links:
     path, common = record["path"], record["common_dir"]
     admin, owned = record["admin_dir"], bool(record["owned"])
     try:
         return _verify(record, state, path, common, admin, owned, rebind)
     except fsafe.FsafeError as exc:
-        raise _unlinked(f"{path} is not the recorded worktree ({exc.kind})") from exc
+        raise _unlinked(
+            f"{path} is not the recorded worktree ({exc.kind})", exc_step(exc, record), path
+        ) from exc
 
 
 def _verify(
@@ -86,7 +112,7 @@ def _verify(
     rebind: bool,
 ) -> Links:
     if not common or not path:
-        raise _unlinked(f"{record['id']} has no recorded location")
+        raise _unlinked(f"{record['id']} has no recorded location", "path", path or None)
     common_expected = None if rebind else _ident(record["common_id"])
     dir_expected = None if rebind else _ident(record["dir_id"])
     with fsafe.open_anchor(common, expected=common_expected) as canchor:
@@ -100,7 +126,7 @@ def _verify(
                 root_info = (base, recorded_root, _text(ranchor.identity))
                 rel = os.path.relpath(path, base)
                 if rel == ".." or rel.startswith("../") or os.path.isabs(rel) or rel == ".":
-                    raise _unlinked(f"{path} is not below its root {base}")
+                    raise _unlinked(f"{path} is not below its root {base}", "root", base, path)
                 fd = fsafe.open_chain(
                     ranchor,
                     ranchor.fd,
@@ -136,21 +162,60 @@ def _pointers(
         finally:
             os.close(dfd)
         if not same or os.path.join(path, ".git") != common:
-            raise _unlinked(f"{path}/.git is not the recorded common dir")
+            raise _unlinked(
+                f"{path}/.git is not the recorded common dir",
+                "dotgit",
+                common,
+                os.path.join(path, ".git"),
+            )
         return
-    pointer = _read_small(wanchor, wfd, ".git")
-    if _pointer_value(pointer, "gitdir: ") != admin:
-        raise _unlinked(f"{path}/.git does not name the recorded admin dir")
-    if not admin.startswith(canchor.path + "/worktrees/"):
-        raise _unlinked(f"{admin} is not an admin entry of {common}")
-    afd = fsafe.open_chain(
-        canchor, canchor.fd, admin[len(canchor.path) + 1 :].split("/"), start_path=canchor.path
-    )
     try:
-        if _pointer_value(_read_small(canchor, afd, "gitdir")) != os.path.join(path, ".git"):
-            raise _unlinked(f"{admin}/gitdir does not name {path}/.git")
-        cd = _pointer_value(_read_small(canchor, afd, "commondir"))
+        pointer = _read_small(wanchor, wfd, ".git")
+    except fsafe.FsafeError as exc:
+        raise _unlinked(
+            f"{path}/.git is not a readable file ({exc.kind})", "dotgit", admin
+        ) from exc
+    named = _pointer_value(pointer, "gitdir: ")
+    if named != admin:
+        raise _unlinked(f"{path}/.git does not name the recorded admin dir", "dotgit", admin, named)
+    if not admin.startswith(canchor.path + "/worktrees/"):
+        raise _unlinked(f"{admin} is not an admin entry of {common}", "dotgit", admin, None)
+    try:
+        afd = fsafe.open_chain(
+            canchor, canchor.fd, admin[len(canchor.path) + 1 :].split("/"), start_path=canchor.path
+        )
+    except fsafe.FsafeError as exc:
+        raise _unlinked(
+            f"{admin} cannot be opened ({exc.kind})", "admin_gitdir", os.path.join(path, ".git")
+        ) from exc
+    try:
+        try:
+            back = _pointer_value(_read_small(canchor, afd, "gitdir"))
+        except fsafe.FsafeError as exc:
+            raise _unlinked(
+                f"{admin}/gitdir is not readable ({exc.kind})",
+                "admin_gitdir",
+                os.path.join(path, ".git"),
+            ) from exc
+        if back != os.path.join(path, ".git"):
+            raise _unlinked(
+                f"{admin}/gitdir does not name {path}/.git",
+                "admin_gitdir",
+                os.path.join(path, ".git"),
+                back,
+            )
+        try:
+            cd = _pointer_value(_read_small(canchor, afd, "commondir"))
+        except fsafe.FsafeError as exc:
+            raise _unlinked(
+                f"{admin}/commondir is not readable ({exc.kind})", "commondir", common
+            ) from exc
         if cd is None or os.path.normpath(os.path.join(admin, cd)) != os.path.normpath(common):
-            raise _unlinked(f"{admin}/commondir does not name the recorded common dir")
+            raise _unlinked(
+                f"{admin}/commondir does not name the recorded common dir",
+                "commondir",
+                common,
+                cd,
+            )
     finally:
         os.close(afd)
