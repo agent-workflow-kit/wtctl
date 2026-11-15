@@ -375,15 +375,6 @@ def test_r13_userinfo_urls_in_git_stderr_are_scrubbed(w: CW) -> None:
     assert err["code"] == "create_failed"
 
 
-def test_r14_copy_env_warns_that_bootstrap_is_missing(w: CW, capsys) -> None:  # noqa: ANN001
-    data = ok(w.create(capsys, "--copy-env"))
-    assert any("bootstrap not implemented yet (#16)" in m for m in data["warnings"])
-    data = ok(w.create(capsys, "--copy-env", "--no-bootstrap"))
-    assert any("bootstrap not implemented yet (#16)" in m for m in data["warnings"])
-    data = ok(w.create(capsys))
-    assert not any("not implemented" in m for m in data["warnings"])
-
-
 @pytest.mark.parametrize("name", ["post-remove", "pre-remove", "post-reconcile"])
 def test_r16_hooks_that_cannot_fire_on_create_are_usage_errors(
     w: CW,

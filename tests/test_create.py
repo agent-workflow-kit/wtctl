@@ -645,15 +645,3 @@ def test_throwaway_is_not_implemented_here(w: CW, capsys) -> None:  # noqa: ANN0
 def test_unknown_repo_is_not_found(w: CW, capsys) -> None:  # noqa: ANN001
     r = w.cli(capsys, "create", "--repo", "example.test/org/none")
     assert r.code == 10
-
-
-# -- bootstrap seam -----------------------------------------------------------------------------
-
-
-def test_configured_bootstrap_steps_are_not_run_yet(w: CW, capsys) -> None:  # noqa: ANN001
-    w.repo_cfg["bootstrap"] = {"steps": [{"argv": ["true"]}]}
-    data = ok(w.create(capsys))
-    assert data["bootstrap"]["state"] == "none"
-    assert any("bootstrap" in m for m in data["warnings"])
-    data = ok(w.create(capsys, "--no-bootstrap"))
-    assert not any("bootstrap" in m for m in data["warnings"])
