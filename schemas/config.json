@@ -118,7 +118,17 @@
     "hosts": {
       "type": "object",
       "propertyNames": {
-        "$ref": "#/$defs/host"
+        "allOf": [
+          {
+            "$ref": "#/$defs/host"
+          },
+          {
+            "not": {
+              "pattern": ":443$"
+            }
+          }
+        ],
+        "description": "A host, with a port only when it is not 443 (use the bare host for 443)."
       },
       "additionalProperties": {
         "$ref": "#/$defs/host_config"
@@ -486,7 +496,7 @@
     },
     "host": {
       "type": "string",
-      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?$",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$",
       "description": "A repo id's host part: lowercase host, optional :port."
     },
     "host_config": {
@@ -529,8 +539,9 @@
         },
         "token_user": {
           "type": "string",
-          "minLength": 1,
-          "default": "x-access-token"
+          "pattern": "^[!-9;-~]{1,256}$",
+          "default": "x-access-token",
+          "description": "username paired with the token: 1-256 visible ASCII characters, no ':' and no space."
         }
       },
       "additionalProperties": false,
@@ -737,7 +748,7 @@
     },
     "repo_id": {
       "type": "string",
-      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+)+$",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[1-9][0-9]{0,4})?(?:/(?!\\.\\.?(?:/|$))[A-Za-z0-9._-]+)+$",
       "description": "Lowercase host, optional :port for a non-default port, then '/' and one or more path segments of [A-Za-z0-9._-], none equal to '.' or '..' (architecture section 16)."
     }
   }

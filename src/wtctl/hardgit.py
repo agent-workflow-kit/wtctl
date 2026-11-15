@@ -373,7 +373,8 @@ def _check_path(path: str | os.PathLike[str], what: str) -> str:
 @dataclass(frozen=True)
 class GitCommand:
     argv: list[str]
-    env: dict[str, str]
+    # The environment can hold a token header: keep it out of repr and of assertion diffs.
+    env: dict[str, str] = field(repr=False, compare=False)
     cwd: str
 
 
