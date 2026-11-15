@@ -11,7 +11,9 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from . import urls
 from .errors import UsageError, WtctlError
@@ -215,61 +217,108 @@ def _local_config(git: Git, common_dir: str) -> dict[str, list[str]]:
     return out
 
 
-def create_branch_ref(git: Git, common_dir: str, branch: str, start: str) -> None:
+def create_branch_ref(
+    git: Git, common_dir: str, branch: str, start: str, on_created: Callable[[], None]
+) -> None:
     """Create ``refs/heads/<branch>`` at ``start`` only if it does not exist (``update-ref`` with
     the all-zero old value), so a branch this call owns was never anybody else's. A branch that
-    exists (also one a case-insensitive file system folds onto) is ``branch_exists``."""
+    exists (also one a case-insensitive file system folds onto) is ``branch_exists``.
+
+    ``on_created`` is called as soon as the ref is known to be ours: on success, and when the
+    command timed out or was interrupted but the ref now holds ``start`` (it was create-only, so
+    the ref is ours). An "already exists" outcome never calls it."""
     ref = f"refs/heads/{branch}"
-    r = git.run(
-        ["update-ref", ref, start, "0" * 40], git_dir=common_dir, cwd=common_dir, timeout=60
-    )
-    if r.returncode == 0 and not r.timed_out:
-        return
-    if not r.timed_out:
+
+    def tip_of() -> str | None:
         have = git.run(
             ["rev-parse", "--verify", "-q", ref], git_dir=common_dir, cwd=common_dir, timeout=60
         )
         tip = have.out.strip()
-        if have.returncode == 0 and SHA.fullmatch(tip):
-            raise WtctlError(
-                "refused",
-                f"branch {branch} already exists",
-                reason="branch_exists",
-                details={"tip": tip},
-            )
+        return tip if have.returncode == 0 and SHA.fullmatch(tip) else None
+
+    try:
+        r = git.run(
+            ["update-ref", ref, start, "0" * 40], git_dir=common_dir, cwd=common_dir, timeout=60
+        )
+    except BaseException:
+        try:
+            if tip_of() == start:
+                on_created()
+        except Exception:  # noqa: BLE001 - the interrupt, not this probe, is what propagates
+            pass
+        raise
+    if r.returncode == 0 and not r.timed_out:
+        on_created()
+        return
+    tip = tip_of()
+    if r.timed_out:
+        if tip == start:
+            on_created()
+    elif tip is not None:
+        raise WtctlError(
+            "refused",
+            f"branch {branch} already exists",
+            reason="branch_exists",
+            details={"tip": tip},
+        )
     raise create_failed(f"cannot create the branch {branch}")
 
 
+class UpstreamKey(NamedTuple):
+    """One upstream key this call wrote: the value written and the values it had before."""
+
+    value: str
+    previous: list[str]
+
+
 def write_upstream(
-    git: Git, common_dir: str, branch: str, remote: str, written: dict[str, str]
+    git: Git, common_dir: str, branch: str, remote: str, written: dict[str, UpstreamKey]
 ) -> None:
     """Explicit upstream for a branch created from a remote-only one (git's own remote-branch
-    guessing is never used). ``written`` receives each key this call added (a key that already
-    existed is overwritten but not listed: the unwind leaves it alone)."""
+    guessing is never used). ``written`` receives each key this call wrote, with the values it
+    had before (empty when it did not exist), so the unwind can put them back."""
     current = _local_config(git, common_dir)
     for var, value in (("remote", remote), ("merge", f"refs/heads/{branch}")):
         key = f"branch.{branch}.{var}"
+        written[key] = UpstreamKey(value, list(current.get(key, [])))
         r = git.run(
-            ["config", "--local", key, value], git_dir=common_dir, cwd=common_dir, timeout=60
+            ["config", "--local", "--replace-all", key, value],
+            git_dir=common_dir,
+            cwd=common_dir,
+            timeout=60,
         )
         if r.returncode != 0 or r.timed_out:
             raise create_failed(f"cannot write the upstream of {branch}")
-        if key not in current:
-            written[key] = value
 
 
-def remove_upstream(git: Git, common_dir: str, branch: str, written: dict[str, str]) -> list[str]:
-    """Undo :func:`write_upstream`: unset each key in ``written`` whose value is still the one
-    written, then drop the ``branch.<b>`` section if nothing is left in it. Returns what could not
-    be undone (empty when all went well)."""
+def remove_upstream(
+    git: Git, common_dir: str, branch: str, written: dict[str, UpstreamKey]
+) -> list[str]:
+    """Undo :func:`write_upstream`: for each key in ``written`` whose value is still the one
+    written, restore the values it had before (unset it when there were none), then drop the
+    ``branch.<b>`` section if nothing is left in it. Returns what could not be undone (empty when
+    all went well)."""
     problems: list[str] = []
     try:
         current = _local_config(git, common_dir)
     except WtctlError as exc:
         return [f"upstream of {branch}: {exc.message}"]
     unset = False
-    for key, value in written.items():
+    for key, (value, previous) in written.items():
         if current.get(key) != [value]:
+            continue
+        if previous:
+            for i, old in enumerate(previous):
+                flag = "--replace-all" if i == 0 else "--add"
+                r = git.run(
+                    ["config", "--local", flag, key, old],
+                    git_dir=common_dir,
+                    cwd=common_dir,
+                    timeout=60,
+                )
+                if r.returncode != 0 or r.timed_out:
+                    problems.append(f"could not restore {key}")
+                    break
             continue
         r = git.run(
             ["config", "--local", "--unset-all", key],

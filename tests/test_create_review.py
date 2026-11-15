@@ -477,3 +477,100 @@ def test_a_dry_run_without_a_clone_is_not_found_and_clones_nothing(w: CW, capsys
     r = w.create(capsys, "--dry-run")
     assert r.code == 10, r.out
     assert w.count("records") == 0 and w.count("clones") == 0
+
+
+# -- targeted round 2 ------------------------------------------------------------------------------
+
+
+def test_t1_unwind_restores_a_preexisting_upstream(w: CW) -> None:
+    w.g(["config", "branch.feature/remote-only.remote", "elsewhere"])
+    w.g(["config", "branch.feature/remote-only.merge", "refs/heads/other"])
+    r = cli_spy(
+        w, Spy(before=fail_sub("worktree", containing="add")), "--branch", "feature/remote-only"
+    )
+    assert refused(r, 12)["code"] == "create_failed"
+    assert w.g(["config", "branch.feature/remote-only.remote"]) == "elsewhere"
+    assert w.g(["config", "branch.feature/remote-only.merge"]) == "refs/heads/other"
+
+
+def test_t2_a_broken_other_clone_does_not_block_create(w: CW, capsys) -> None:  # noqa: ANN001
+    ok(w.create(capsys, "--detach", "--name", "first"))
+    bad = w.tmp / "badclone"
+    (bad / ".git" / "worktrees" / "x").mkdir(parents=True)
+    (bad / ".git" / "worktrees" / "x" / "gitdir").write_text(f"{w.tmp}/gone/.git\n")
+    st = State(w.db, Gateway())
+    st.put_clone("example.test/org/bad", path=str(bad), common_dir=str(bad / ".git"))
+    st.close()
+    ok(w.create(capsys, "--detach", "--name", "second"))
+
+
+def test_t2_an_unreadable_other_clone_names_it(w: CW, capsys) -> None:  # noqa: ANN001
+    ok(w.create(capsys, "--detach", "--name", "first"))
+    bad = w.tmp / "badclone"
+    (bad / ".git").mkdir(parents=True)
+    (bad / ".git" / "worktrees").write_text("not a directory")
+    st = State(w.db, Gateway())
+    st.put_clone("example.test/org/bad", path=str(bad), common_dir=str(bad / ".git"))
+    st.close()
+    r = w.create(capsys, "--detach", "--name", "second")
+    assert r.code != 0
+    assert "badclone" in r.out + r.err
+
+
+def test_t3_an_unreadable_admin_dir_after_a_failed_add_keeps_the_record(
+    w: CW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import worktrees
+
+    armed = {"on": False}
+
+    def fail_add(sub, argv, kw):  # noqa: ANN001, ANN202
+        if sub == "worktree" and "add" in argv:
+            armed["on"] = True
+            return GitResult(128, b"", b"fatal: injected\n")
+        return None
+
+    real = worktrees.admin_gitdirs
+
+    def scan(common: str) -> list[str]:
+        if armed["on"]:
+            raise PermissionError(13, "denied")
+        return real(common)
+
+    monkeypatch.setattr(worktrees, "admin_gitdirs", scan)
+    err = refused(cli_spy(w, Spy(before=fail_add)), 12)
+    assert err["code"] == "create_failed"
+    [rec] = w.records()
+    assert rec["state"] == "creating"
+    assert any(k.startswith("refs/heads/wt/") for k in w.refs())
+
+
+def test_t4_a_timed_out_update_ref_that_created_the_branch_is_unwound(w: CW) -> None:
+    def time_out(sub, argv, kw, result):  # noqa: ANN001, ANN202
+        if sub == "update-ref" and "-d" not in argv and result.returncode == 0:
+            return GitResult(-9, b"", b"", timed_out=True)
+        return None
+
+    err = refused(cli_spy(w, Spy(after=time_out)), 12)
+    assert err["code"] == "create_failed"
+    assert not any(k.startswith("refs/heads/wt/") for k in w.refs())
+    assert w.records() == []
+
+
+def test_t5_an_interrupt_after_the_add_is_not_its_own_cause(w: CW) -> None:
+    def interrupt(sub, argv, kw, result):  # noqa: ANN001, ANN202
+        if sub == "worktree" and "add" in argv:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt) as ei:
+        cli_spy(w, Spy(after=interrupt))
+    assert ei.value.__cause__ is not ei.value
+
+
+def test_t5_the_kept_message_scrubs_urls(w: CW) -> None:
+    def leak(sub, argv, kw, result):  # noqa: ANN001, ANN202
+        if sub == "worktree" and "add" in argv:
+            raise RuntimeError("boom https://user:s3cret@host.test/x.git")
+
+    err = refused(cli_spy(w, Spy(after=leak)), 12)
+    assert "s3cret" not in err["message"]

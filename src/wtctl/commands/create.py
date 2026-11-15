@@ -479,10 +479,22 @@ class Creator:
             dirs.append(row["path"])
             common = row.get("common_dir")
             if common and os.path.realpath(common) != own and os.path.isdir(common):
-                dirs += [e.path for e in worktrees.worktree_entries(self.git, common)]
+                dirs += self._other_clone_worktrees(row["path"], common)
         dirs += [e.path for e in worktrees.worktree_entries(self.git, self.res.common_dir)]
         dirs += [r["path"] for r in self.state.records()]
         return [os.path.realpath(d) for d in dirs if d]
+
+    @staticmethod
+    def _other_clone_worktrees(clone: str, common: str) -> list[str]:
+        """The worktree paths of a clone other than the target's, from its admin entries alone (no
+        git call runs against it); fails closed, naming the clone, when they cannot be read."""
+        try:
+            gitdirs = worktrees.admin_gitdirs(common)
+        except OSError as exc:
+            raise WtctlError(
+                "internal", f"cannot read the worktrees of the known clone {clone}: {exc.strerror}"
+            ) from exc
+        return [g.removesuffix("/.git") for g in gitdirs]
 
     def _clone_rows(self) -> list[dict[str, Any]]:
         rows = self.state._conn.execute("SELECT path, common_dir FROM clones").fetchall()  # noqa: SLF001
@@ -699,8 +711,8 @@ class Creator:
 
     def _add(self, plan: Plan, record: Record, lease: Lease) -> None:
         git, common = self.wgit, self.res.common_dir
-        created_sha: str | None = None
-        written: dict[str, str] = {}
+        created: list[str] = []  # [start] once the branch ref is known to be ours
+        written: dict[str, worktrees.UpstreamKey] = {}
         added = False
         try:
             start = plan.start
@@ -712,8 +724,9 @@ class Creator:
                 # The ref is created create-only, so a branch this call owns was never anybody
                 # else's and the unwind may delete it; one that exists is a refusal.
                 assert plan.branch is not None
-                worktrees.create_branch_ref(self.git, common, plan.branch, start)
-                created_sha = start
+                worktrees.create_branch_ref(
+                    self.git, common, plan.branch, start, lambda: created.append(start)
+                )
             if plan.action == "track":
                 assert plan.branch is not None
                 worktrees.write_upstream(
@@ -744,8 +757,11 @@ class Creator:
             if added:
                 # The worktree exists: branch, directory and the `creating` record stay for
                 # reconcile to settle (a record that says `active` or vanishes would lie).
-                raise self._kept(exc, record, plan) from exc
-            notes = self._unwind(record, plan, created_sha, written)
+                kept = self._kept(exc, record, plan)
+                if kept is exc:
+                    raise
+                raise kept from exc
+            notes = self._unwind(record, plan, created[0] if created else None, written)
             self._annotate(exc, notes)
             raise
 
@@ -759,7 +775,9 @@ class Creator:
             exc.fields["details"].setdefault("branch", plan.branch)
             exc.fields["details"].setdefault("path", self.path)
             return exc
-        what = exc.message if isinstance(exc, WtctlError) else f"{type(exc).__name__}: {exc}"
+        what = worktrees.scrub_urls(
+            exc.message if isinstance(exc, WtctlError) else f"{type(exc).__name__}: {exc}"
+        )
         return WtctlError(
             "create_failed",
             f"{what} (the worktree was added; record {record['id']} stays `creating`)",
@@ -777,7 +795,10 @@ class Creator:
             if stat.S_ISREG(st.st_mode):
                 return True
         mine = os.path.join(self.path, ".git")
-        return any(g == mine for g in worktrees.admin_gitdirs(self.res.common_dir))
+        try:
+            return any(g == mine for g in worktrees.admin_gitdirs(self.res.common_dir))
+        except OSError:
+            return True  # cannot tell: keep the record and the branch for reconcile
 
     def _verify_placement(self) -> str:
         """After the add: walk from the root anchor to the worktree without following a symlink
@@ -828,7 +849,11 @@ class Creator:
         transfer_base(self.mirror, lease, common_id=fsafe.Identity(int(dev), int(ino)), start=start)
 
     def _unwind(
-        self, record: Record, plan: Plan, created_sha: str | None, written: dict[str, str]
+        self,
+        record: Record,
+        plan: Plan,
+        created_sha: str | None,
+        written: dict[str, worktrees.UpstreamKey],
     ) -> list[str]:
         """A failed create (nothing was added to disk) leaves no branch this call created, no
         upstream key it wrote and no record. Returns what could not be undone."""
