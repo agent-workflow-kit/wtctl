@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import secrets
 import sqlite3
 import stat
@@ -576,6 +577,67 @@ class State:
         got = self.get_record(record_id)
         assert got is not None
         return got
+
+    def delete_record(self, record_id: str, *, expected: str) -> bool:
+        """Delete a record still in state ``expected`` (a compare-and-set); False if it is not.
+
+        Only a ``creating`` record that never became real is deleted (a failed create); its
+        children go with it and its id stays burned.
+        """
+        _check_state(expected)
+        with self._txn() as c:
+            cur = c.execute("DELETE FROM records WHERE id = ? AND state = ?", (record_id, expected))
+            return cur.rowcount == 1
+
+    def live_records_for_repo(self, repo: str) -> list[Record]:
+        """Live records of one repo id, oldest first."""
+        return [r for r in self.records() if r["repo"] == repo]
+
+    def preview_id(self) -> str:
+        """An id that looks like a real one but is not allocated (dry runs)."""
+        return _random_id()
+
+    def timestamp(self) -> str:
+        """Now, in the fixed-width format of every state timestamp."""
+        return self._now()
+
+    def set_stash_ids(self, record_id: str, oids: Iterable[str]) -> None:
+        """Replace the stash entry ids recorded for a record."""
+        with self._txn() as c:
+            c.execute("DELETE FROM stash_ids WHERE record_id = ?", (record_id,))
+            c.executemany(
+                "INSERT INTO stash_ids(record_id, oid) VALUES (?, ?)",
+                [(record_id, o) for o in sorted(set(oids))],
+            )
+
+    def stash_ids(self, record_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT oid FROM stash_ids WHERE record_id = ? ORDER BY oid", (record_id,)
+        )
+        return [r[0] for r in rows]
+
+    # -- anchors --------------------------------------------------------------------------
+
+    def anchor_identity(self, path: str) -> str | None:
+        """The recorded ``<st_dev>:<st_ino>`` of an anchor directory (a worktree root), if any."""
+        row = self._conn.execute("SELECT dev_ino FROM anchors WHERE path = ?", (path,)).fetchone()
+        return None if row is None else str(row[0])
+
+    def record_anchor(self, path: str, dev_ino: str) -> str:
+        """Record an anchor's identity on first use and return the stored one.
+
+        A recorded identity is never replaced here (trust on first use; docs/interface.md, Mount
+        points): the caller compares the result with what it opened.
+        """
+        if not re.fullmatch(r"[0-9]+:[0-9]+", dev_ino):
+            raise ValueError(f"invalid anchor identity {dev_ino!r}")
+        with self._txn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO anchors(path, dev_ino, recorded_at) VALUES (?, ?, ?)",
+                (path, dev_ino, self._now()),
+            )
+            row = c.execute("SELECT dev_ino FROM anchors WHERE path = ?", (path,)).fetchone()
+        return str(row[0])
 
     # -- addressing -----------------------------------------------------------------------
 
