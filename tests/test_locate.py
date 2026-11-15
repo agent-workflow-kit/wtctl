@@ -764,7 +764,11 @@ def test_clone_command_clones_into_the_location_and_records_it(
     assert stored is not None
     assert stored["common_id"] == f"{st.st_dev}:{st.st_ino}" and stored["source"] == "cloned"
     # hardened clone: no hooks from templates, protocol v2 recorded, origin is the plain path
-    assert not list((dest / ".git" / "hooks").glob("*")) if (dest / ".git" / "hooks").exists() else True
+    assert (
+        not list((dest / ".git" / "hooks").glob("*"))
+        if (dest / ".git" / "hooks").exists()
+        else True
+    )
     assert g(["config", "remote.origin.url"], dest, w.home).strip() == str(bare)
 
 
@@ -936,7 +940,8 @@ def test_clone_url_scheme_problems_are_remote_mismatch(
     w: World, capsys: pytest.CaptureFixture[str]
 ) -> None:
     marker = w.tmp / "pwned"
-    for bad in (f"ext::sh -c 'touch {marker}'", "git://example.test/org/repo", "-oProxy=x", "rel/p"):
+    bads = (f"ext::sh -c 'touch {marker}'", "git://example.test/org/repo", "-oProxy=x", "rel/p")
+    for bad in bads:
         w.repos[REPO] = {"clone_url": bad}
         r = w.cli(capsys, "clone", REPO)
         assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch"), bad
@@ -979,7 +984,7 @@ def test_clone_from_a_hostile_source_stays_inert(
     assert "fsmonitor" not in (dest / ".git" / "config").read_text()
 
 
-# -- failures classified from git's result (fake runner) ---------------------------------------------
+# -- failures classified from git's result (fake runner) --------------------------------------
 
 
 def fake_runner(result: GitResult, seen: list[list[str]]):  # type: ignore[no-untyped-def]
@@ -999,7 +1004,7 @@ def fake_runner(result: GitResult, seen: list[list[str]]):  # type: ignore[no-un
 @pytest.mark.parametrize(
     ("result", "code", "details"),
     [
-        (GitResult(128, b"", b"fatal: could not read Username for 'https://x'"), "auth_required", None),
+        (GitResult(128, b"", b"fatal: could not read Username for x"), "auth_required", None),
         (GitResult(128, b"", b"Permission denied (publickey)."), "auth_required", None),
         (GitResult(128, b"", b"fatal: repository not found"), "clone_failed", None),
         (GitResult(-9, b"", b"partial", timed_out=True), "clone_failed", {"cause": "timeout"}),
@@ -1054,7 +1059,8 @@ def test_https_clone_url_allows_only_https(w: World) -> None:
         make_resolver(w, runner=runner).clone(REPO)
     assert captured["env"]["GIT_ALLOW_PROTOCOL"] == "https"
     assert captured["argv"][-2] == URL
-    assert captured["argv"][-1].startswith(str(w.tmp / "wt/clones/example.test/org/repo.wtctl-tmp-"))
+    tmp_prefix = str(w.tmp / "wt/clones/example.test/org/repo.wtctl-tmp-")
+    assert captured["argv"][-1].startswith(tmp_prefix)
 
 
 # -- concurrency ---------------------------------------------------------------------------------
@@ -1119,3 +1125,50 @@ def test_multiple_repos_keep_separate_rows(w: World, capsys: pytest.CaptureFixtu
     w.cli(capsys, "locate", REPO)
     w.cli(capsys, "locate", other)
     assert row(REPO)["path"] == str(a) and row(other)["path"] == str(b)  # type: ignore[index]
+
+
+# -- races between checking and using ------------------------------------------------------------
+
+
+def test_a_clone_swapped_while_it_is_verified_is_refused(
+    w: World, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clone = w.stub(w.tmp / "mine")
+    w.repos[REPO] = {"clone": str(clone)}
+    real_open = locate_mod.open_dir_nofollow
+    calls: list[str] = []
+
+    def swapping_open(path: str) -> int:
+        calls.append(path)
+        if path.endswith("/mine/.git") and len(calls) == 1:
+            os.rename(clone / ".git", w.tmp / "old-git")  # the attacker swaps the directory
+            os.mkdir(clone / ".git")
+        return real_open(path)
+
+    monkeypatch.setattr(locate_mod, "open_dir_nofollow", swapping_open)
+    r = w.cli(capsys, "locate", REPO)
+    assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch")
+    assert "changed while" in r.json()["error"]["message"]
+    assert row() is None
+
+
+def test_discovery_walk_refuses_a_directory_swapped_for_a_symlink(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between listing a directory and opening it, the entry becomes a symlink: not entered."""
+    search = w.tmp / "search"
+    (search / "a").mkdir(parents=True)
+    w.stub(w.tmp / "outside" / "repo")
+    real_stat = os.stat
+
+    def swapping_stat(path: Any, *a: Any, **k: Any) -> os.stat_result:
+        st = real_stat(path, *a, **k)
+        if path == "a" and k.get("dir_fd") is not None and (search / "a").is_dir():
+            os.rmdir(search / "a")
+            os.symlink(w.tmp / "outside", search / "a")
+        return st
+
+    monkeypatch.setattr(os, "stat", swapping_stat)
+    budget = locate_mod._Budget(100, float("inf"))
+    found = list(locate_mod.walk_for_clones(str(search), 5, budget, Gateway().clock))
+    assert found == []
