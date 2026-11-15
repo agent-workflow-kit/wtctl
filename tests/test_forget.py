@@ -8,19 +8,30 @@ from pathlib import Path
 
 import pytest
 
-from tests.adoptlib import (  # noqa: F401
+from tests.adoptlib import (
     adopt,
     disk_snapshot,
     err_of,
-    fast,
     foreign,
+    inproc_baseline,
     ok_adopt,
     ok_forget,
-    w,
+    tombstone,
+    world,
 )
 from tests.createlib import CW, REPO
 from wtctl.gateway import Gateway
 from wtctl.state import State, record_lease
+
+
+@pytest.fixture(autouse=True)
+def fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    inproc_baseline(monkeypatch)
+
+
+@pytest.fixture
+def w(tmp_path: Path, private_home: Path) -> CW:
+    return world(tmp_path, private_home)
 
 
 def adopted(w: CW, capsys, *holders: str, name: str = "ext") -> tuple[Path, dict]:  # noqa: ANN001
@@ -133,7 +144,9 @@ def test_dry_run_with_a_non_holder_warns(w: CW, capsys) -> None:  # noqa: ANN001
 def test_a_bad_holder_is_a_usage_error(w: CW, capsys) -> None:  # noqa: ANN001
     _, r = adopted(w, capsys, "a")
     err_of(forget(w, capsys, r["id"], "--holder", "bad holder"), 2)
-    err_of(forget(w, capsys, r["id"], "--holder", ""), 2)
+    # an empty holder counts as no holder: the human-only gate answers first (docs: Check order)
+    err_of(forget(w, capsys, r["id"], "--holder", ""), 13)
+    err_of(forget(w, capsys, r["id"], "--holder", "", human=True), 2)
     assert state_of(w, r["id"]) == "active"
 
 
@@ -185,7 +198,7 @@ def test_plain_forget_works_in_every_live_state(w: CW, capsys, state: str) -> No
 @pytest.mark.parametrize("state", ["forgotten", "removed", "gone"])
 def test_a_tombstone_is_exit_10_with_details(w: CW, capsys, state: str) -> None:  # noqa: ANN001
     _, r = adopted(w, capsys)
-    w.set_state(r["id"], state)
+    tombstone(w, r["id"], state)
     for argv in ([], ["--holder", "a"]):
         err = err_of(forget(w, capsys, r["id"], *argv, human=True), 10)
         assert err["details"]["state"] == state
@@ -261,5 +274,3 @@ def test_forget_does_not_need_git(w: CW, capsys, monkeypatch: pytest.MonkeyPatch
     w.top["git_bin"] = "/nonexistent/git"
     out = ok_forget(forget(w, capsys, r["id"], "--holder", "a"))
     assert out["record"]["state"] == "forgotten"
-
-

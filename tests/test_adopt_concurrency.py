@@ -7,19 +7,43 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from tests.adoptlib import adopt, fast, foreign, ok_adopt, w  # noqa: F401
+from tests.adoptlib import adopt, foreign, inproc_baseline, ok_adopt, world
 from tests.createlib import CW, REPO
+
+
+@pytest.fixture(autouse=True)
+def fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    inproc_baseline(monkeypatch)
+
+
+@pytest.fixture
+def w(tmp_path: Path, private_home: Path) -> CW:
+    return world(tmp_path, private_home)
 
 
 def spawn(w: CW, *argv: str) -> subprocess.Popen[str]:
     env = {**os.environ, "HOME": str(w.home)}
     return subprocess.Popen(
-        [sys.executable, "-m", "wtctl", "--config", w.config(), "--json", "--actor", "auto:t", *argv],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-    )  # fmt: skip
+        [
+            sys.executable,
+            "-m",
+            "wtctl",
+            "--config",
+            w.config(),
+            "--json",
+            "--actor",
+            "auto:t",
+            *argv,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
 
 
 def finish(procs: list[subprocess.Popen[str]]) -> list[tuple[int, str, str]]:
@@ -73,7 +97,9 @@ def test_forget_and_adopt_holder_race_never_loses_a_live_holder(w: CW, capsys) -
     if state == "forgotten":
         live = w.rows("SELECT id FROM records WHERE state = 'active'")
         assert len(live) == 1
-        assert [x[0] for x in w.rows("SELECT holder FROM holders WHERE record_id = ?", live[0][0])] == ["new"]
+        assert [
+            x[0] for x in w.rows("SELECT holder FROM holders WHERE record_id = ?", live[0][0])
+        ] == ["new"]
     else:
         assert holders == ["new"]
 

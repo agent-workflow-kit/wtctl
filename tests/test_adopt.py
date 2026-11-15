@@ -9,12 +9,22 @@ from pathlib import Path
 
 import pytest
 
-from tests.adoptlib import adopt, err_of, fast, foreign, ok_adopt, w  # noqa: F401
+from tests.adoptlib import adopt, err_of, foreign, inproc_baseline, ok_adopt, world
 from tests.createlib import CW, REPO
 from tests.schemacheck import validate
 
 
-def rec_of(w: CW, capsys, path: Path, *argv: str, **kw) -> dict:  # noqa: ANN001, ANN003
+@pytest.fixture(autouse=True)
+def fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    inproc_baseline(monkeypatch)
+
+
+@pytest.fixture
+def w(tmp_path: Path, private_home: Path) -> CW:
+    return world(tmp_path, private_home)
+
+
+def rec_of(w: CW, capsys, path: Path | str, *argv: str, **kw) -> dict:  # noqa: ANN001, ANN003
     return ok_adopt(adopt(w, capsys, path, *argv, **kw))["record"]
 
 
@@ -82,10 +92,13 @@ def test_baseline_check_passes_then_sees_a_later_change(w: CW, capsys) -> None: 
     r = rec_of(w, capsys, path)
     assert w.cli(capsys, "baseline", "check", r["id"]).code == 0  # recorded as it was
     (w.clone / ".git" / "hooks" / "planted-after").write_text("#!/bin/sh\n")
-    assert err_of(w.cli(capsys, "baseline", "check", r["id"]), 20)["reason"] == "repo_config_changed"
+    assert (
+        err_of(w.cli(capsys, "baseline", "check", r["id"]), 20)["reason"] == "repo_config_changed"
+    )
 
 
 def test_no_hooks_or_git_config_run_during_adopt(w: CW, capsys, tmp_path: Path) -> None:  # noqa: ANN001
+    path = foreign(w, "ext")  # plain git ran its own hooks while making this
     marker = tmp_path / "marker"
     hook = tmp_path / "evil.sh"
     hook.write_text(f"#!/bin/sh\necho ran >> {marker}\n")
@@ -94,16 +107,21 @@ def test_no_hooks_or_git_config_run_during_adopt(w: CW, capsys, tmp_path: Path) 
                 "credential.helper", "core.sshCommand", "gpg.program"):  # fmt: skip
         w.g(["config", key, str(hook)])
     w.g(["config", "core.hooksPath", str(tmp_path)])
-    (w.clone / ".git" / "hooks" / "reference-transaction").write_text(f"#!/bin/sh\necho ran >> {marker}\n")
-    os.chmod(w.clone / ".git" / "hooks" / "reference-transaction", 0o755)
-    path = foreign(w, "ext")
+    for name in ("reference-transaction", "post-checkout", "post-commit", "pre-commit"):
+        for d in (tmp_path, w.clone / ".git" / "hooks"):
+            (d / name).write_text(f"#!/bin/sh\necho ran >> {marker}\n")
+            os.chmod(d / name, 0o755)
+    (w.clone / ".git" / "config.worktree").write_text(f"[core]\n\tfsmonitor = {hook}\n")
+    marker.unlink(missing_ok=True)
     rec_of(w, capsys, path)
     rec_of(w, capsys, w.clone)
     assert not marker.exists()
 
 
 def test_the_real_child_process_runs_the_baseline(
-    w: CW, capsys, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
 ) -> None:
     from wtctl import baselinesvc
 
@@ -198,7 +216,9 @@ def test_a_symlinked_ancestor_is_resolved(w: CW, capsys) -> None:  # noqa: ANN00
 
 
 def test_a_relative_path_is_taken_from_the_working_directory(
-    w: CW, capsys, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
 ) -> None:
     path = foreign(w, "rel")
     monkeypatch.chdir(path.parent)
@@ -421,7 +441,9 @@ def test_a_changed_common_dir_identity_is_refused(w: CW, capsys) -> None:  # noq
 
 
 def test_a_worktree_on_a_fuse_file_system_is_refused(
-    w: CW, capsys, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
 ) -> None:
     from wtctl.commands import adopt as adopt_cmd
 
@@ -438,7 +460,9 @@ def test_a_worktree_on_a_fuse_file_system_is_refused(
 
 
 def test_a_mount_point_worktree_is_refused(
-    w: CW, capsys, monkeypatch: pytest.MonkeyPatch  # noqa: ANN001
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
 ) -> None:
     from wtctl import fsafe
 
@@ -547,7 +571,11 @@ def test_dry_run_on_an_existing_record_adds_no_holder(w: CW, capsys) -> None:  #
 )
 def test_usage_errors_exit_2_and_change_nothing(w: CW, capsys, argv: list[str]) -> None:  # noqa: ANN001
     path = foreign(w)
-    r = w.cli(capsys, "adopt", str(path), *argv) if argv[0] == "--repo" else adopt(w, capsys, path, *argv)
+    r = (
+        w.cli(capsys, "adopt", str(path), *argv)
+        if argv[0] == "--repo"
+        else adopt(w, capsys, path, *argv)
+    )
     err_of(r, 2)
     assert w.count("records") == 0
 

@@ -116,7 +116,16 @@ def test_two_connections_race_for_the_last_holder_exactly_one_forgets(tmp_path: 
 
 def test_insert_record_takes_baseline_rows_and_stash_ids_in_one_transaction(st: State) -> None:
     rid = st.allocate_id()
-    rows = [{"cls": "git", "path": "/p", "key": "k", "type": "config", "sha256": "ab", "anchor_id": None}]
+    rows = [
+        {
+            "cls": "git",
+            "path": "/p",
+            "key": "k",
+            "type": "config",
+            "sha256": "ab",
+            "anchor_id": None,
+        }
+    ]
     st.insert_record(rec(rid), baseline_items=rows, stash_ids=["b" * 40, "a" * 40])
     assert st.baseline_items(rid)[0]["path"] == "/p"
     assert st.stash_ids(rid) == ["a" * 40, "b" * 40]
@@ -126,8 +135,12 @@ def test_a_failed_insert_leaves_no_baseline_rows(st: State) -> None:
     rid = st.allocate_id()
     st.insert_record(rec(rid, path="/same"))
     rid2 = st.allocate_id()
-    rows = [{"cls": "git", "path": "/p", "key": None, "type": "x", "sha256": "ab", "anchor_id": None}]
+    rows = [
+        {"cls": "git", "path": "/p", "key": None, "type": "x", "sha256": "ab", "anchor_id": None}
+    ]
     with pytest.raises(Exception):  # noqa: B017 - the unique live path
         st.insert_record(rec(rid2, path="/same"), baseline_items=rows)
-    n = st._conn.execute("SELECT count(*) FROM baseline_items WHERE record_id = ?", (rid2,)).fetchone()[0]
+    n = st._conn.execute(
+        "SELECT count(*) FROM baseline_items WHERE record_id = ?", (rid2,)
+    ).fetchone()[0]
     assert n == 0

@@ -10,18 +10,6 @@ import pytest
 from tests.createlib import CW, REPO
 from tests.helpers import Run
 from tests.schemacheck import validate
-from wtctl import baselinesvc, repobaseline
-
-
-@pytest.fixture(autouse=True)
-def fast(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run the baseline collectors in this process (the child path has its own test)."""
-    monkeypatch.setattr(baselinesvc, "RUNNER", repobaseline.inproc)
-
-
-@pytest.fixture
-def w(tmp_path: Path, private_home: Path) -> CW:
-    return CW(tmp_path, private_home).build()
 
 
 def foreign(w: CW, name: str = "ext", branch: str | None = None) -> Path:
@@ -78,3 +66,27 @@ def disk_snapshot(w: CW) -> dict:
         "tree": tree(w.tmp / "foreign") if (w.tmp / "foreign").exists() else [],
         "clone": tree(w.clone / ".git" / "worktrees"),
     }
+
+
+def tombstone(w: CW, rid: str, state: str) -> None:
+    """Set a tombstone state with the removal time `transition` would set."""
+    import sqlite3
+
+    conn = sqlite3.connect(w.db)
+    conn.execute(
+        "UPDATE records SET state = ?, removed_at = '2026-01-01T00:00:00.000Z' WHERE id = ?",
+        (state, rid),
+    )
+    conn.commit()
+    conn.close()
+
+
+def world(tmp_path: Path, home: Path) -> CW:
+    return CW(tmp_path, home).build()
+
+
+def inproc_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the baseline collectors in this process (the child path has its own test)."""
+    from wtctl import baselinesvc, repobaseline
+
+    monkeypatch.setattr(baselinesvc, "RUNNER", repobaseline.inproc)
