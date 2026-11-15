@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import datetime as dt
 import os
+import re
 import selectors
 import signal
 import subprocess
@@ -38,6 +39,191 @@ def run(
         timeout=timeout,
         check=False,
     )
+
+
+# --- crontab (#8) -------------------------------------------------------------------------------
+
+
+def _find_executable(name: str, path: str) -> str | None:
+    """``name`` in the absolute entries of ``path`` (relative and empty entries are ignored, so
+    a planted program in the working directory is never run; design D49)."""
+    for entry in path.split(os.pathsep):
+        candidate = os.path.join(entry, name)
+        if os.path.isabs(entry) and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def run_crontab(args: list[str], stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run ``crontab <args>`` with bytes in and out (a crontab is rewritten without re-encoding),
+    in the C locale so its "no crontab" message can be recognised.
+
+    Raises ``FileNotFoundError`` when there is no ``crontab`` on an absolute ``PATH`` entry.
+    """
+    program = _find_executable("crontab", os.environ.get("PATH", ""))
+    if program is None:
+        raise FileNotFoundError("crontab")
+    return subprocess.run(
+        [program, *args],
+        input=stdin,
+        capture_output=True,
+        timeout=30,
+        check=False,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+
+
+@dataclass(frozen=True)
+class DeadlineResult:
+    """Outcome of ``run_with_deadline``; ``returncode`` is None when the child was killed."""
+
+    pid: int
+    returncode: int | None
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool
+
+
+def run_with_deadline(
+    argv: list[str],
+    *,
+    stdin: bytes = b"",
+    timeout: float,
+    env: Mapping[str, str] | None = None,
+    on_start: Callable[[int], None] | None = None,
+) -> DeadlineResult:
+    """Run ``argv`` (no shell) and SIGKILL it on expiry.
+
+    The kill goes to the exact PID of the ``Popen`` this call started (``Popen.kill`` signals
+    only a child that has not been reaped), never a pattern or a process group.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=None if env is None else dict(env),
+        close_fds=True,
+    )
+    try:
+        if on_start is not None:
+            on_start(proc.pid)
+        try:
+            out, err = proc.communicate(stdin, timeout=max(timeout, 0.0))
+            return DeadlineResult(proc.pid, proc.returncode, out, err, False)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:  # still stuck in the kernel: report, never block
+                out, err = b"", b""
+            return DeadlineResult(proc.pid, None, out, err, True)
+    except BaseException:
+        # on_start raised or we were interrupted: never leave the child running
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        raise
+
+
+@dataclass(frozen=True)
+class MountEntry:
+    """One mounted file system. ``mount_id`` is None where the platform has none (macOS)."""
+
+    mount_id: int | None
+    mount_point: str
+    fstype: str
+    source: str
+
+
+class MountTableUnavailable(Exception):
+    """The mount table or an fd's mount id could not be read on a platform that has them."""
+
+
+_OCTAL = re.compile(r"\\([0-7]{3})")
+
+
+def _unescape_mountinfo(field: str) -> str:
+    return _OCTAL.sub(lambda m: chr(int(m.group(1), 8)), field)
+
+
+def parse_mountinfo(text: str) -> list[MountEntry]:
+    """Parse ``/proc/self/mountinfo``; malformed lines are skipped."""
+    entries: list[MountEntry] = []
+    for line in text.splitlines():
+        head, sep, tail = line.partition(" - ")
+        fields = head.split(" ")
+        rest = tail.split(" ")
+        if not sep or len(fields) < 5 or len(rest) < 2 or not fields[0].isdigit():
+            continue
+        entries.append(
+            MountEntry(
+                int(fields[0]),
+                _unescape_mountinfo(fields[4]),
+                rest[0],
+                _unescape_mountinfo(rest[1]),
+            )
+        )
+    return entries
+
+
+_MOUNT_LINE = re.compile(r"^(?P<src>.*?) on (?P<mp>/.*) \((?P<fs>[^,)]*)")
+
+
+def parse_mount_command(text: str) -> list[MountEntry]:
+    """Parse BSD/macOS ``mount`` output (``<source> on <point> (<fstype>, ...)``)."""
+    entries: list[MountEntry] = []
+    for line in text.splitlines():
+        m = _MOUNT_LINE.match(line)
+        if m:
+            entries.append(MountEntry(None, m.group("mp"), m.group("fs"), m.group("src")))
+    return entries
+
+
+def read_mount_table() -> list[MountEntry] | None:
+    """All mounts: Linux ``/proc/self/mountinfo``, macOS ``mount``; None on other platforms."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as f:
+                return parse_mountinfo(f.read())
+        except OSError as exc:
+            raise MountTableUnavailable(f"cannot read /proc/self/mountinfo: {exc}") from exc
+    if sys.platform == "darwin":
+        try:
+            r = run(["mount"], timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise MountTableUnavailable(f"cannot run mount: {exc}") from exc
+        if r.returncode != 0:
+            raise MountTableUnavailable("mount failed")
+        return parse_mount_command(r.stdout)
+    return None
+
+
+def fd_mount_id(fd: int) -> int | None:
+    """Linux: the ``mnt_id`` of an open fd (``/proc/self/fdinfo/<fd>``); None elsewhere."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        with open(f"/proc/self/fdinfo/{fd}", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if line.startswith("mnt_id:"):
+                    return int(line.split(":", 1)[1])
+    except (OSError, ValueError) as exc:
+        raise MountTableUnavailable(f"cannot read the mount id of fd {fd}: {exc}") from exc
+    raise MountTableUnavailable(f"no mnt_id line for fd {fd}")
+
+
+def chmod_opath_fd(fd: int, mode: int) -> None:
+    """Linux: chmod the inode an ``O_PATH`` fd refers to (``/proc/self/fd/<fd>``)."""
+    os.chmod(f"/proc/self/fd/{fd}", mode)
 
 
 # TODO(#9): the hardened git runner (clean environment, overrides) builds on ``run``.
@@ -86,14 +272,92 @@ class UnavailableScanner:
         raise ScannerUnavailable("process scanning is not implemented yet")
 
 
+class ProcessUnreadable(Exception):
+    """Whether a process exists could not be determined (as opposed to: it does not exist)."""
+
+
+class ProcessIdentity(Protocol):
+    def start_time(self, pid: int) -> str | None:
+        """An opaque string that, with the PID, identifies one process for its lifetime.
+
+        None when no such process runs (a zombie counts as not running); raises
+        ``ProcessUnreadable`` when that cannot be told.
+        """
+        ...
+
+
+class PsProcessIdentity:
+    """Start time from ``ps -o stat=,lstart=`` (macOS and anywhere without ``/proc``).
+
+    Run with ``TZ=UTC LC_ALL=C`` so the start time does not depend on the caller's time zone or
+    locale; a zombie (stat starting with ``Z``) counts as not running.
+    """
+
+    def __init__(self, runner: Callable[..., subprocess.CompletedProcess[str]] = run) -> None:
+        self._runner = runner
+
+    def start_time(self, pid: int) -> str | None:
+        try:
+            r = self._runner(
+                ["env", "TZ=UTC", "LC_ALL=C", "ps", "-o", "stat=,lstart=", "-p", str(pid)],
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ProcessUnreadable(f"cannot run ps: {exc}") from exc
+        if r.returncode in (126, 127):  # env could not exec ps: unknown, not "gone"
+            raise ProcessUnreadable(f"cannot run ps (exit {r.returncode})")
+        out = r.stdout.strip()
+        if r.returncode != 0 or not out:
+            return None
+        parts = out.split(None, 1)
+        if parts[0].startswith("Z"):
+            return None
+        if len(parts) < 2:
+            raise ProcessUnreadable(f"unexpected ps output: {out!r}")
+        return parts[1]
+
+
+class ProcProcessIdentity:
+    """Start time from ``/proc/<pid>/stat`` field 22 (clock ticks since boot; Linux)."""
+
+    def start_time(self, pid: int) -> str | None:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                raw = f.read().decode("utf-8", "replace")
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except OSError as exc:
+            raise ProcessUnreadable(f"cannot read /proc/{pid}/stat: {exc}") from exc
+        # The command name (field 2) is in parentheses and may itself contain spaces or ')'.
+        rest = raw[raw.rfind(")") + 2 :].split()
+        if len(rest) < 20:
+            raise ProcessUnreadable(f"unexpected /proc/{pid}/stat format")
+        if rest[0] in ("Z", "X"):  # zombie or dead: not running
+            return None
+        return rest[19]
+
+
+def system_process_identity() -> ProcessIdentity:
+    return ProcProcessIdentity() if sys.platform.startswith("linux") else PsProcessIdentity()
+
+
 @dataclass
 class Gateway:
     clock: Clock = field(default_factory=SystemClock)
+    procs: ProcessIdentity = field(default_factory=system_process_identity)
     scanner: ProcessScanner = field(default_factory=UnavailableScanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
+    crontab_runner: Callable[..., subprocess.CompletedProcess[bytes]] = field(
+        default_factory=lambda: run_crontab  # looked up at call time, so tests can patch it
+    )
 
     def run(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return self.runner(argv, **kwargs)
+
+    def crontab(
+        self, args: list[str], stdin: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        return self.crontab_runner(args, stdin)
 
 
 _PR_SET_DUMPABLE = 4
