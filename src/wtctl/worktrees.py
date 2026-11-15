@@ -2,8 +2,8 @@
 
 Everything runs through the hardened :class:`~wtctl.hardgit.Git`; nothing here contacts a remote.
 Names that reach git as arguments are checked first and are never option-like: a branch is
-validated by ``check-ref-format --branch`` and starts with a letter or digit, a start commit is a
-40-hex id, and a path is absolute.
+validated by ``check-ref-format --branch`` and never starts with ``-``, a start commit is a 40-hex
+id, and a path is absolute. Every call also puts ``--`` before its positional arguments.
 """
 
 from __future__ import annotations
@@ -116,12 +116,6 @@ def worktree_entries(git: Git, common_dir: str) -> list[WorktreeEntry]:
             " (a path with a newline can forge entries)",
         )
     return entries
-
-
-def has_commit(git: Git, git_dir: str, sha: str) -> bool:
-    from .packs import clone_has_commit
-
-    return clone_has_commit(git, git_dir, sha)
 
 
 # -- the driver config check ------------------------------------------------------------------
