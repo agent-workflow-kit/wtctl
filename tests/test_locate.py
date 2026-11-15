@@ -1121,7 +1121,7 @@ def test_default_branch_comes_from_the_row(w: World, capsys: pytest.CaptureFixtu
     w.repos[REPO] = {"clone": str(clone)}
     w.cli(capsys, "locate", REPO)
     st = State(state_path(), Gateway())
-    st.put_clone(REPO, default_branch="main")
+    st.set_mirror(REPO, default_branch="main")
     st.close()
     assert w.cli(capsys, "locate", REPO).json()["default_branch"] == "main"
 

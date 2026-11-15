@@ -13,6 +13,7 @@ import pytest
 from tests.mirrorlib import World, forge_loose_object
 from tests.test_mirror import lease
 from tests.vectorlib import build_hostile, plain_git
+from wtctl.gateway import Gateway, GitResult, run_git
 from wtctl.mirror import (
     Tips,
     commit_parents,
@@ -96,6 +97,18 @@ def test_a_force_pushed_away_commit_is_unpushed_though_the_object_stays(w: World
     assert m.is_pushed(shas[0], tips).pushed
 
 
+def test_only_the_tips_of_the_refresh_are_candidates(w: World) -> None:
+    shas = w.build()
+    u = unpushed_commit(w)
+    m = w.mirror()
+    tips = w.refresh(m).tips
+    inject(w, m, u, w.clone)
+    assert mg(w, m, ["update-ref", "refs/heads/x", u]).returncode == 0
+    res = m.is_pushed(u, tips)  # the old Tips do not name x
+    assert (res.pushed, res.detail) == (False, "not_ancestor")
+    assert m.is_pushed(shas[0], tips).pushed
+
+
 def test_no_tips_means_nothing_is_pushed(w: World) -> None:
     shas = w.build()
     m = w.mirror()
@@ -105,13 +118,6 @@ def test_no_tips_means_nothing_is_pushed(w: World) -> None:
         assert (res.pushed, res.detail) == (False, "no_tips")
 
 
-def test_a_failed_refresh_leaves_no_tips_to_ask_with(w: World) -> None:
-    w.build()
-    m = w.mirror(url=str(w.tmp / "nowhere.git"))
-    with pytest.raises(Exception):  # noqa: B017, PT011
-        w.refresh(m)
-
-
 @pytest.mark.parametrize(
     "bad", ["", "HEAD", "main", "abc", "A" * 40, "0" * 39, "0" * 41, "--all", "HEAD~1", "x" * 40]
 )
@@ -119,7 +125,6 @@ def test_only_full_lowercase_shas_are_accepted(w: World, bad: str) -> None:
     w.build()
     m = w.mirror()
     tips = w.refresh(m).tips
-    assert m.is_pushed(bad, tips) == m.is_pushed(bad, tips)
     assert m.is_pushed(bad, tips).pushed is False
 
 
@@ -190,7 +195,9 @@ def test_e1a_replace_refs_do_not_forge_ancestry(w: World) -> None:
     control = mg(w, m, ["merge-base", "--is-ancestor", u, shas[2]])
     assert control.returncode == 0, "the vector is live for unhardened git"
     res = m.is_pushed(u, tips)
-    assert res.pushed is False
+    # With the replace refs ignored no tip contains u; honoured, git would offer a tip and the
+    # re-hash would end in "ancestry_unverified".
+    assert (res.pushed, res.detail) == (False, "not_ancestor")
 
 
 def test_e1b_grafts_do_not_forge_ancestry(w: World) -> None:
@@ -199,7 +206,8 @@ def test_e1b_grafts_do_not_forge_ancestry(w: World) -> None:
     Path(m.path, "info", "grafts").write_text(f"{shas[2]} {u}\n")
     control = mg(w, m, ["merge-base", "--is-ancestor", u, shas[2]])
     assert control.returncode == 0, "the vector is live for unhardened git"
-    assert m.is_pushed(u, tips).pushed is False
+    res = m.is_pushed(u, tips)
+    assert (res.pushed, res.detail) == (False, "not_ancestor")
 
 
 def test_e1d_a_planted_shallow_file_only_cuts_history(w: World) -> None:
@@ -274,6 +282,45 @@ def test_a_commit_missing_from_the_middle_of_the_path_is_unpushed(w: World) -> N
     obj.unlink()
     res = m.is_pushed(shas[0], tips)
     assert res.pushed is False
+
+
+def test_a_failed_ancestry_command_is_check_failed_not_not_ancestor(w: World) -> None:
+    shas = w.build()
+    m = w.mirror()
+    tips = w.refresh(m).tips
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        if "merge-base" in argv:
+            return GitResult(128, b"", b"fatal: bad object\n")
+        return run_git(argv, **kw)  # type: ignore[arg-type]
+
+    w.gateway = Gateway(git_runner=runner)
+    res = w.mirror().is_pushed(shas[0], tips)
+    assert (res.pushed, res.detail) == (False, "check_failed")
+
+
+def test_an_earlier_unverified_candidate_keeps_its_verdict(w: World) -> None:
+    shas = w.build(2)
+    w.g(["checkout", "-q", "-b", "feat", shas[0]])
+    w.commit("feat")
+    w.g(["push", "-q", "origin", "feat"])
+    m = w.mirror()
+    tips = w.refresh(m).tips
+    calls = {"n": 0}
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        if "merge-base" in argv:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return GitResult(128, b"", b"fatal: bad object\n")
+            return GitResult(0, b"", b"")
+        if "cat-file" in argv and "--batch" in argv:
+            return GitResult(1, b"", b"")  # verification fails for every candidate
+        return run_git(argv, **kw)  # type: ignore[arg-type]
+
+    w.gateway = Gateway(git_runner=runner)
+    res = w.mirror().is_pushed(shas[0], tips)
+    assert (res.pushed, res.detail) == (False, "ancestry_unverified")
 
 
 def graft_commit_graph(w: World, m, child: str, parent: str) -> None:  # noqa: ANN001

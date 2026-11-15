@@ -770,10 +770,7 @@ class State:
         wtctl never re-records it by itself (docs/interface.md, Clone resolution > Anchor
         identity), so a caller passes it only for the first recording or a human re-accept.
         """
-        allowed = {
-            "path", "common_dir", "common_id", "source", "fetch_url", "mirror_path",
-            "default_branch",
-        }  # fmt: skip
+        allowed = {"path", "common_dir", "common_id", "source", "fetch_url"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unknown clones columns: {sorted(unknown)}")

@@ -35,6 +35,7 @@ from . import urls
 from .config import Config
 from .credentials import (
     NetworkKind,
+    fetch_target,
     prepare_network_auth,
     rejected_token_error,
     run_network_git,
@@ -68,6 +69,7 @@ MAX_CANDIDATES = 20
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _TIP_LINE = re.compile(r"([0-9a-f]{40}) (refs/heads/[^\n]+)\Z")
 _SYMREF_LINE = re.compile(r"ref: (refs/heads/[^\t\n]+)\tHEAD\Z")
+_CORE_ENTRIES = ("HEAD", "objects", "refs")
 _OPEN_NOFOLLOW = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 # Entries in the mirror that change how git reads it. Their presence makes the mirror unusable
@@ -104,8 +106,9 @@ def mirror_path(common_dir: str) -> str:
 def mirror_url(fetch_url: str) -> str:
     """The URL written to the mirror: an https URL ends in ``.git`` (redirects are not followed,
     and some forges answer a URL without it with a redirect)."""
-    if urls.url_scheme(fetch_url) == "https" and not fetch_url.endswith(".git"):
-        return fetch_url.rstrip("/") + ".git"
+    trimmed = fetch_url.rstrip("/")
+    if urls.url_scheme(trimmed) == "https":
+        return trimmed if trimmed.lower().endswith(".git") else trimmed + ".git"
     return fetch_url
 
 
@@ -284,7 +287,7 @@ class Mirror:
     clone_path: str
     common_dir: str
     fetch_url: str
-    environ: Mapping[str, str]
+    environ: Mapping[str, str] = field(repr=False)
     warn: Callable[[str], None] = field(default=lambda message: None)
     path: str = field(init=False)
 
@@ -317,14 +320,15 @@ class Mirror:
         for this clone must be empty (any other one is never reused: ``fetch_failed``).
         """
         self._require_lease(lease)
+        want = self._wanted_config()  # a refused URL writes nothing
         row = self.state.get_clone(self.repo) or {}
         recorded = row.get("mirror_path") == self.path
-        created = self._prepare_directory(recorded)
+        created, init_due = self._prepare_directory(recorded)
         try:
             self.state.set_mirror(self.repo, mirror_path=self.path)
         except Conflict as e:
             raise self._fail(f"mirror path {self.path} is already stored by another clone") from e
-        if created:
+        if init_due:
             with private_dir() as p:
                 r = self.git.run(
                     ["init", "-q", "--bare", "--template=", "--", self.path],
@@ -333,17 +337,33 @@ class Mirror:
                 )
             if r.returncode != 0:
                 raise self._fail(f"git init of the mirror failed: {r.err.strip()[:200]}")
-        self._write_config()
+        self._write_config(want)
         return created
 
-    def _prepare_directory(self, recorded: bool) -> bool:
-        """Check the mirror path and create it (0700) if absent; True when a git init is due."""
+    def _wanted_config(self) -> bytes:
+        """The config for the clone's fetch URL, or ``remote_mismatch`` for an unusable URL."""
+        url = mirror_url(self.fetch_url)
+        try:
+            target = fetch_target(url)
+            if target.scheme == "https" and "/" not in url.partition("://")[2]:
+                raise ValueError("unsupported fetch URL (no repository path)")
+            return config_text(url)
+        except ValueError as e:
+            raise WtctlError("remote_mismatch", f"unusable fetch URL: {e}") from e
+
+    def _prepare_directory(self, recorded: bool) -> tuple[bool, bool]:
+        """Check the mirror path and create it (0700) if absent.
+
+        Returns ``(created, init_due)``: ``created`` when this call made the mirror (absent or
+        empty directory), ``init_due`` when ``git init`` must run: also for a recorded mirror a
+        crash left without HEAD, objects or refs (``git init`` is idempotent).
+        """
         _prepare_dir(mirrors_root())
         try:
             st = os.lstat(self.path)
         except FileNotFoundError:
             os.mkdir(self.path, 0o700)
-            return True
+            return True, True
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
             raise self._fail(f"mirror path {self.path} is not a plain directory")
         if st.st_uid != os.geteuid():
@@ -351,18 +371,53 @@ class Mirror:
         entries = os.listdir(self.path)
         if not entries:
             os.chmod(self.path, 0o700)
-            return True
+            return True, True
         if not recorded:
-            raise self._fail(f"mirror path {self.path} exists and is not empty")
-        return False
+            raise self._fail(
+                f"mirror path {self.path} exists and is not empty; it was not created by wtctl "
+                "for this clone, remove or move it"
+            )
+        incomplete = any(not os.path.lexists(os.path.join(self.path, n)) for n in _CORE_ENTRIES)
+        forbidden = any(os.path.lexists(os.path.join(self.path, n)) for n in FORBIDDEN_ENTRIES)
+        return False, incomplete and not forbidden
 
-    def _write_config(self) -> None:
-        """Rewrite the config file unless it already holds exactly what wtctl writes."""
-        want = config_text(mirror_url(self.fetch_url))
+    def _open_mirror(self) -> int:
+        """The mirror directory, opened relative to the resolved mirrors root.
+
+        The mirrors root and the mirror itself were checked not to be symlinks by
+        :meth:`_prepare_directory`; links above the state directory (a symlinked home, ``/var``
+        on macOS) are fine, so the root is resolved once and the open is no-follow from there.
+        """
+        root = os.path.realpath(mirrors_root())
+        leaf = os.path.join(root, os.path.basename(self.path))
         try:
-            fd = open_dir_nofollow(self.path)
+            return open_dir_nofollow(leaf)
         except OSError as e:
             raise self._fail(f"cannot open the mirror {self.path}: {e.strerror}") from e
+
+    def check_config(self) -> None:
+        """Refuse a mirror whose config file is not byte for byte what wtctl writes.
+
+        Stronger than the key check of the token gate: a second ``remote.origin.url``, a changed
+        filter or ``promisor = false`` are caught as well. A same-user writer can still change
+        the file between this check and git's read (docs/design.md, Residual risks).
+        """
+        want = self._wanted_config()
+        fd = self._open_mirror()
+        try:
+            same = self._read_config(fd) == want
+        finally:
+            os.close(fd)
+        if not same:
+            raise WtctlError(
+                "unsafe_repo_config",
+                "the mirror's config is not the one wtctl wrote; no network command is run",
+                details={"keys": ["config"]},
+            )
+
+    def _write_config(self, want: bytes) -> None:
+        """Rewrite the config file unless it already holds exactly what wtctl writes."""
+        fd = self._open_mirror()
         try:
             if self._read_config(fd) == want:
                 return
@@ -400,6 +455,12 @@ class Mirror:
 
     def check_layout(self) -> None:
         """Refuse a mirror holding an entry that changes how git reads it (FORBIDDEN_ENTRIES)."""
+        try:
+            head = os.lstat(os.path.join(self.path, "HEAD"))
+        except OSError as e:
+            raise self._fail("the mirror has no HEAD") from e
+        if not stat.S_ISREG(head.st_mode):
+            raise self._fail("the mirror's HEAD is not a regular file")
         for sub in ("objects", "refs"):
             try:
                 st = os.lstat(os.path.join(self.path, sub))
@@ -435,6 +496,7 @@ class Mirror:
         with private_dir() as p:
 
             def network(args: list[str], kind: NetworkKind) -> GitResult:
+                self.check_config()
                 return run_network_git(
                     self.git, args, cfg=self.cfg, auth=auth, kind=kind, tool_owned=True,
                     owned_keys=OWNED_KEYS, git_dir=self.path, cwd=p,
@@ -470,7 +532,8 @@ class Mirror:
         if r.returncode != 0 or r.timed_out:
             raise self._fail("cannot list the mirror's branches")
         refs: dict[str, str] = {}
-        for line in r.out.split("\n"):
+        # surrogateescape: ref names are bytes; distinct names must stay distinct keys
+        for line in r.stdout.decode("utf-8", "surrogateescape").split("\n"):
             if not line:
                 continue
             m = _TIP_LINE.fullmatch(line)
@@ -539,8 +602,13 @@ class Mirror:
         verdict = "not_ancestor"
         for tip in candidates:
             anc = self._run(["merge-base", "--is-ancestor", commit, tip])
-            if anc.returncode != 0 or anc.timed_out:
-                continue  # 1: not an ancestor; 128: an object is missing. Both: not through here
+            if anc.timed_out or anc.returncode not in (0, 1):
+                # 128: an object is missing, or the command failed: no answer through this tip
+                if verdict != "ancestry_unverified":
+                    verdict = "check_failed"
+                continue
+            if anc.returncode == 1:
+                continue  # not an ancestor of this tip
             if self._verified(commit, tip):
                 return Pushed(True)
             verdict = "ancestry_unverified"
