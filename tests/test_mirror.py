@@ -1,0 +1,482 @@
+"""The mirror: creation, config, refresh, default branch (docs/interface.md, Mirror)."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from tests.mirrorlib import REPO, World
+from tests.vectorlib import plain_git
+from wtctl import mirror as mirror_mod
+from wtctl.config import Config
+from wtctl.errors import WtctlError
+from wtctl.gateway import Gateway, GitResult, run_git
+from wtctl.mirror import OWNED_KEYS, config_text, mirror_key, mirror_url
+
+
+@pytest.fixture
+def w(tmp_path: Path, private_home: Path) -> World:
+    return World(tmp_path, private_home)
+
+
+def keys_of(path: str) -> dict[str, str]:
+    r = plain_git(["config", "--file", f"{path}/config", "--list"], cwd=Path(path), home=Path("/"))
+    return dict(line.split("=", 1) for line in r.stdout.decode().splitlines())
+
+
+def lease(w: World, m):  # noqa: ANN001, ANN201
+    return w.state.lease(m.lease_name, wait=1)
+
+
+# -- location -------------------------------------------------------------------------------------
+
+
+def test_path_is_a_hash_of_the_realpath_of_the_common_dir(w: World) -> None:
+    w.build()
+    link = w.tmp / "link"
+    link.symlink_to(w.clone / ".git")
+    real = os.path.realpath(w.clone / ".git")
+    want = hashlib.sha256(real.encode()).hexdigest()[:16]
+    assert mirror_key(str(link)) == mirror_key(str(w.clone / ".git")) == want
+    m = w.mirror()
+    assert m.path.endswith(f"/wtctl/mirrors/{want}.git")
+
+
+def test_creation_makes_private_directories_and_records_the_path(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    with lease(w, m) as ls:
+        assert m.ensure(ls) is True
+        assert m.ensure(ls) is False
+    for d in (m.path, os.path.dirname(m.path)):
+        assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+    assert w.state.get_clone(REPO)["mirror_path"] == m.path
+
+
+def test_config_holds_only_wtctl_keys(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    with lease(w, m) as ls:
+        m.ensure(ls)
+    got = keys_of(m.path)
+    assert set(got) == OWNED_KEYS
+    assert got["remote.origin.url"] == str(w.remote)
+    assert got["extensions.partialclone"] == "origin"
+    assert got["remote.origin.promisor"] == "true"
+    assert got["remote.origin.partialclonefilter"] == "tree:0"
+    assert got["gc.auto"] == "0" and got["core.logallrefupdates"] == "false"
+    assert got["core.repositoryformatversion"] == "1" and got["core.bare"] == "true"
+
+
+@pytest.mark.parametrize(
+    "url", ['/tmp/a "quoted" \\ dir/x.git', "/tmp/x #y ;z/r.git", "/tmp/üni/r.git", "/tmp/a  b "]
+)
+def test_config_text_round_trips_awkward_urls(tmp_path: Path, private_home: Path, url: str) -> None:
+    d = tmp_path / "c"
+    d.mkdir()
+    (d / "config").write_bytes(config_text(url))
+    assert keys_of(str(d))["remote.origin.url"] == url
+
+
+def test_config_text_refuses_control_characters() -> None:
+    with pytest.raises(ValueError):
+        config_text("/tmp/a\nb")
+
+
+@pytest.mark.parametrize(
+    ("url", "want"),
+    [
+        ("https://h.example/o/r", "https://h.example/o/r.git"),
+        ("https://h.example/o/r/", "https://h.example/o/r.git"),
+        ("https://h.example/o/r.git", "https://h.example/o/r.git"),
+        ("ssh://git@h.example/o/r", "ssh://git@h.example/o/r"),
+        ("git@h.example:o/r", "git@h.example:o/r"),
+        ("/srv/r", "/srv/r"),
+    ],
+)
+def test_https_url_is_written_with_dot_git(url: str, want: str) -> None:
+    assert mirror_url(url) == want
+
+
+def test_config_is_rewritten_when_it_differs_and_left_alone_when_it_does_not(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    with lease(w, m) as ls:
+        m.ensure(ls)
+        cfg = Path(m.path, "config")
+        before = cfg.stat().st_ino
+        m.ensure(ls)
+        assert cfg.stat().st_ino == before
+        with open(cfg, "a") as f:
+            f.write('[http]\n\tproxy = http://127.0.0.1:1\n[url "x://"]\n\tinsteadOf = https://\n')
+        m.ensure(ls)
+    assert set(keys_of(m.path)) == OWNED_KEYS
+
+
+def test_config_is_rewritten_when_the_fetch_url_changes(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    with lease(w, m) as ls:
+        m.ensure(ls)
+    other = w.mirror(url="https://other.example/o/r")
+    with lease(w, other) as ls:
+        assert other.ensure(ls) is False
+    assert keys_of(m.path)["remote.origin.url"] == "https://other.example/o/r.git"
+
+
+def test_config_that_is_a_symlink_is_replaced_not_followed(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    victim = w.tmp / "victim"
+    victim.write_text("keep")
+    with lease(w, m) as ls:
+        m.ensure(ls)
+        os.unlink(Path(m.path, "config"))
+        os.symlink(victim, Path(m.path, "config"))
+        m.ensure(ls)
+    assert victim.read_text() == "keep"
+    assert not os.path.islink(Path(m.path, "config"))
+    assert set(keys_of(m.path)) == OWNED_KEYS
+
+
+def test_a_foreign_directory_is_never_reused(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    os.makedirs(m.path)
+    Path(m.path, "precious").write_text("x")
+    with pytest.raises(WtctlError) as exc, lease(w, m) as ls:
+        m.ensure(ls)
+    assert exc.value.code == "fetch_failed" and "not empty" in exc.value.message
+    assert w.state.get_clone(REPO)["mirror_path"] in (None, "")
+    assert Path(m.path, "precious").read_text() == "x"
+
+
+def test_an_empty_directory_is_used(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    os.makedirs(m.path)
+    with lease(w, m) as ls:
+        assert m.ensure(ls) is True
+    assert Path(m.path, "HEAD").exists()
+
+
+def test_a_symlink_at_the_mirror_path_is_refused(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    target = w.tmp / "elsewhere"
+    target.mkdir()
+    os.makedirs(os.path.dirname(m.path), exist_ok=True)
+    os.symlink(target, m.path)
+    with pytest.raises(WtctlError) as exc, lease(w, m) as ls:
+        m.ensure(ls)
+    assert exc.value.code == "fetch_failed"
+    assert list(target.iterdir()) == []
+
+
+def test_two_clones_never_store_the_same_mirror_path(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w.build()
+    other = w.tmp / "clone2"
+    w.g(["clone", "-q", str(w.remote), str(other)], w.tmp)
+    w.record("other.example/o/r", other)
+    monkeypatch.setattr(mirror_mod, "mirror_key", lambda common: "0" * 16)
+    first, second = w.mirror(), w.mirror(repo="other.example/o/r", clone=other)
+    assert first.path == second.path
+    with lease(w, first) as ls:
+        first.ensure(ls)
+    with pytest.raises(WtctlError) as exc, lease(w, second) as ls:
+        second.ensure(ls)
+    assert exc.value.code == "fetch_failed"
+    assert w.state.get_clone("other.example/o/r")["mirror_path"] in (None, "")
+
+
+def test_the_lease_must_be_the_clones_own(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    with w.state.lease("clone:/somewhere/else", wait=1) as ls, pytest.raises(ValueError):
+        m.ensure(ls)
+
+
+def test_refresh_locked_holds_and_releases_the_clone_lease(w: World) -> None:
+    w.build()
+    m = w.mirror()
+    seen: list[float] = []
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        seen.append(w.state.lease_expires(m.lease_name))
+        return run_git(argv, **kw)  # type: ignore[arg-type]
+
+    w.gateway = Gateway(git_runner=runner)
+    m = w.mirror()
+    w.refresh(m)
+    assert seen
+    with pytest.raises(KeyError):
+        w.state.lease_expires(m.lease_name)
+
+
+# -- refresh --------------------------------------------------------------------------------------
+
+
+def object_types(m) -> set[str]:  # noqa: ANN001
+    r = plain_git(
+        ["--git-dir", m.path, "cat-file", "--batch-all-objects", "--batch-check"],
+        cwd=Path(m.path), home=Path("/"),
+    )  # fmt: skip
+    return {line.split()[1] for line in r.stdout.decode().splitlines()}
+
+
+def test_refresh_is_treeless_and_returns_the_tips(w: World) -> None:
+    shas = w.build()
+    m = w.mirror()
+    res = w.refresh(m)
+    assert res.tips.refs == {"refs/heads/main": shas[-1]}
+    assert res.created is True
+    assert object_types(m) == {"commit"}
+    assert w.refresh(m).created is False
+
+
+def test_default_branch_is_recorded_from_ls_remote(w: World) -> None:
+    w.build()
+    w.g(["branch", "dev"], w.remote)
+    w.g(["symbolic-ref", "HEAD", "refs/heads/dev"], w.remote)
+    m = w.mirror()
+    res = w.refresh(m)
+    assert res.default_branch == "dev"
+    assert w.state.get_clone(REPO)["default_branch"] == "dev"
+    assert w.g(["symbolic-ref", "HEAD"], Path(m.path)) == "refs/heads/dev"
+
+
+def test_an_empty_remote_has_no_default_branch(w: World) -> None:
+    w.build()
+    empty = w.tmp / "empty.git"
+    w.g(["init", "-q", "--bare", str(empty)], w.tmp)
+    m = w.mirror(url=str(empty))
+    res = w.refresh(m)
+    assert res.tips.refs == {} and res.default_branch is None
+
+
+def test_a_detached_remote_head_has_no_default_branch(w: World) -> None:
+    shas = w.build()
+    w.g(["update-ref", "--no-deref", "HEAD", shas[0]], w.remote)
+    res = w.refresh(w.mirror())
+    assert res.default_branch is None
+    assert w.state.get_clone(REPO)["default_branch"] is None
+
+
+def test_branches_deleted_and_force_pushed_on_the_remote_follow(w: World) -> None:
+    shas = w.build()
+    w.g(["branch", "gone", shas[0]], w.remote)
+    m = w.mirror()
+    assert set(w.refresh(m).tips.refs) == {"refs/heads/main", "refs/heads/gone"}
+    w.g(["branch", "-D", "gone"], w.remote)
+    w.g(["update-ref", "refs/heads/main", shas[0]], w.remote)
+    assert w.refresh(m).tips.refs == {"refs/heads/main": shas[0]}
+
+
+def test_tags_are_not_fetched(w: World) -> None:
+    w.build()
+    w.g(["tag", "v1"], w.remote)
+    m = w.mirror()
+    w.refresh(m)
+    assert w.g(["tag", "-l"], Path(m.path)) == ""
+
+
+def test_hostile_branch_names_are_data(w: World) -> None:
+    shas = w.build()
+    for name in ["--upload-pack=touch", "-oProxyCommand=x", "üñí", "a--b", "x;y"]:
+        w.g(["update-ref", f"refs/heads/{name}", shas[0]], w.remote)
+    m = w.mirror()
+    res = w.refresh(m)
+    assert len(res.tips.refs) == 6
+    assert "refs/heads/--upload-pack=touch" in res.tips.refs
+
+
+def test_many_branches(w: World) -> None:
+    shas = w.build()
+    stdin = "".join(f"create refs/heads/b{i:05d} {shas[0]}\n" for i in range(3000))
+    r = plain_git(["update-ref", "--stdin"], cwd=w.remote, home=w.home, stdin=stdin.encode(),
+                  env={"GIT_DIR": str(w.remote)})  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    res = w.refresh(w.mirror())
+    assert len(res.tips.refs) == 3001
+
+
+# -- the remote's text is data --------------------------------------------------------------------
+
+
+def with_ls_remote(w: World, stdout: bytes):  # noqa: ANN201
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        if "ls-remote" in argv:
+            return GitResult(0, stdout, b"")
+        return run_git(argv, **kw)  # type: ignore[arg-type]
+
+    w.gateway = Gateway(git_runner=runner)
+
+
+@pytest.mark.parametrize(
+    "out",
+    [
+        b"ref: refs/heads/../../x\tHEAD\n",
+        b"ref: refs/tags/main\tHEAD\n",
+        b"ref: refs/heads/nope\tHEAD\n",  # not a branch the mirror holds
+        b"ref: refs/heads/ma in\tHEAD\n",
+        b"ref: refs/heads/main\tOTHER\n",
+        b"ref: refs/heads/\xff\xfe\tHEAD\n",
+        b"ref: -x\tHEAD\n",
+        b"ref: refs/heads/main\x00\tHEAD\n",
+        b"ref: refs/heads/main lock\tHEAD\n",
+        b"garbage\n" * 100,
+        b"",
+    ],
+)
+def test_hostile_symref_output_gives_no_default_branch(w: World, out: bytes) -> None:
+    w.build()
+    with_ls_remote(w, out)
+    m = w.mirror()
+    res = w.refresh(m)
+    assert res.default_branch is None
+    assert w.g(["symbolic-ref", "HEAD"], Path(m.path)) == "refs/heads/master"
+
+
+def test_a_symref_to_a_held_branch_is_believed(w: World) -> None:
+    w.build()
+    with_ls_remote(w, b"ref: refs/heads/main\tHEAD\n" + b"0" * 40 + b"\tHEAD\n")
+    assert w.refresh(w.mirror()).default_branch == "main"
+
+
+# -- failures -------------------------------------------------------------------------------------
+
+
+def failing(w: World, results: list[GitResult], needle: str = "fetch") -> list[int]:
+    calls = [0]
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        if needle in argv:
+            calls[0] += 1
+            if results:
+                return results.pop(0)
+        return run_git(argv, **kw)  # type: ignore[arg-type]
+
+    w.gateway = Gateway(git_runner=runner)
+    return calls
+
+
+def test_a_missing_remote_is_fetch_failed(w: World) -> None:
+    w.build()
+    m = w.mirror(url=str(w.tmp / "nowhere.git"))
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(m)
+    assert exc.value.code == "fetch_failed"
+
+
+def test_lock_contention_is_retried(w: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    w.build()
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    lock = GitResult(1, b"", b"error: cannot lock ref 'refs/heads/main': is at x\n")
+    calls = failing(w, [lock, lock])
+    res = w.refresh(w.mirror())
+    assert calls[0] == 3 and res.tips.refs
+
+
+def test_lock_contention_that_persists_fails(w: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    w.build()
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    lock = GitResult(1, b"", b"error: cannot lock ref 'refs/heads/main': is at x\n")
+    failing(w, [lock] * 10)
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror())
+    assert exc.value.code == "fetch_failed"
+
+
+def test_prune_incomplete_is_classified(w: World) -> None:
+    w.build()
+    failing(w, [GitResult(0, b"", b"error: could not delete references: boom\n")])
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror())
+    assert exc.value.code == "fetch_failed"
+    assert exc.value.fields["details"] == {"cause": "prune_incomplete"}
+    assert "could not delete" in exc.value.message
+
+
+def test_a_timeout_names_its_cause(w: World) -> None:
+    w.build()
+    failing(w, [GitResult(-9, b"", b"", timed_out=True)])
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror())
+    assert exc.value.fields["details"] == {"cause": "timeout"}
+
+
+def test_a_refused_login_is_auth_required(w: World) -> None:
+    w.build()
+    failing(w, [GitResult(128, b"", b"fatal: Authentication failed for 'x'\n")])
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror())
+    assert exc.value.code == "auth_required"
+
+
+def test_a_full_disk_fails_the_refresh_and_yields_no_tips(w: World) -> None:
+    w.build()
+    failing(w, [GitResult(128, b"", b"fatal: write error: No space left on device\n")])
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror())
+    assert exc.value.code == "fetch_failed" and "No space left" in exc.value.message
+
+
+def test_a_failed_default_branch_listing_fails_the_refresh(w: World) -> None:
+    w.build()
+    failing(w, [GitResult(128, b"", b"fatal: unable to access\n")], needle="ls-remote")
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror())
+    assert exc.value.code == "fetch_failed"
+
+
+@pytest.mark.parametrize("url", ["--upload-pack=x", "ext::sh -c id", "http://h.example/o/r"])
+def test_an_unusable_url_is_remote_mismatch_and_runs_nothing(w: World, url: str) -> None:
+    w.build()
+    ran: list[list[str]] = []
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        ran.append(argv)
+        return run_git(argv, **kw)  # type: ignore[arg-type]
+
+    w.gateway = Gateway(git_runner=runner)
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror(url=url))
+    assert exc.value.code == "remote_mismatch"
+    assert not any("fetch" in a for a in ran)
+
+
+@pytest.mark.parametrize("entry", ["shallow", "commondir", "info/grafts", "objects/info/alternates"])
+def test_a_mirror_with_a_forbidden_entry_is_not_refreshed(w: World, entry: str) -> None:
+    w.build()
+    m = w.mirror()
+    w.refresh(m)
+    p = Path(m.path, entry)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("x\n")
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(m)
+    assert exc.value.code == "fetch_failed" and entry in exc.value.message
+
+
+def test_timeouts_first_refresh_uses_clone_timeout_later_ones_network_timeout(w: World) -> None:
+    w.build()
+    w.cfg = Config(network_timeout="7s", clone_timeout="90s")
+    seen: list[tuple[str, float]] = []
+
+    def runner(argv: list[str], **kw: object) -> GitResult:
+        for name in ("fetch", "ls-remote"):
+            if name in argv:
+                seen.append((name, kw["timeout"]))  # type: ignore[arg-type]
+        return run_git(argv, **kw)  # type: ignore[arg-type]
+
+    w.gateway = Gateway(git_runner=runner)
+    m = w.mirror()
+    w.refresh(m)
+    w.refresh(m)
+    assert seen == [("fetch", 90), ("ls-remote", 7), ("fetch", 7), ("ls-remote", 7)]
