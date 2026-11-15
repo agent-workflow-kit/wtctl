@@ -21,8 +21,8 @@ from urllib.parse import quote
 
 from . import urls
 from .config import Config
-from .gateway import Gateway, GitResult
 from .errors import WtctlError
+from .gateway import Gateway, GitResult
 from .hardgit import Git, parse_config_list
 
 # A token command gets this long, and may print this much. The token itself is much shorter.

@@ -802,7 +802,9 @@ class State:
         """
         unknown = set(fields) - {"mirror_path", "default_branch"}
         if unknown or not fields:
-            raise ValueError(f"set_mirror takes mirror_path and default_branch, got {sorted(fields)}")
+            raise ValueError(
+                f"set_mirror takes mirror_path and default_branch, got {sorted(fields)}"
+            )
         with self._txn() as c:
             if "mirror_path" in fields and fields["mirror_path"] is not None:
                 other = c.execute(

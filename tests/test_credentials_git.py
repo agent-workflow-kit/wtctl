@@ -22,13 +22,13 @@ import pytest
 
 from tests.vectorlib import GIT, plain_git
 from wtctl.config import Config, HostConfig
-from wtctl.errors import WtctlError
 from wtctl.credentials import (
     NetworkKind,
     prepare_network_auth,
     rejected_token_error,
     run_network_git,
 )
+from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway, run_git
 from wtctl.hardgit import FetchKind, Git, classify_fetch
 
@@ -137,7 +137,12 @@ FRESH_KEYS = frozenset({"core.repositoryformatversion", "core.filemode", "core.b
 
 
 def ls_remote(  # noqa: ANN201
-    git: Git, mirror: Path, cfg: Config, auth, url: str, owned_keys: frozenset[str] = FRESH_KEYS  # noqa: ANN001
+    git: Git,
+    mirror: Path,
+    cfg: Config,
+    auth,
+    url: str,
+    owned_keys: frozenset[str] = FRESH_KEYS,  # noqa: ANN001
 ):
     return run_network_git(
         git, ["ls-remote", "--", url], cfg=cfg, auth=auth, kind=NetworkKind.NETWORK,
@@ -365,7 +370,7 @@ def test_a_stalled_server_times_out_end_to_end(
     assert classify_fetch(result).cause == "timeout"
 
 
-# -- #13: separator, owned config, the token-rejected message ---------------------------------------
+# -- #13: separator, owned config, the token-rejected message ---------------------------------
 
 
 @pytest.mark.parametrize("sub", ["ls-remote", "fetch", "clone", "push"])

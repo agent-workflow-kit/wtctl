@@ -15,7 +15,6 @@ import pytest
 
 from tests.vectorlib import GIT
 from wtctl.config import Config, HostConfig
-from wtctl.errors import WtctlError
 from wtctl.credentials import (
     NetworkAuth,
     NetworkKind,
@@ -27,6 +26,7 @@ from wtctl.credentials import (
     timeout_seconds,
     token_header,
 )
+from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway, GitResult, TokenCommandResult, run_token_command
 from wtctl.hardgit import Git
 

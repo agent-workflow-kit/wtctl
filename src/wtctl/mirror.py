@@ -399,7 +399,7 @@ class Mirror:
             os.close(f)
 
     def check_layout(self) -> None:
-        """Refuse a mirror holding an entry that changes how git reads it (see FORBIDDEN_ENTRIES)."""
+        """Refuse a mirror holding an entry that changes how git reads it (FORBIDDEN_ENTRIES)."""
         for sub in ("objects", "refs"):
             try:
                 st = os.lstat(os.path.join(self.path, sub))
@@ -453,9 +453,7 @@ class Mirror:
             if err is not None:
                 raise err
             listing = network(["ls-remote", "--symref", "--", url, "HEAD"], NetworkKind.NETWORK)
-            err = rejected_token_error(
-                auth, outcome_error(classify_fetch(listing), listing)
-            )
+            err = rejected_token_error(auth, outcome_error(classify_fetch(listing), listing))
             if err is not None:
                 raise err
         tips = self._read_tips()
@@ -576,4 +574,3 @@ class Mirror:
         except ValueError:
             return False
         return verify_path(path, objects)
-

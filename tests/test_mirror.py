@@ -1,3 +1,4 @@
+# ruff: noqa: F811
 """The mirror: creation, config, refresh, default branch (docs/interface.md, Mirror)."""
 
 from __future__ import annotations
@@ -28,6 +29,12 @@ def keys_of(path: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in r.stdout.decode().splitlines())
 
 
+def row(w: World, repo: str = REPO) -> dict:  # noqa: ANN401
+    r = w.state.get_clone(repo)
+    assert r is not None
+    return r
+
+
 def lease(w: World, m):  # noqa: ANN001, ANN201
     return w.state.lease(m.lease_name, wait=1)
 
@@ -54,7 +61,7 @@ def test_creation_makes_private_directories_and_records_the_path(w: World) -> No
         assert m.ensure(ls) is False
     for d in (m.path, os.path.dirname(m.path)):
         assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
-    assert w.state.get_clone(REPO)["mirror_path"] == m.path
+    assert row(w)["mirror_path"] == m.path
 
 
 def test_config_holds_only_wtctl_keys(w: World) -> None:
@@ -151,7 +158,7 @@ def test_a_foreign_directory_is_never_reused(w: World) -> None:
     with pytest.raises(WtctlError) as exc, lease(w, m) as ls:
         m.ensure(ls)
     assert exc.value.code == "fetch_failed" and "not empty" in exc.value.message
-    assert w.state.get_clone(REPO)["mirror_path"] in (None, "")
+    assert row(w)["mirror_path"] in (None, "")
     assert Path(m.path, "precious").read_text() == "x"
 
 
@@ -192,7 +199,7 @@ def test_two_clones_never_store_the_same_mirror_path(
     with pytest.raises(WtctlError) as exc, lease(w, second) as ls:
         second.ensure(ls)
     assert exc.value.code == "fetch_failed"
-    assert w.state.get_clone("other.example/o/r")["mirror_path"] in (None, "")
+    assert row(w, "other.example/o/r")["mirror_path"] in (None, "")
 
 
 def test_the_lease_must_be_the_clones_own(w: World) -> None:
@@ -247,7 +254,7 @@ def test_default_branch_is_recorded_from_ls_remote(w: World) -> None:
     m = w.mirror()
     res = w.refresh(m)
     assert res.default_branch == "dev"
-    assert w.state.get_clone(REPO)["default_branch"] == "dev"
+    assert row(w)["default_branch"] == "dev"
     assert w.g(["symbolic-ref", "HEAD"], Path(m.path)) == "refs/heads/dev"
 
 
@@ -265,7 +272,7 @@ def test_a_detached_remote_head_has_no_default_branch(w: World) -> None:
     w.g(["update-ref", "--no-deref", "HEAD", shas[0]], w.remote)
     res = w.refresh(w.mirror())
     assert res.default_branch is None
-    assert w.state.get_clone(REPO)["default_branch"] is None
+    assert row(w)["default_branch"] is None
 
 
 def test_branches_deleted_and_force_pushed_on_the_remote_follow(w: World) -> None:
@@ -451,7 +458,9 @@ def test_an_unusable_url_is_remote_mismatch_and_runs_nothing(w: World, url: str)
     assert not any("fetch" in a for a in ran)
 
 
-@pytest.mark.parametrize("entry", ["shallow", "commondir", "info/grafts", "objects/info/alternates"])
+@pytest.mark.parametrize(
+    "entry", ["shallow", "commondir", "info/grafts", "objects/info/alternates"]
+)
 def test_a_mirror_with_a_forbidden_entry_is_not_refreshed(w: World, entry: str) -> None:
     w.build()
     m = w.mirror()
@@ -480,3 +489,75 @@ def test_timeouts_first_refresh_uses_clone_timeout_later_ones_network_timeout(w:
     w.refresh(m)
     w.refresh(m)
     assert seen == [("fetch", 90), ("ls-remote", 7), ("fetch", 7), ("ls-remote", 7)]
+
+
+# -- over https (loopback capture server) ---------------------------------------------------------
+
+from tests.test_credentials_git import TOKEN, Capture, server, trusting_gateway  # noqa: E402,F401
+from wtctl.config import HostConfig  # noqa: E402
+
+
+def https_world(w: World, server: Capture, *, token: bool) -> tuple[str, dict[str, str]]:
+    w.build()
+    url = f"https://127.0.0.1:{server.port}/org/repo"
+    w.gateway = trusting_gateway(server.cert)
+    hosts = {f"127.0.0.1:{server.port}": HostConfig(token_env="T")} if token else {}
+    w.cfg = Config(hosts=hosts)
+    return url, {"PATH": "/usr/bin:/bin", "T": TOKEN}
+
+
+def test_https_refresh_sends_the_scoped_token_to_the_dot_git_url(w: World, server: Capture) -> None:
+    url, environ = https_world(w, server, token=True)
+    m = w.mirror(url=url, environ=environ)
+    with pytest.raises(WtctlError):
+        w.refresh(m)  # the capture server answers 404
+    assert keys_of(m.path)["remote.origin.url"] == url + ".git"
+    assert server.requests and all(r["path"].startswith("/org/repo.git/") for r in server.requests)
+    assert all(r.get("authorization", "").startswith("Basic ") for r in server.requests)
+
+
+def test_a_rejected_token_is_named(w: World, server: Capture) -> None:
+    url, environ = https_world(w, server, token=True)
+    server.always_401 = True
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror(url=url, environ=environ))
+    assert exc.value.code == "auth_required"
+    assert f"rejected the configured token for 127.0.0.1:{server.port}" in exc.value.message
+    assert TOKEN not in exc.value.message
+
+
+def test_a_missing_token_is_not_called_rejected(w: World, server: Capture) -> None:
+    url, environ = https_world(w, server, token=False)
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror(url=url, environ=environ))
+    assert exc.value.code == "auth_required"
+    assert "rejected" not in exc.value.message
+    assert not any("authorization" in r for r in server.requests)
+
+
+def test_a_planted_proxy_in_the_mirror_is_removed_before_a_token_is_sent(
+    w: World, server: Capture
+) -> None:
+    url, environ = https_world(w, server, token=True)
+    m = w.mirror(url=url, environ=environ)
+    with lease(w, m) as ls:
+        m.ensure(ls)
+    with open(Path(m.path, "config"), "a") as f:
+        f.write(
+            '[http]\n\tproxy = http://127.0.0.1:9\n[url "http://evil.invalid/"]\n\tinsteadOf = x\n'
+        )
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(m)
+    assert exc.value.code != "unsafe_repo_config"  # ensure() rewrote the file first
+    assert set(keys_of(m.path)) == OWNED_KEYS
+    assert server.requests  # the request went to the real server, not a planted proxy
+
+
+def test_a_stalled_server_times_out_with_its_cause(w: World, server: Capture) -> None:
+    url, environ = https_world(w, server, token=False)
+    w.cfg = Config(clone_timeout="2s", network_timeout="2s")
+    server.stall = True
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(w.mirror(url=url, environ=environ))
+    assert exc.value.code == "fetch_failed"
+    assert exc.value.fields["details"] == {"cause": "timeout"}

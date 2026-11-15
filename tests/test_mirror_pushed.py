@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.mirrorlib import REPO, World, forge_loose_object
+from tests.mirrorlib import World, forge_loose_object
 from tests.test_mirror import lease
 from tests.vectorlib import build_hostile, plain_git
 from wtctl.mirror import (
@@ -215,7 +215,9 @@ def test_e1e_alternates_give_nothing_beyond_writing_the_store(w: World) -> None:
     u = unpushed_commit(w)
     m = w.mirror()
     tips = w.refresh(m).tips
-    Path(m.path, "objects", "info", "alternates").write_text(str(w.clone / ".git" / "objects") + "\n")
+    Path(m.path, "objects", "info", "alternates").write_text(
+        str(w.clone / ".git" / "objects") + "\n"
+    )
     assert mg(w, m, ["cat-file", "-t", u]).stdout.strip() == b"commit"
     assert m.is_pushed(u, tips).pushed is False
     assert m.is_pushed(shas[0], tips).pushed
@@ -285,7 +287,7 @@ def graft_commit_graph(w: World, m, child: str, parent: str) -> None:  # noqa: A
     for i in range(nchunks + 1):
         cid, off = struct.unpack(">4sQ", data[8 + 12 * i : 8 + 12 * i + 12])
         chunks[cid] = off
-    oidl, cdat, end = chunks[b"OIDL"], chunks[b"CDAT"], chunks[b"\0\0\0\0"]
+    oidl, cdat = chunks[b"OIDL"], chunks[b"CDAT"]
     n = (cdat - oidl) // 20
     oids = [data[oidl + 20 * i : oidl + 20 * i + 20].hex() for i in range(n)]
     ci, pi = oids.index(child), oids.index(parent)
@@ -343,7 +345,7 @@ def test_commit_parents_reads_only_the_header() -> None:
     assert commit_parents(content) == [p1, p2]
     gpg = f"tree {'c' * 40}\nparent {p1}\ngpgsig -----BEGIN\n parent {'e' * 40}\n -----END\n\nm\n"
     assert commit_parents(gpg.encode()) == [p1]
-    assert commit_parents(f"tree x\nparent nothex\n\nm".encode()) is None
+    assert commit_parents(b"tree x\nparent nothex\n\nm") is None
 
 
 def test_find_path_prefers_short_paths_and_ignores_unlisted_parents() -> None:
