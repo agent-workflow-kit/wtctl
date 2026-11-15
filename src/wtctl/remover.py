@@ -227,7 +227,7 @@ class Remover:
 
     def _normal(self, rec: Record) -> Result:
         st = self.st
-        if rec["dir_id"] is not None:
+        if rec["state"] == "partial" and rec["dir_id"] is not None:
             check, links = removal_integrity.integrity_check(self.state, rec, self.git)
             if (
                 links is None
@@ -251,9 +251,7 @@ class Remover:
     # -- step 5 -------------------------------------------------------------------------------
 
     def _mirror(self) -> Mirror:
-        mirror = self.st.mirror_for()
-        self.st.git = self.git
-        return mirror
+        return self.st.mirror_for()
 
     def _fetch(self) -> None:
         try:
@@ -661,8 +659,7 @@ class Remover:
             cwd=common,
             timeout=60,
         )
-        if prepared.branch is not None:
-            self.journal.commit_audit(prepared.branch)
+        prepared.branch_deleted = True
         return True, None
 
     # -- audit --------------------------------------------------------------------------------
@@ -681,6 +678,7 @@ class Remover:
             "baseline_digest": rec["baseline_digest"],
             "overridden": list(self.overridden),
         }
+        self.journal.check_writable()
         ok = self.journal.prepare_audit("remove", inputs=inputs, result="ok", **common)
         bad = self.journal.prepare_audit("remove", inputs=inputs, result="error", **common)
         branch = None
@@ -705,6 +703,8 @@ class Remover:
             rec["id"], ("active", "partial"), "removed", last_error=None
         )
         self.journal.commit_audit(prepared.ok)
+        if prepared.branch is not None and prepared.branch_deleted:
+            self.journal.commit_audit(prepared.branch)
         out = record_object(removed, self.state.bootstrap_summary(removed["id"]))
         payload = hooks.build_payload(
             "post-remove",
@@ -762,7 +762,7 @@ class Remover:
             event,
             actor=self.ctx.actor.value,
             level=level,
-            id=r["id"] if r else None,
+            id=r["id"] if r else self.rid,
             repo=r["repo"] if r else None,
             decision_ids=self.decision_ids,
             details=details,
@@ -788,6 +788,7 @@ class Prepared:
     ok: audit.PreparedAudit
     failed: audit.PreparedAudit
     branch: audit.PreparedAudit | None
+    branch_deleted: bool = False
 
 
 def parse_options(ctx: Context) -> Options:

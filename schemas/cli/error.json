@@ -41,8 +41,7 @@
           "items": {
             "$ref": "../defs.json#/$defs/process"
           },
-          "minItems": 1,
-          "description": "in_use: the processes found."
+          "description": "in_use: the processes found. Empty when `remove` could not tell because the process scanner failed (a worktree is never removed on an unknown)."
         },
         "items": {
           "type": "array",

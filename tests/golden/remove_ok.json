@@ -1,0 +1,101 @@
+{
+ "record": {
+  "id": "<id>",
+  "object_type": "worktree",
+  "owned": true,
+  "state": "removed",
+  "repo": "example.test/org/repo",
+  "clone_path": "<tmp>/clone",
+  "common_dir": "<tmp>/clone/.git",
+  "common_id": "<common_id>",
+  "admin_dir": "<admin>",
+  "dir_id": "<dir_id>",
+  "base_dir": "<tmp>/wt/worktrees",
+  "root_id": null,
+  "path": "<wt-parent>/work",
+  "name": "work",
+  "branch": "work",
+  "created_branch": true,
+  "base": "refs/heads/main",
+  "base_sha": "<head>",
+  "head_at_create": "<head>",
+  "ref": null,
+  "source": null,
+  "depth": null,
+  "fetch_url": "<tmp>/remote.git",
+  "remote": "origin",
+  "labels": [],
+  "holders": [
+   "agent-1"
+  ],
+  "baseline_digest": "<baseline_digest>",
+  "bootstrap": {
+   "state": "none",
+   "steps": [],
+   "created_paths_count": 0
+  },
+  "created": "<created>",
+  "updated": "<updated>",
+  "missing_since": null,
+  "removed_at": "<updated>",
+  "last_error": null
+ },
+ "checks": {
+  "integrity": {
+   "status": "pass",
+   "details": []
+  },
+  "locked": {
+   "status": "pass",
+   "details": []
+  },
+  "baseline": {
+   "status": "pass",
+   "details": []
+  },
+  "in_use": {
+   "status": "pass",
+   "details": []
+  },
+  "held": {
+   "status": "pass",
+   "details": []
+  },
+  "fetch": {
+   "status": "pass",
+   "details": []
+  },
+  "tracked": {
+   "status": "pass",
+   "details": []
+  },
+  "untracked": {
+   "status": "pass",
+   "details": []
+  },
+  "ignored": {
+   "status": "pass",
+   "details": []
+  },
+  "nested_repos": {
+   "status": "pass",
+   "details": []
+  },
+  "stash": {
+   "status": "pass",
+   "details": []
+  },
+  "unpushed_head": {
+   "status": "pass",
+   "details": []
+  },
+  "unpushed_branches": {
+   "status": "pass",
+   "details": []
+  }
+ },
+ "overridden": [],
+ "branch_deleted": true,
+ "branch_kept_reason": null,
+ "warnings": []
+}

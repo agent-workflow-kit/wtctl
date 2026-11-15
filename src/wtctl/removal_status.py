@@ -7,7 +7,7 @@ passed; a check that could not run (the mirror refresh failed or timed out, the 
 unavailable) leaves it ``null`` or ``false``, never ``true``.
 
 TODO(#5): log the check outcomes when the log lands.
-TODO(#20): ``remove`` reuses these checks for steps 2 to 6 and again for the step-9 re-check.
+``wtctl.remover`` reuses these checks for steps 2 to 6 and again for the step-9 re-check.
 """
 
 from __future__ import annotations

@@ -468,12 +468,6 @@ def test_dry_run_changes_nothing_on_disk(w: RW, capsys) -> None:  # noqa: ANN001
     assert w.wt.is_dir()
 
 
-def test_remove_without_dry_run_is_not_implemented_here(w: RW, capsys) -> None:  # noqa: ANN001
-    w.start(capsys)
-    r = w.status(capsys, "--yes", cmd=("remove",))
-    assert r.code == 1 and w.wt.is_dir()
-
-
 def test_status_rejects_dry_run(w: RW, capsys) -> None:  # noqa: ANN001
     w.start(capsys)
     assert w.status(capsys, "--dry-run").code == 2

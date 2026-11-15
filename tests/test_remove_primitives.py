@@ -56,6 +56,7 @@ def test_last_entry_is_kept_when_another_entry_cannot_go(base: Path) -> None:
     with fsafe.open_anchor(str(base)) as a:
         mp = pytest.MonkeyPatch()
         mp.setattr(os, "unlink", unlink)
+        mp.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, unlink})
         try:
             res = fsafe.delete_tree(a, a.fd, "wt", last=".git")
         finally:

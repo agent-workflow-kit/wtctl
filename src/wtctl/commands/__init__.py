@@ -10,8 +10,7 @@ Handlers still to come:
 - TODO(#11): locate, clone
 - TODO(#18): adopt, forget
 - TODO(#19): status
-- TODO(#20): remove
-- TODO(#21): prune
+- TODO(#21): prune, `remove` of a throwaway
 - TODO(#22): extract
 - TODO(#23): reconcile
 """

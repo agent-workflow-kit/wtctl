@@ -21,6 +21,14 @@ from wtctl.gateway import Gateway
 class RR(RW):
     """``RW`` with a ``remove`` runner (a human or an automation actor, a TTY or none)."""
 
+    def build(self) -> RR:
+        """The world, with ``node_modules/`` ignored (so it is disposable) in every worktree."""
+        super().build()
+        info = self.clone / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        (info / "exclude").write_text("node_modules/\n")
+        return self
+
     def rm(
         self,
         *argv: str,
