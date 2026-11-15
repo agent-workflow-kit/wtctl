@@ -328,16 +328,15 @@ class Status:
 
     def partial_worktree_unlinked(self) -> None:
         """A ``partial`` worktree whose pointers are gone: only the recorded path is verified,
-        content checks do not run (Partial records)."""
+        content checks do not run (Partial records). The lock is still reported: nothing
+        overrides it."""
         r = self.record
         try:
-            self._open_recorded_directory()
-        except fsafe.FsafeError as exc:
-            if exc.kind != "missing":
-                return
-            # the tree was deleted and only the admin entry (if anything) is left to finish
-            self.directory_gone = True
+            self.directory_gone = self._open_recorded_directory()
+        except fsafe.FsafeError:
+            return  # a missing anchor or chain component, or any mismatch: not the recorded path
         self.checks["integrity"] = {"status": "pass", "details": []}
+        self.checks["locked"] = removal_integrity.lock_check(r)
         self.by_design_skipped = True
         self.warnings.append(
             f"{_escape(r['path'])} is partial and its git pointers are gone; content checks "
@@ -346,28 +345,48 @@ class Status:
         if self.directory_gone:
             self.warnings.append(f"{_escape(r['path'])} no longer exists")
 
-    def _open_recorded_directory(self) -> None:
+    def _open_recorded_directory(self) -> bool:
         """Open the remaining path as Partial records require: an owned record component by
         component below its recorded ``base_dir`` (whose identity is the recorded one, every
-        component on its device and mount), an adopted one by its own path; the opened directory
-        must have the recorded ``dir_id``."""
+        component on its device and mount), an adopted one below its parent; the opened directory
+        must have the recorded ``dir_id``. Returns True when the final component does not exist
+        under an anchor and chain that opened (the tree was deleted); a missing anchor or chain
+        component raises, as every other mismatch does."""
         r = self.record
         expected = removal_content._ident(r["dir_id"])
         base = r["base_dir"]
-        if not (r["owned"] and base):
-            with fsafe.open_anchor(r["path"], expected=expected):
-                return
-        rel = os.path.relpath(r["path"], base)
-        if rel in (".", "..") or rel.startswith("../") or os.path.isabs(rel):
-            raise fsafe.FsafeError("identity", f"{r['path']} is not below its root {base}")
-        recorded = removal_content._ident(self.state.anchor_identity(base))
-        if recorded is None:
-            raise fsafe.FsafeError("identity", f"no identity is recorded for the root {base}")
-        with fsafe.open_anchor(base, expected=recorded) as anchor:
-            fd = fsafe.open_chain(
-                anchor, anchor.fd, rel.split(os.sep), expected=expected, start_path=anchor.path
-            )
-            os.close(fd)
+        if r["owned"] and base:
+            rel = os.path.relpath(r["path"], base)
+            if rel in (".", "..") or rel.startswith("../") or os.path.isabs(rel):
+                raise fsafe.FsafeError("identity", f"{r['path']} is not below its root {base}")
+            recorded = removal_content._ident(self.state.anchor_identity(base))
+            if recorded is None:
+                raise fsafe.FsafeError("identity", f"no identity is recorded for the root {base}")
+            anchor_path, parts = base, rel.split(os.sep)
+            anchor = fsafe.open_anchor(anchor_path, expected=recorded)
+        else:
+            anchor_path, name = os.path.split(r["path"])
+            parts = [name]
+            anchor = fsafe.open_anchor(anchor_path, precheck=False)
+        with anchor:
+            parent = fsafe.open_chain(anchor, anchor.fd, parts[:-1], start_path=anchor.path)
+            try:
+                try:
+                    fd = fsafe.open_chain(
+                        anchor,
+                        parent,
+                        parts[-1:],
+                        expected=expected,
+                        start_path=os.path.join(anchor.path, *parts[:-1]),
+                    )
+                except fsafe.FsafeError as exc:
+                    if exc.kind == "missing":
+                        return True
+                    raise
+                os.close(fd)
+                return False
+            finally:
+                os.close(parent)
 
     # -- the verdict --------------------------------------------------------------------------
 

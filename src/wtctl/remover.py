@@ -91,6 +91,8 @@ class Remover:
         self.checks: dict[str, dict[str, Any]] = {}
         self.overridden: list[str] = []
         self.budget = fsafe_child.Budget()
+        # the deletion has a budget of its own, so the earlier steps cannot starve it
+        self.del_budget = fsafe_child.Budget()
         self.decision_ids: list[str] = list(ctx.decision_ids)
         self.head: str | None = None
         self.mirror: Mirror | None = None
@@ -122,10 +124,10 @@ class Remover:
         self.rec = rec
         if rec["admin_dir"] is None and rec["state"] != "creating":
             raise self._refuse("main_worktree", f"{rec['path']} is the clone's main worktree")
-        if not rec["owned"] or rec["state"] == "partial":
-            self.ctx.require_human()
         if rec["state"] not in ("active", "partial"):
             raise self._refuse("unlinked", f"{rec['id']} is {rec['state']}, not active")
+        if not rec["owned"] or rec["state"] == "partial":
+            self.ctx.require_human()
         self.st = Status(self.ctx, rec)
         self.st.git = self.git
         self.st.budget = self.budget
@@ -483,19 +485,23 @@ class Remover:
             rec = st9.record
             plan = self._plan_branch(rec)
             prepared = self._prepare_audits(rec, plan)
-            admin = removal_delete.admin_check(self.state, rec, self.budget)
+            admin = removal_delete.admin_check(self.state, rec, self.del_budget)
             if isinstance(admin, fsafe.FsafeError) or not admin.present:
                 raise self._unlinked(f"the admin entry of {rec['id']} cannot be opened")
             if admin.gitdir != os.path.join(rec["path"], ".git"):
                 raise self._unlinked(f"the admin entry of {rec['id']} names another path")
             if admin.locked or removal_integrity.lock_check(rec)["status"] != "pass":
                 raise self._refuse("locked", f"{rec['id']} is locked", details={"lock_reason": ""})
+            self._check_lease()
             self._begin(rec)
-            outcome = removal_delete.delete_worktree(self.state, rec, self.budget)
+            outcome = removal_delete.delete_worktree(self.state, rec, self.del_budget)
             self._after_tree(outcome, rec, prepared)
+            self._check_lease()
             self._finish_admin(rec, prepared)
+            self._check_lease()
+            self.journal.commit_audit(prepared.ok)  # before the branch is touched
             branch_deleted, kept = self._branch(rec, plan, prepared)
-        return self._finish(rec, prepared, branch_deleted, kept)
+        return self._finish(rec, branch_deleted, kept)
 
     # -- the partial flow ---------------------------------------------------------------------
 
@@ -505,6 +511,7 @@ class Remover:
         st.partial_worktree_unlinked()
         if st.checks.get("integrity", {}).get("status") != "pass":
             raise self._unlinked(f"{_escape(rec['path'])} is not the recorded remaining path")
+        self._locked_gate(rec, st.checks["locked"])
         st.skip_git_checks()
         self._in_use(st)
         st.checks["held"] = {"status": "skipped", "details": []}
@@ -512,18 +519,41 @@ class Remover:
         self._confirm("\n".join([f"finish removing {rec['name']}", *entries, *self.warnings]))
         self._pre_hooks()
         with self.state.lease(clone_lease(rec["clone_path"]), wait=self.config.lease_wait_s):
+            again = Status(self.ctx, self._fresh_record())  # the hooks and the prompt took time
+            again.budget = self.budget
+            again.checks = self.checks
+            again.warnings = self.warnings
+            self._in_use(again)
             plan = Plan(kept_reason=self._partial_kept_reason(rec))
             prepared = self._prepare_audits(rec, plan)
-            admin = removal_delete.admin_check(self.state, rec, self.budget)
+            admin = removal_delete.admin_check(self.state, rec, self.del_budget)
             if isinstance(admin, fsafe.FsafeError):
                 raise self._unlinked(f"the admin entry of {rec['id']} cannot be opened")
+            if admin.locked:
+                self._locked_gate(rec, removal_integrity.lock_check(rec))
+                raise self._refuse("locked", f"{rec['id']} is locked", details={"lock_reason": ""})
+            self._check_lease()
             self._begin(rec)
-            outcome = removal_delete.delete_worktree(
-                self.state, rec, self.budget, allow_missing=True
-            )
+            outcome = removal_delete.delete_worktree(self.state, rec, self.del_budget)
             self._after_tree(outcome, rec, prepared)
+            self._check_lease()
             self._finish_admin(rec, prepared)
-        return self._finish(rec, prepared, False, plan.kept_reason)
+            self._check_lease()
+            self.journal.commit_audit(prepared.ok)
+        return self._finish(rec, False, plan.kept_reason)
+
+    def _locked_gate(self, rec: Record, lock: dict[str, Any]) -> None:
+        """Nothing overrides the lock of the admin entry, finishing a partial record included."""
+        if lock["status"] == "fail":
+            self.checks["locked"] = lock
+            reason = lock["details"][0]["lock_reason"]
+            raise self._refuse("locked", f"{rec['id']} is locked", details={"lock_reason": reason})
+
+    def _check_lease(self) -> None:
+        """The record lease is what keeps another wtctl out: once it is lost, stop (the record
+        is as truthful as the last step left it)."""
+        if self.rlease.lost:
+            raise WtctlError("busy", f"the lease on {self.rid} was lost during the removal")
 
     def _partial_kept_reason(self, rec: Record) -> str:
         if not rec["created_branch"]:
@@ -571,12 +601,15 @@ class Remover:
         if outcome.status == "refused":
             self._revert(rec)
             why = outcome.error.kind if outcome.error else "unknown"
-            raise self._unlinked(f"{_escape(rec['path'])} is not the recorded worktree ({why})")
+            hint = "; unmount it first" if why == "mount_point" else ""
+            raise self._unlinked(
+                f"{_escape(rec['path'])} is not the recorded worktree ({why}){hint}"
+            )
         if outcome.status == "partial":
             self._partial(rec, rec["path"], outcome.remaining, outcome.remaining_total, prepared)
 
     def _finish_admin(self, rec: Record, prepared: Prepared) -> None:
-        state, remaining = removal_delete.delete_admin(self.state, rec, self.budget)
+        state, remaining = removal_delete.delete_admin(self.state, rec, self.del_budget)
         if state == "foreign":
             self.warnings.append(
                 f"the admin entry {_escape(rec['admin_dir'] or '')} names another path and was left"
@@ -590,10 +623,10 @@ class Remover:
         shown = remaining or [_escape(path)]
         error = f"could not delete {shown[0]}" + (f" and {total - 1} more" if total > 1 else "")
         self.state.transition(rec["id"], ("active", "partial"), "partial", last_error=error)
-        self._audit_failed(prepared)
+        note = self._audit_failed(prepared)
         raise WtctlError(
             "partial",
-            f"removing {rec['id']} left {total} entr{'y' if total == 1 else 'ies'} behind",
+            f"removing {rec['id']} left {total} entr{'y' if total == 1 else 'ies'} behind{note}",
             details={"remaining_path": _escape(path), "remaining": shown[:100]},
         )
 
@@ -657,6 +690,8 @@ class Remover:
             timeout=60,
         )
         prepared.branch_deleted = True
+        if prepared.branch is not None:
+            self.journal.commit_audit(prepared.branch)
         return True, None
 
     # -- audit --------------------------------------------------------------------------------
@@ -688,20 +723,23 @@ class Remover:
             )
         return Prepared(ok, bad, branch)
 
-    def _audit_failed(self, prepared: Prepared) -> None:
-        self.journal.commit_audit(prepared.failed)
+    def _audit_failed(self, prepared: Prepared) -> str:
+        """Append the ``error`` audit record; a failure to write it must not hide the partial
+        error (its ``remaining`` is what the human needs), so it only adds a note."""
+        try:
+            self.journal.commit_audit(prepared.failed)
+        except audit.JournalIOError as exc:
+            self.warnings.append(f"the audit record could not be written: {exc.message}")
+            return f" (the audit record could not be written: {_escape(exc.message)})"
+        return ""
 
     # -- step 11 ------------------------------------------------------------------------------
 
-    def _finish(
-        self, rec: Record, prepared: Prepared, branch_deleted: bool, kept: str | None
-    ) -> Result:
+    def _finish(self, rec: Record, branch_deleted: bool, kept: str | None) -> Result:
+        self._check_lease()
         removed = self.state.transition(
             rec["id"], ("active", "partial"), "removed", last_error=None
         )
-        self.journal.commit_audit(prepared.ok)
-        if prepared.branch is not None and prepared.branch_deleted:
-            self.journal.commit_audit(prepared.branch)
         out = record_object(removed, self.state.bootstrap_summary(removed["id"]))
         payload = hooks.build_payload(
             "post-remove",

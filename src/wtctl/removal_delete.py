@@ -42,7 +42,6 @@ class TreeOutcome:
     remaining: list[str] = field(default_factory=list)
     remaining_total: int = 0
     error: fsafe.FsafeError | None = None
-    gone: bool = False
 
 
 def _remaining(base: str, entries: list[dict[str, Any]]) -> list[str]:
@@ -58,7 +57,9 @@ def delete_args(state: Any, record: dict[str, Any]) -> dict[str, Any]:
     ``/`` is not compared), the chain the components between it and the directory's parent."""
     path = record["path"]
     base = record.get("base_dir")
-    if base and record.get("owned"):
+    if record.get("owned"):
+        if not base:
+            raise fsafe.FsafeError("identity", f"the owned record of {path} has no recorded root")
         identity = state.anchor_identity(base)
         if not identity:
             raise fsafe.FsafeError("identity", f"no identity is recorded for the root {base}")
@@ -82,10 +83,10 @@ def delete_args(state: Any, record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def delete_worktree(
-    state: Any, record: dict[str, Any], budget: fsafe_child.Budget, *, allow_missing: bool = False
-) -> TreeOutcome:
-    """Delete the worktree directory, its ``.git`` pointer last."""
+def delete_worktree(state: Any, record: dict[str, Any], budget: fsafe_child.Budget) -> TreeOutcome:
+    """Delete the worktree directory, its ``.git`` pointer last. A directory that is already gone,
+    under an anchor that opened and matched its recorded identity, counts as deleted; a missing
+    anchor or chain component is a refusal (``missing``): the tree may exist elsewhere."""
     path = record["path"]
     try:
         args = {**delete_args(state, record), "last": ".git"}
@@ -93,19 +94,33 @@ def delete_worktree(
         return TreeOutcome("refused", error=exc)
     res = removalfs.run("delete_tree", args, budget, fsafe_child.REMOVE_DEADLINE)
     if res.timed_out:
+        if res.pid is None:  # no child ever ran: nothing was deleted
+            return TreeOutcome("refused", error=res.error)
         return TreeOutcome("partial", [fsafe.escape_for_details(path)], 1, res.error)
     if not res.ok:
         err = res.error
-        if err is not None and err.kind == "missing" and allow_missing:
-            return TreeOutcome("deleted", gone=True)
         if err is not None and err.kind in NOTHING_DELETED:
             return TreeOutcome("refused", error=err)
         return TreeOutcome("partial", [fsafe.escape_for_details(path)], 1, err)
     value = res.value or {}
     total = int(value.get("remaining_total", 0))
     if total == 0:
-        return TreeOutcome("deleted", gone=int(value.get("removed", 0)) == 0)
+        return TreeOutcome("deleted")
+    if _root_not_opened(value):
+        # the directory is a mount point (or became one): `delete_tree` did not enter it
+        err = fsafe.FsafeError("mount_point", f"{path} is a mount point", path=path)
+        return TreeOutcome("refused", error=err)
     return TreeOutcome("partial", _remaining(path, value.get("remaining", [])), total)
+
+
+def _root_not_opened(value: dict[str, Any]) -> bool:
+    """``delete_tree`` reports a root it would not enter as a ``mount_point`` entry with an empty
+    path and returns at once, so nothing was deleted (it is the only entry, and no entry went)."""
+    if int(value.get("removed", 0)) != 0 or int(value.get("remaining_total", 0)) != 1:
+        return False
+    return any(
+        e.get("path") == [] and e.get("reason") == "mount_point" for e in value.get("remaining", [])
+    )
 
 
 def admin_args(record: dict[str, Any], state: Any) -> dict[str, Any] | None:
