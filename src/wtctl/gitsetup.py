@@ -44,7 +44,7 @@ def private_dir() -> Iterator[str]:
 def open_git(config: Any, gateway: Gateway) -> Git:
     """The hardened git for this invocation (``git_too_old``, exit 12, below 2.34).
 
-    TODO(#15): honored filter drivers (``load_filter_policy``) are wired by ``create``; locate and
+    Honored filter drivers (``load_filter_policy``) are wired by ``create`` itself; locate and
     clone never check out user content with filters.
     """
     git_bin = resolve_binary("git", os.environ.get("PATH", ""), config.git_bin)

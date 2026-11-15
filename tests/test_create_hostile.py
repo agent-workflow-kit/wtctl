@@ -516,3 +516,68 @@ def test_an_honored_driver_refuses_unsafe_lfsconfig_of_the_checkout(
 def test_the_driver_check_only_runs_for_an_honored_driver(w: CW, capsys) -> None:  # noqa: ANN001
     w.g(["config", "lfs.url", "https://evil.test/lfs"])
     ok(w.create(capsys))
+
+
+# -- more vectors -------------------------------------------------------------------------------
+
+
+def test_a_planted_promisor_cannot_fetch_during_the_checkout(w: CW, capsys) -> None:  # noqa: ANN001
+    # a partial clone without a checkout: the blobs of `local-b` are missing, so `worktree add`
+    # needs them, and the planted uploadpack is what a lazy fetch would run
+    shutil_rm = __import__("shutil").rmtree
+    shutil_rm(w.clone)
+    plain_git(["clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{w.remote}",
+               str(w.clone)], cwd=w.tmp, home=w.home)  # fmt: skip
+    w.g(["remote", "set-url", "origin", str(w.remote)])
+    w.g(["branch", "local-b", "main"])
+    markers = w.tmp / "markers"
+    markers.mkdir()
+    payload = script(w.tmp / "payload.sh", f'echo "$0 $*" >> {markers}/hit\nexit 1')
+    w.g(["config", "remote.origin.uploadpack", payload])
+    w.g(["config", "extensions.partialClone", "origin"])
+    plain_git(["cat-file", "-p", "local-b:c1.txt"], cwd=w.clone, home=w.home)
+    assert (markers / "hit").exists(), "the control did not fire: the lazy fetch is dead"
+    (markers / "hit").unlink()
+    before = settled(w)
+    r = w.create(capsys, "--branch", "local-b")
+    assert r.code in (0, 12), r.out
+    assert sorted(os.listdir(markers)) == []
+    if r.code == 12:
+        assert settled(w) == before and w.records() == []
+
+
+def test_a_worktree_with_a_forged_porcelain_path_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
+    forged = w.tmp / f"x\n\nworktree {w.tmp}/fake\nHEAD {w.shas['c3']}\nbranch refs/heads/zzz"
+    r = plain_git(["worktree", "add", "-q", "--detach", str(forged)], cwd=w.clone, home=w.home)
+    if r.returncode != 0:
+        pytest.skip("this git refuses a newline in a worktree path")
+    r = w.create(capsys, "--branch", "local-b")
+    assert r.code == 1 and "worktree" in r.json()["error"]["message"]
+    assert w.records() == []
+
+
+def test_a_newline_in_the_rendered_path_is_create_failed(w: CW, capsys) -> None:  # noqa: ANN001
+    w.top["worktree_path"] = "{root}/a\nb/{name}"
+    r = w.create(capsys)
+    assert r.code in (2, 12)
+    assert w.records() == []
+
+
+def test_golden_json_shape(w: CW, capsys) -> None:  # noqa: ANN001
+    data = ok(w.create(capsys, "--name", "golden", "--label", "k=v", "--holder", "h"))
+    rec = data["record"]
+    for volatile in ("id", "created", "updated", "dir_id", "common_id", "admin_dir"):
+        assert rec.pop(volatile)
+    root = str(w.root.resolve() / "worktrees")
+    assert rec == {
+        "object_type": "worktree", "owned": True, "state": "active", "repo": REPO,
+        "clone_path": str(w.clone), "common_dir": str(w.clone / ".git"),
+        "base_dir": root, "root_id": None, "path": f"{root}/example.test/org/repo/golden",
+        "name": "golden", "branch": "wt/golden", "created_branch": True,
+        "base": "refs/heads/main", "base_sha": w.shas["c3"], "head_at_create": w.shas["c3"],
+        "ref": None, "source": None, "depth": None, "fetch_url": str(w.remote),
+        "remote": "origin", "labels": ["k=v"], "holders": ["h"], "baseline_digest": None,
+        "bootstrap": {"state": "none", "steps": [], "created_paths_count": 0},
+        "missing_since": None, "removed_at": None, "last_error": None,
+    }  # fmt: skip
+    assert set(data) == {"record", "branch_action", "bootstrap", "reused", "warnings", "dry_run"}

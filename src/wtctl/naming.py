@@ -10,6 +10,11 @@ import posixpath
 import re
 from collections.abc import Iterator
 
+
+class PathNewlineError(ValueError):
+    """A rendered path holds a newline or NUL (git 2.34's porcelain is line-based)."""
+
+
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 MAX_NAME = 64
 MAX_SUFFIX = 1000  # candidates tried before create gives up on finding a free name
@@ -71,7 +76,7 @@ def render_path(
     }
     rendered = _render(template, values)
     if "\n" in rendered or "\x00" in rendered:
-        raise ValueError("the rendered path contains a newline or NUL")
+        raise PathNewlineError("the rendered path contains a newline or NUL")
     norm = posixpath.normpath(rendered)
     base = posixpath.normpath(root)
     if not posixpath.isabs(norm) or not norm.startswith(base.rstrip("/") + "/"):

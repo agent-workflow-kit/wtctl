@@ -24,7 +24,7 @@ from ..hardgit import Git, load_filter_policy
 from ..locate import Resolver, describe_mount, identity_str
 from ..mirror import Mirror, Tips
 from ..packs import clone_has_commit, transfer_base
-from ..state import Lease, Record, State, check_holder, clone_lease, state_path
+from ..state import Conflict, Lease, Record, State, check_holder, clone_lease, state_path
 from ..worktrees import SHA, AddSpec
 
 NAME_RE = naming.NAME_RE
@@ -232,9 +232,14 @@ class Creator:
         decision_ids = self._pre_create(plan)
         self._prepare_root(write=True)
         # 12. the record and its lease, in one transaction
-        record, rlease = self.state.insert_record_leased(
-            record_fields, labels=o.labels, holders=[o.holder] if o.holder else []
-        )
+        try:
+            record, rlease = self.state.insert_record_leased(
+                record_fields, labels=o.labels, holders=[o.holder] if o.holder else []
+            )
+        except Conflict as exc:  # another actor took the name or path since step 7 and 10
+            raise WtctlError(
+                "refused", f"{self.path} was taken meanwhile ({exc.column})", reason="path_exists"
+            ) from None
         try:
             self._add(plan, record, lease)
         except BaseException:
@@ -280,6 +285,8 @@ class Creator:
                 name=name,
                 record_id=self.rid,
             )
+        except naming.PathNewlineError as exc:
+            raise WtctlError("create_failed", f"worktree_path cannot be used: {exc}") from None
         except ValueError as exc:
             raise UsageError(f"worktree_path cannot be used: {exc}") from None
 
