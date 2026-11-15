@@ -630,6 +630,8 @@ def test_default_config_seam_reads_the_private_config(
 def test_default_state_seam_raises_not_implemented_internal(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Behave as if the state module defined no seam function.
+    monkeypatch.setattr("wtctl.context._seam", lambda module, attr: None)
     install_handler(monkeypatch, "list", lambda ctx: Result({"s": ctx.state}))
     r = run_cli(capsys, "--json", "list")
     assert "not implemented yet (see #4)" in r.json()["error"]["message"]
