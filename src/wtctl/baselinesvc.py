@@ -113,12 +113,14 @@ def refusal(
     rows: list[dict[str, Any]],
     *,
     anchors: list[dict[str, Any]] | None = None,
+    confirming: bool = False,
 ) -> WtctlError:
     """``repo_config_changed`` with the changed items. Never an empty ``items`` or
     ``changed_classes`` (the schema forbids them): with no rows, moved ``anchors`` stand alone in
-    ``details``; with neither, nothing differs from the record and the state only moved under
-    the caller (``busy``)."""
-    if not rows and not anchors:
+    ``details``; with neither, the recorded digest alone disagrees with the rows and the refusal
+    carries just the two digests. Only a caller in ``baseline accept``'s confirm window
+    (``confirming``) reads that as the state moving under it (``busy``)."""
+    if not rows and not anchors and confirming:
         return WtctlError(
             "busy",
             f"the baseline of {record['id']} moved while it was being confirmed; run it again",
@@ -128,7 +130,7 @@ def refusal(
         "recorded_digest": recorded_digest(record),
     }
     fields: dict[str, Any] = {}
-    what = "an anchor identity"
+    what = "an anchor identity" if anchors else "the recorded digest"
     if rows:
         classes = repobaseline.changed_classes(rows)
         what = " and ".join(classes)

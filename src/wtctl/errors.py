@@ -153,8 +153,14 @@ def _validate(code: str, fields: Mapping[str, Any]) -> None:
             if not fields["items"]:
                 fail("items needs at least 1 entry")
             details_need(("changed_classes",))
-        elif not (isinstance(details, dict) and details.get("anchors")):
-            fail("items is required for reason repo_config_changed (or details.anchors)")
+        elif not (
+            isinstance(details, dict)
+            and (details.get("anchors") or ("digest" in details and "recorded_digest" in details))
+        ):
+            fail(
+                "items is required for reason repo_config_changed "
+                "(or details.anchors, or details.digest with details.recorded_digest)"
+            )
     if reason == "branch_in_use" and "holder_id" not in fields:
         fail("holder_id is required for reason branch_in_use")
     if "holder_id" in fields and reason not in ("branch_in_use", "path_exists"):

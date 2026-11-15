@@ -188,7 +188,9 @@ def _decide(ctx: Context, record: dict[str, Any], write_state: Any) -> Result:
     ):
         # it moved while the human decided (possibly back to the recorded state: then there are
         # no rows to show and the refusal is `busy`)
-        raise baselinesvc.refusal(record, again.current, again.rows, anchors=again.moved())
+        raise baselinesvc.refusal(
+            record, again.current, again.rows, anchors=again.moved(), confirming=True
+        )
     updates: dict[str, Any] = {}
     if again.links.common_id != record["common_id"]:
         updates["common_id"] = again.links.common_id

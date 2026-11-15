@@ -41,7 +41,8 @@ def w(tmp_path: Path, private_home: Path) -> CW:
 def test_refusal_never_has_empty_lists(w: CW, capsys) -> None:  # noqa: ANN001
     rec = made(w, capsys)
     cur = repobaseline.Baseline([], "0" * 64)
-    err = baselinesvc.refusal({"id": rec["id"], "baseline_digest": "1" * 64}, cur, [])
+    record = {"id": rec["id"], "baseline_digest": "1" * 64}
+    err = baselinesvc.refusal(record, cur, [], confirming=True)
     assert err.code == "busy"
     anchors = [
         {"anchor": "common_dir", "path": "/x", "recorded": "1:2", "current": "3:4",
@@ -62,6 +63,34 @@ def test_expect_digest_mismatch_with_only_a_moved_anchor(w: CW, capsys) -> None:
     assert "items" not in e and "changed_classes" not in e["details"]
     assert [a["anchor"] for a in e["details"]["anchors"]] == ["worktree_dir"]
     assert row(w, rec["id"])["dir_id"] == "1:2"
+
+
+def test_verify_unchanged_digest_only_mismatch_is_a_valid_refusal(w: CW, capsys) -> None:  # noqa: ANN001
+    rec = made(w, capsys)
+    set_col(w, rec["id"], baseline_digest="f" * 64)
+    e = err_of(check(w, capsys, rec["id"]), 20, "repo_config_changed")
+    assert "items" not in e and "changed_classes" not in e["details"]
+    assert e["details"]["recorded_digest"] == "f" * 64
+    assert e["details"]["digest"] == rec["baseline_digest"]
+
+
+def test_bootstrap_rerun_precheck_digest_only_mismatch_is_a_valid_refusal(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    rec = made(w, capsys)
+    set_col(w, rec["id"], baseline_digest="f" * 64)
+    e = err_of(w.cli(capsys, "bootstrap", rec["id"], human=True), 20, "repo_config_changed")
+    assert "items" not in e and e["details"]["recorded_digest"] == "f" * 64
+
+
+def test_refusal_without_confirming_is_digest_only_and_with_it_busy() -> None:
+    cur = repobaseline.Baseline([], "0" * 64)
+    record = {"id": "x", "baseline_digest": "1" * 64}
+    err = baselinesvc.refusal(record, cur, [])
+    assert err.code == "refused" and "items" not in err.fields
+    validate("wtctl/cli/error.json", err.to_object())
+    assert baselinesvc.refusal(record, cur, [], confirming=True).code == "busy"
 
 
 def test_a_change_reverted_while_confirming_is_busy_not_an_empty_refusal(
