@@ -41,6 +41,90 @@ def run(
     )
 
 
+@dataclass(frozen=True)
+class GitResult:
+    """Outcome of one git process: raw bytes (git output is not always text) and a timeout flag."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+
+    @property
+    def out(self) -> str:
+        return self.stdout.decode("utf-8", "replace")
+
+    @property
+    def err(self) -> str:
+        return self.stderr.decode("utf-8", "replace")
+
+
+# Seconds to wait for the pipes to close after the process group was killed.
+KILL_GRACE = 5.0
+
+
+def _drain(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
+    """Output after a kill: the pipes close once the group is dead; else return what was read.
+
+    A descendant that left the process group (``setsid``) can keep the pipes open for as long as
+    it lives; waiting for end-of-file would then hang forever, so the wait is bounded and the
+    pipes are closed from our side.
+    """
+    try:
+        return proc.communicate(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired as e:
+        out, err = e.output or b"", e.stderr or b""
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+        proc.wait()
+        return out, err
+
+
+def run_git(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    cwd: str,
+    stdin: bytes | None = None,
+    timeout: float | None = None,
+) -> GitResult:
+    """Run git with exactly ``env`` (nothing is inherited) in its own process group.
+
+    The group is the one this call created (the child is its leader), so on expiry the whole
+    group is killed through the leader's pid captured at launch, never by pattern.
+    ``timed_out`` is set only when git itself was still running at expiry; a git that already
+    exited (its pipes held open by a descendant) is returned with its own exit status.
+    """
+    # TODO(#13): stdout is buffered in memory; pack-objects --stdout needs stdout_path or an fd.
+    proc = subprocess.Popen(
+        argv,
+        env=dict(env),
+        cwd=cwd,
+        stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    pgid = proc.pid
+    try:
+        out, err = proc.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        was_running = proc.poll() is None
+        if was_running:
+            # Only while the leader is unreaped is its pid certainly still this group's id; once
+            # it has exited, a recycled pid could name an unrelated group, so descendants that
+            # outlive it are left to the bounded wait below.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        out, err = _drain(proc)
+        proc.wait()
+        return GitResult(proc.returncode, out, err, timed_out=was_running)
+    return GitResult(proc.returncode, out, err)
+
+
 # --- crontab (#8) -------------------------------------------------------------------------------
 
 
@@ -347,12 +431,17 @@ class Gateway:
     procs: ProcessIdentity = field(default_factory=system_process_identity)
     scanner: ProcessScanner = field(default_factory=UnavailableScanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
+    git_runner: Callable[..., GitResult] = run_git
     crontab_runner: Callable[..., subprocess.CompletedProcess[bytes]] = field(
         default_factory=lambda: run_crontab  # looked up at call time, so tests can patch it
     )
 
     def run(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return self.runner(argv, **kwargs)
+
+    def git(self, argv: list[str], **kwargs: object) -> GitResult:
+        """Run a fully built git command line (see ``wtctl.hardgit``, the only caller)."""
+        return self.git_runner(argv, **kwargs)
 
     def crontab(
         self, args: list[str], stdin: bytes | None = None
