@@ -10,6 +10,7 @@ Plugs in as ``open_state(ctx)`` (see ``context.py``); the handle is a ``State``.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import secrets
 import sqlite3
@@ -424,10 +425,24 @@ class State:
         return None if row is None else self._build(row)
 
     def records(
-        self, *, states: Collection[str] | None = None, include_tombstones: bool = False
+        self,
+        *,
+        states: Collection[str] | None = None,
+        include_tombstones: bool = False,
+        repo: str | None = None,
+        labels: Iterable[str] = (),
+        object_type: str | None = None,
+        created_before: str | None = None,
+        newest_first: bool = False,
     ) -> list[Record]:
-        """Records ordered by creation time then id. Live ones unless ``states`` or
-        ``include_tombstones`` says otherwise. TODO(#7): label and repo filters for `list`."""
+        """Records ordered by creation time then id (reversed with ``newest_first``).
+
+        Live ones unless ``states`` or ``include_tombstones`` says otherwise. The filters AND
+        together: ``repo`` is an exact repo id, each of ``labels`` (``key=value``, parsed by the
+        label grammar, a usage error otherwise) must be one of the record's pairs, ``object_type``
+        is ``worktree`` or ``throwaway`` and ``created_before`` is a ``created`` timestamp the
+        record must be strictly older than (same fixed-width text form).
+        """
         if states is not None:
             wanted = list(states)
             for s in wanted:
@@ -436,11 +451,61 @@ class State:
             wanted = list(STATES)
         else:
             wanted = list(LIVE_STATES)
-        marks = ",".join("?" * len(wanted))
+        where = [f"state IN ({','.join('?' * len(wanted))})"]
+        params: list[Any] = list(wanted)
+        if repo is not None:
+            where.append("repo = ?")
+            params.append(repo)
+        if object_type is not None:
+            if object_type not in OBJECT_TYPES:
+                raise ValueError(f"unknown object_type {object_type!r}")
+            where.append("object_type = ?")
+            params.append(object_type)
+        if created_before is not None:
+            where.append("created < ?")
+            params.append(created_before)
+        for key, value in sorted({labelmod.parse_label(x) for x in labels}):
+            where.append(
+                "EXISTS (SELECT 1 FROM labels l WHERE l.record_id = records.id "
+                'AND l."key" = ? AND l.value = ?)'
+            )
+            params += [key, value]
+        order = "created DESC, id DESC" if newest_first else "created, id"
         rows = self._conn.execute(
-            f"SELECT * FROM records WHERE state IN ({marks}) ORDER BY created, id", wanted
+            f"SELECT * FROM records WHERE {' AND '.join(where)} ORDER BY {order}", params
         ).fetchall()
         return [self._build(r) for r in rows]
+
+    def bootstrap_info(self, record_id: str) -> dict[str, Any]:
+        """The record object's ``bootstrap`` member: state, the last run's steps in order, and
+        the size of the bootstrap-created set."""
+        row = self._conn.execute(
+            "SELECT bootstrap_state FROM records WHERE id = ?", (record_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(record_id)
+        runs = self._conn.execute(
+            "SELECT MAX(run) FROM bootstrap_runs WHERE record_id = ?", (record_id,)
+        ).fetchone()[0]
+        steps = []
+        if runs is not None:
+            for r in self._conn.execute(
+                'SELECT argv_json, "exit", duration_ms, output_tail FROM bootstrap_runs '
+                "WHERE record_id = ? AND run = ? ORDER BY step",
+                (record_id, runs),
+            ):
+                steps.append(
+                    {
+                        "argv": json.loads(r[0]),
+                        "exit": r[1],
+                        "duration_ms": r[2] if r[2] is not None else 0,
+                        "output_tail": r[3] if r[3] is not None else "",
+                    }
+                )
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM bootstrap_paths WHERE record_id = ?", (record_id,)
+        ).fetchone()[0]
+        return {"state": row[0], "steps": steps, "created_paths_count": count}
 
     def insert_record(
         self,

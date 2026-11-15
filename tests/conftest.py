@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -30,3 +31,14 @@ def private_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
 def no_dumpable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Do not make the pytest process non-dumpable; a dedicated test covers the real call."""
     monkeypatch.setattr(gateway, "disable_dumpable", lambda: True)
+
+
+@pytest.fixture(autouse=True)
+def no_real_crontab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A default Gateway must never reach the user's real crontab; tests pass a fake."""
+
+    def refuse(args: list[str], stdin: bytes | None = None) -> NoReturn:
+        # pytest's Failed is a BaseException: the CLI's `except Exception` cannot swallow it.
+        pytest.fail(f"a test ran the real crontab: {args}", pytrace=False)
+
+    monkeypatch.setattr(gateway, "run_crontab", refuse)
