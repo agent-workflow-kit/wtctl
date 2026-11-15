@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def private_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
     monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
-    for name in ("WTCTL_ROOT", "WTCTL_LEASE_WAIT", "WTCTL_GIT_BIN"):
+    for name in [n for n in os.environ if n.startswith("WTCTL_")]:
         monkeypatch.delenv(name, raising=False)
     yield home
 
