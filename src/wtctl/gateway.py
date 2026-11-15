@@ -37,6 +37,38 @@ def run(
     )
 
 
+# --- crontab (#8) -------------------------------------------------------------------------------
+
+
+def _find_executable(name: str, path: str) -> str | None:
+    """``name`` in the absolute entries of ``path`` (relative and empty entries are ignored, so
+    a planted program in the working directory is never run; design D49)."""
+    for entry in path.split(os.pathsep):
+        candidate = os.path.join(entry, name)
+        if os.path.isabs(entry) and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def run_crontab(args: list[str], stdin: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run ``crontab <args>`` with bytes in and out (a crontab is rewritten without re-encoding),
+    in the C locale so its "no crontab" message can be recognised.
+
+    Raises ``FileNotFoundError`` when there is no ``crontab`` on an absolute ``PATH`` entry.
+    """
+    program = _find_executable("crontab", os.environ.get("PATH", ""))
+    if program is None:
+        raise FileNotFoundError("crontab")
+    return subprocess.run(
+        [program, *args],
+        input=stdin,
+        capture_output=True,
+        timeout=30,
+        check=False,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+
+
 @dataclass(frozen=True)
 class DeadlineResult:
     """Outcome of ``run_with_deadline``; ``returncode`` is None when the child was killed."""
@@ -311,9 +343,17 @@ class Gateway:
     procs: ProcessIdentity = field(default_factory=system_process_identity)
     scanner: ProcessScanner = field(default_factory=UnavailableScanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
+    crontab_runner: Callable[..., subprocess.CompletedProcess[bytes]] = field(
+        default_factory=lambda: run_crontab  # looked up at call time, so tests can patch it
+    )
 
     def run(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return self.runner(argv, **kwargs)
+
+    def crontab(
+        self, args: list[str], stdin: bytes | None = None
+    ) -> subprocess.CompletedProcess[bytes]:
+        return self.crontab_runner(args, stdin)
 
 
 _PR_SET_DUMPABLE = 4
