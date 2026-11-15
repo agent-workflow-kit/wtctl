@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -111,3 +112,191 @@ def test_git_that_exited_before_the_deadline_is_not_a_timeout(
         assert b"done" in r.stdout
     finally:
         _kill_recorded(pidfile)
+
+
+MOUNTINFO = (
+    "22 28 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw\n"
+    "100 28 0:90 / /mnt/with\\040space rw,relatime shared:1 - tmpfs none rw,uid=1000\n"
+    "101 28 0:91 / /mnt/fuse rw,nosuid,nodev - fuse.sshfs me@host:/ rw,user_id=1000\n"
+    "102 28 8:1 /sub /mnt/bind rw - ext4 /dev/sda1 rw\n"
+)
+
+
+def test_parse_mountinfo_decodes_escapes_and_fields() -> None:
+    entries = gateway.parse_mountinfo(MOUNTINFO)
+    by_point = {e.mount_point: e for e in entries}
+    assert by_point["/mnt/with space"].mount_id == 100
+    assert by_point["/mnt/with space"].fstype == "tmpfs"
+    assert by_point["/mnt/fuse"].fstype == "fuse.sshfs"
+    assert by_point["/mnt/fuse"].source == "me@host:/"
+    assert by_point["/mnt/bind"].source == "/dev/sda1"
+    assert len(entries) == 4
+
+
+def test_parse_mountinfo_skips_malformed_lines() -> None:
+    assert gateway.parse_mountinfo("garbage\n\n1 2 3\n") == []
+
+
+def test_parse_mount_command_output_macos_style() -> None:
+    text = (
+        "/dev/disk3s1 on / (apfs, local, journaled)\nmacfuse@0 on /Volumes/x y (macfuse, nodev)\n"
+    )
+    entries = gateway.parse_mount_command(text)
+    assert [(e.mount_point, e.fstype) for e in entries] == [
+        ("/", "apfs"),
+        ("/Volumes/x y", "macfuse"),
+    ]
+    assert all(e.mount_id is None for e in entries)
+
+
+def test_fd_mount_id_reads_fdinfo_on_linux(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    import os
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("linux only")
+    fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        mnt = gateway.fd_mount_id(fd)
+    finally:
+        os.close(fd)
+    assert isinstance(mnt, int)
+
+
+def test_run_with_deadline_returns_output() -> None:
+    r = gateway.run_with_deadline(
+        [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read().upper())"],
+        stdin=b"abc",
+        timeout=30,
+    )
+    assert (r.returncode, r.stdout, r.timed_out) == (0, b"ABC", False)
+
+
+def test_run_with_deadline_kills_exact_pid_on_expiry() -> None:
+    import os
+
+    started: list[int] = []
+    r = gateway.run_with_deadline(
+        [sys.executable, "-c", "import time; time.sleep(600)"],
+        timeout=0.5,
+        on_start=started.append,
+    )
+    assert r.timed_out
+    assert started == [r.pid]
+    with pytest.raises(ProcessLookupError):  # reaped: the exact PID we started is gone
+        os.kill(r.pid, 0)
+
+
+def test_run_with_deadline_kills_the_child_when_on_start_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import signal
+    import subprocess
+
+    started: list[int] = []
+    procs: list[Any] = []
+    real_popen: Any = subprocess.Popen
+
+    def capture(*a: Any, **k: Any) -> Any:
+        p = real_popen(*a, **k)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(gateway.subprocess, "Popen", capture)
+
+    def boom(pid: int) -> None:
+        started.append(pid)
+        raise RuntimeError("on_start failed")
+
+    with pytest.raises(RuntimeError):
+        gateway.run_with_deadline(
+            [sys.executable, "-c", "import time; time.sleep(600)"], timeout=30, on_start=boom
+        )
+    alive = True
+    try:
+        os.kill(started[0], 0)
+    except ProcessLookupError:
+        alive = False
+    if alive:  # only if the fix regressed: do not leak the sleeper
+        os.kill(started[0], signal.SIGKILL)
+    assert not alive
+    p = procs[0]
+    assert p.stdin is not None and p.stdout is not None and p.stderr is not None
+    assert p.stdin.closed and p.stdout.closed and p.stderr.closed
+
+
+def test_system_process_identity_of_self_is_stable_and_unknown_pid_is_none() -> None:
+    import os
+
+    ident = gateway.system_process_identity()
+    mine = ident.start_time(os.getpid())
+    assert mine and mine == ident.start_time(os.getpid())
+    assert ident.start_time(2**22 + 12345) is None
+
+
+def test_system_process_identity_differs_between_processes() -> None:
+    import os
+    import subprocess
+
+    ident = gateway.system_process_identity()
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        theirs = ident.start_time(p.pid)
+        assert theirs and theirs != ident.start_time(os.getpid())
+    finally:
+        p.kill()
+        p.wait()
+    assert ident.start_time(p.pid) is None  # reaped
+
+
+def test_zombie_counts_as_not_running() -> None:
+    import subprocess
+    import time
+
+    ident = gateway.system_process_identity()
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and ident.start_time(p.pid) is not None:
+            time.sleep(0.02)  # exited but not yet reaped: a zombie
+        assert ident.start_time(p.pid) is None
+    finally:
+        p.wait()
+
+
+def test_ps_fallback_parses_pins_tz_and_locale_and_reports_missing() -> None:
+    import subprocess
+
+    seen: list[list[str]] = []
+
+    def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        seen.append(argv)
+        if argv[-1] == "5":
+            return subprocess.CompletedProcess(argv, 0, "Ss   Mon Jan  5 10:00:00 2026\n", "")
+        if argv[-1] == "7":
+            return subprocess.CompletedProcess(argv, 0, "Z+   Mon Jan  5 10:00:00 2026\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    ident = gateway.PsProcessIdentity(runner=fake)
+    assert ident.start_time(5) == "Mon Jan  5 10:00:00 2026"
+    assert ident.start_time(6) is None
+    assert ident.start_time(7) is None  # zombie
+    assert seen[0][:3] == ["env", "TZ=UTC", "LC_ALL=C"]
+    assert seen[0][3:] == ["ps", "-o", "stat=,lstart=", "-p", "5"]
+
+
+def test_ps_fallback_treats_unexecutable_ps_as_unreadable() -> None:
+    import subprocess
+
+    import pytest
+
+    def make(code: int):
+        def fake(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(argv, code, "", "")
+
+        return fake
+
+    for code in (126, 127):
+        with pytest.raises(gateway.ProcessUnreadable):
+            gateway.PsProcessIdentity(runner=make(code)).start_time(5)
+    assert gateway.PsProcessIdentity(runner=make(1)).start_time(5) is None

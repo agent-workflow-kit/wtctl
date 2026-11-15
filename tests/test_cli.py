@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
 from tests.helpers import Result, install_handler, run_cli
@@ -28,11 +30,11 @@ MINIMAL: dict[str, list[str]] = {
     "forget": ["forget", SID],
     "locate": ["locate", "example.com/o/r"],
     "clone": ["clone", "example.com/o/r"],
+    "export": ["export"],
     "label_add": ["label", "add", SID, "k=v"],
     "label_remove": ["label", "remove", SID, "k=v"],
     "reconcile": ["reconcile"],
     "prune": ["prune", "--throwaways"],
-    "export": ["export"],
     "cron_install": ["cron", "install"],
     "cron_uninstall": ["cron", "uninstall"],
 }
@@ -73,10 +75,16 @@ def test_abbreviated_flags_are_not_accepted(capsys: pytest.CaptureFixture[str]) 
     assert run_cli(capsys, "remove", SID, "--forc", "--actor", "human:a").code == 2
 
 
-@pytest.mark.parametrize("key", sorted(MINIMAL))
+def _implemented(key: str) -> bool:
+    return importlib.util.find_spec(f"wtctl.commands.{key}") is not None
+
+
+@pytest.mark.parametrize("key", sorted(k for k in MINIMAL if not _implemented(k)))
 def test_unimplemented_commands_exit_1_internal(
     capsys: pytest.CaptureFixture[str], key: str
 ) -> None:
+    if importlib.util.find_spec(f"wtctl.commands.{key}") is not None:
+        pytest.skip("implemented")
     r = run_cli(capsys, "--json", "--actor", "human:alice", *MINIMAL[key])
     assert r.code == 1
     obj = r.json()
@@ -630,6 +638,8 @@ def test_default_config_seam_reads_the_private_config(
 def test_default_state_seam_raises_not_implemented_internal(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Whatever modules exist now, behave as if state defined no seam function.
+    monkeypatch.setattr("wtctl.context._seam", lambda module, attr: None)
     install_handler(monkeypatch, "list", lambda ctx: Result({"s": ctx.state}))
     r = run_cli(capsys, "--json", "list")
     assert "not implemented yet (see #4)" in r.json()["error"]["message"]
