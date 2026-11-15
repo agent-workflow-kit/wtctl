@@ -268,8 +268,8 @@ def run_token_command(
     echoed). The child is a process-group leader; on timeout, or output beyond ``max_bytes``,
     the whole group gets SIGKILL through the pid captured at launch.
     """
-    # TODO(#16): switch to the step runner (run_step) once it lands; this block is only the
-    # credentials seam (bounded stdout capture) it does not yet offer.
+    # Not on run_step on purpose: a token command must be killed at the first byte over the cap
+    # (``too_large``), while run_step keeps reading and discards the excess.
     try:
         proc = subprocess.Popen(
             argv,
@@ -485,9 +485,6 @@ def fd_mount_id(fd: int) -> int | None:
 def chmod_opath_fd(fd: int, mode: int) -> None:
     """Linux: chmod the inode an ``O_PATH`` fd refers to (``/proc/self/fd/<fd>``)."""
     os.chmod(f"/proc/self/fd/{fd}", mode)
-
-
-# TODO(#16): the step runner (process groups, timeouts) is added here.
 
 
 class Clock(Protocol):
@@ -725,6 +722,14 @@ _COLLECT_SECONDS = 0.2
 _COLLECT_BYTES = 1 << 20
 
 
+def _term_group(pgid: int) -> None:
+    """SIGTERM the process group ``pgid`` (same ownership rules as ``_kill_group``)."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def _raise_system_exit(signum: int, _frame: object) -> None:
     raise SystemExit(128 + signum)
 
@@ -742,6 +747,8 @@ def run_step(
     drain_grace: float = 1.0,
     on_start: Callable[[int], None] | None = None,
     on_tick: Callable[[], None] | None = None,
+    term_grace: float | None = None,
+    merge_stderr: bool = False,
 ) -> StepResult:
     """Run ``argv`` (no shell) in a new session; see ``StepResult`` for the outcome.
 
@@ -752,6 +759,11 @@ def run_step(
     ``on_start`` receives the leader pid (= process group id) right after launch, for callers
     that record it. ``on_tick`` is called about once a second while waiting (lease renewal);
     its exceptions are ignored. A failure to start is a result, not an exception.
+
+    At the timeout the group gets SIGKILL at once. With ``term_grace`` (seconds) it gets SIGTERM
+    first and, when the leader has exited or the grace has passed, SIGKILL: either way the whole
+    group is killed, stragglers that ignored SIGTERM included. ``merge_stderr`` sends stderr into
+    the stdout pipe (one interleaved stream; ``stderr`` of the result stays empty).
     """
     t0 = time.monotonic()
     saved: dict[int, object] = {}
@@ -773,7 +785,7 @@ def run_step(
                 list(argv),
                 stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
                 env=dict(env),
                 cwd=cwd,
                 start_new_session=True,
@@ -784,8 +796,9 @@ def run_step(
         pid = proc.pid
         if on_start is not None:
             on_start(pid)
-        assert proc.stdout is not None and proc.stderr is not None
-        for stream, cap in ((proc.stdout, out), (proc.stderr, err)):
+        assert proc.stdout is not None and (merge_stderr or proc.stderr is not None)
+        streams = [(proc.stdout, out)] + ([] if proc.stderr is None else [(proc.stderr, err)])
+        for stream, cap in streams:
             os.set_blocking(stream.fileno(), False)
             sel.register(stream, selectors.EVENT_READ, cap)
         pending = memoryview(stdin) if stdin else None
@@ -798,6 +811,7 @@ def run_step(
         deadline = t0 + timeout
         exited_at: float | None = None
         last_tick = t0
+        kill_at: float | None = None  # set once SIGTERM went out (term_grace)
         while True:
             now = time.monotonic()
             if on_tick is not None and now - last_tick >= 1.0:
@@ -808,14 +822,23 @@ def run_step(
                     pass
             if exited_at is None and _leader_exited(proc):
                 exited_at = now
-            if exited_at is not None and not sel.get_map():
+            if kill_at is not None:
+                # SIGTERM was sent: wait for the leader, then SIGKILL the whole group
+                if exited_at is not None or now >= kill_at:
+                    _kill_group(pid)
+                    break
+            elif exited_at is not None and not sel.get_map():
                 break
-            if exited_at is not None and now - exited_at >= drain_grace:
+            elif exited_at is not None and now - exited_at >= drain_grace:
                 incomplete = True
                 break
-            if now >= deadline:
+            elif now >= deadline:
                 if exited_at is None:
                     timed_out = True
+                    if term_grace:
+                        _term_group(pid)
+                        kill_at = now + term_grace
+                        continue
                     _kill_group(pid)
                 else:
                     incomplete = True
