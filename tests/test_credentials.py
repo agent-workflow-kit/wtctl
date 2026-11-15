@@ -15,6 +15,7 @@ import pytest
 
 from tests.vectorlib import GIT
 from wtctl.config import Config, HostConfig
+from wtctl.errors import WtctlError
 from wtctl.credentials import (
     NetworkAuth,
     NetworkKind,
@@ -281,8 +282,6 @@ def test_command_environment_is_the_given_one(tmp_path: Path) -> None:
         ("https://forge.example:8443/org/repo", "https", "forge.example:8443"),
         ("https://xn--bcher-kva.example/x", "https", "xn--bcher-kva.example"),
         ("https://127.0.0.1:9/x", "https", "127.0.0.1:9"),
-        ("https://forge.example", "https", "forge.example"),
-        ("https://forge.example?x=1", "https", "forge.example"),
         ("ssh://git@forge.example/org/repo", "ssh", None),
         ("git@forge.example:org/repo.git", "ssh", None),
         ("forge.example:org/repo", "ssh", None),
@@ -322,6 +321,8 @@ def test_fetch_target(url: str, scheme: str, hostport: str | None) -> None:
         "https://forge.example:99999999/x",
         "https:///x",
         "https://",
+        "https://forge.example",  # a fetch URL always has a path (the urls module's grammar)
+        "https://forge.example?x=1",
         "https://for ge.example/x",
         "https://forge.example/x\ny",
         "https://forge.example\t/x",
@@ -437,7 +438,7 @@ def test_prepare_without_token_is_anonymous() -> None:
     auth = prepare_network_auth(
         Config(), "https://forge.example/x", environ=ENV, gateway=Gateway(), warn=lambda m: None
     )
-    assert auth == NetworkAuth("https") and auth.extra_config == ()
+    assert auth == NetworkAuth("https", hostport="forge.example") and auth.extra_config == ()
 
 
 def test_prepare_bad_token_user_warns_without_leaking() -> None:
@@ -491,7 +492,7 @@ def test_prepare_file_url_has_no_credentials(tmp_path: Path) -> None:
 
 
 def test_prepare_refuses_userinfo_urls_without_echoing_them() -> None:
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(WtctlError) as exc:
         prepare_network_auth(
             Config(),
             f"https://user:{TOKEN}@forge.example/x",

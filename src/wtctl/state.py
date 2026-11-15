@@ -793,6 +793,29 @@ class State:
                     [repo, *cols.values()],
                 )
 
+    def set_mirror(self, repo: str, **fields: str | None) -> None:
+        """Store the mirror's path and/or the default branch the mirror learned for ``repo``.
+
+        Only those two columns are written (``verified_at`` is the clone's own verification time
+        and is left alone). The row must exist. No two repos may store the same mirror path
+        (docs/interface.md, Mirror): a clash raises :class:`Conflict` and writes nothing.
+        """
+        unknown = set(fields) - {"mirror_path", "default_branch"}
+        if unknown or not fields:
+            raise ValueError(f"set_mirror takes mirror_path and default_branch, got {sorted(fields)}")
+        with self._txn() as c:
+            if "mirror_path" in fields and fields["mirror_path"] is not None:
+                other = c.execute(
+                    "SELECT repo FROM clones WHERE mirror_path = ? AND repo <> ?",
+                    (fields["mirror_path"], repo),
+                ).fetchone()
+                if other is not None:
+                    raise Conflict("mirror_path", "another repo already stores this mirror path")
+            sets = ", ".join(f"{n} = ?" for n in fields)
+            cur = c.execute(f"UPDATE clones SET {sets} WHERE repo = ?", [*fields.values(), repo])
+            if cur.rowcount != 1:
+                raise _internal(f"no clone is recorded for {repo}")
+
     def record_first_clone(self, repo: str, **fields: str | None) -> dict[str, Any]:
         """Record the repo's clone with its ``common_id`` unless one is already recorded.
 

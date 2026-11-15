@@ -13,14 +13,17 @@ from __future__ import annotations
 
 import base64
 import enum
+import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
+from . import urls
 from .config import Config
 from .gateway import Gateway, GitResult
-from .hardgit import Git
+from .errors import WtctlError
+from .hardgit import Git, parse_config_list
 
 # A token command gets this long, and may print this much. The token itself is much shorter.
 TOKEN_COMMAND_TIMEOUT = 10.0
@@ -29,9 +32,6 @@ MAX_TOKEN_LENGTH = 4096
 MAX_USER_LENGTH = 256
 
 _VISIBLE_ASCII = re.compile(r"[\x21-\x7e]+\Z")
-_HOSTPORT = re.compile(
-    r"([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)(?::([1-9][0-9]{0,4}))?\Z"
-)
 _URL_CHARS = re.compile(r"[\x21-\x7e]+\Z")  # no space, control or non-ASCII character
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SCP_LIKE = re.compile(r"[^/:]+:")
@@ -91,11 +91,6 @@ class FetchTarget:
     hostport: str | None  # lowercase ``host[:port]`` of an https URL, default port dropped
 
 
-def _valid_hostport(hostport: str) -> bool:
-    m = _HOSTPORT.fullmatch(hostport)
-    return m is not None and (m.group(2) is None or int(m.group(2)) <= 65535)
-
-
 def fetch_target(url: str) -> FetchTarget:
     """Scheme and host of an already normalized fetch URL (userinfo stripped).
 
@@ -106,9 +101,9 @@ def fetch_target(url: str) -> FetchTarget:
     lowercase (git refuses another spelling). The port must be 1-65535 without leading zeros;
     exactly ``:443`` is dropped.
 
-    TODO(#11): switch to the ``urls`` module's parser once it lands; this minimal helper only
-    refuses what it cannot place with certainty. Anything unexpected raises ``ValueError`` (the
-    message never contains the URL, which could carry a secret).
+    An https URL's host comes from the ``urls`` module (the one parser of host and port grammar);
+    this function adds the checks for a URL that goes to argv. Anything unexpected raises
+    ``ValueError`` (the message never contains the URL, which could carry a secret).
     """
     if not url or url.startswith("-") or url[:1].isspace() or _CONTROL.search(url):
         raise ValueError("unsupported fetch URL (option-like, or control or leading whitespace)")
@@ -130,11 +125,9 @@ def fetch_target(url: str) -> FetchTarget:
     authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
     if "@" in authority:
         raise ValueError("fetch URL carries userinfo; it must be stripped first")
-    hostport = authority.lower()
-    if not _valid_hostport(hostport):
+    hostport = urls.url_host(url)
+    if hostport is None or urls.url_scheme(url) != "https":
         raise ValueError("unsupported host in fetch URL")
-    if hostport.endswith(":443"):
-        hostport = hostport[: -len(":443")]
     return FetchTarget("https", hostport)
 
 
@@ -233,7 +226,7 @@ def token_header(hostport: str, token_user: str, token: Secret) -> tuple[str, Se
     The key is URL-scoped, so git sends the header to no other host or port; redirects are off
     in the hardened invocation. The value is wrapped so it cannot leak through a ``repr``.
     """
-    if not _valid_hostport(hostport):
+    if urls.url_host(f"https://{hostport}/x") != hostport:
         raise ValueError("invalid host for a token header")
     if (
         not token_user
@@ -257,8 +250,13 @@ class NetworkAuth:
 
     scheme: str
     ssh_auth_sock: str | None = None
+    hostport: str | None = None  # https only: the host the token (if any) is scoped to
     _header: tuple[str, Secret] | None = field(default=None, repr=False)
     _token: Secret | None = field(default=None, repr=False)
+
+    @property
+    def has_token(self) -> bool:
+        return self._header is not None
 
     @property
     def extra_config(self) -> tuple[tuple[str, str], ...]:
@@ -311,10 +309,13 @@ def prepare_network_auth(
     the caller's ``SSH_AUTH_SOCK``; file: nothing. The caller's ``GIT_SSH_COMMAND`` and the rest
     of its environment never reach git (hardgit builds the environment from scratch).
 
-    Raises ``ValueError`` for a URL :func:`fetch_target` refuses (the message never contains the
-    URL). TODO(#13): the callers map it to a typed ``WtctlError``.
+    Raises ``WtctlError`` (``remote_mismatch``) for a URL :func:`fetch_target` refuses; the
+    message never contains the URL, which could carry a secret.
     """
-    target = fetch_target(url)
+    try:
+        target = fetch_target(url)
+    except ValueError as e:
+        raise WtctlError("remote_mismatch", f"unusable fetch URL: {e}") from e
     if target.scheme == "ssh":
         sock = environ.get("SSH_AUTH_SOCK")
         if sock and sock.startswith("/") and "\0" not in sock and "\n" not in sock:
@@ -331,13 +332,13 @@ def prepare_network_auth(
         command_timeout=command_timeout,
     )
     if token is None:
-        return NetworkAuth("https")
+        return NetworkAuth("https", hostport=target.hostport)
     try:
         header = token_header(target.hostport, cfg.host(target.hostport).token_user, token)
     except ValueError as e:
         warn(f"{e} for {target.hostport}; continuing without a token")
-        return NetworkAuth("https")
-    return NetworkAuth("https", _header=header, _token=token)
+        return NetworkAuth("https", hostport=target.hostport)
+    return NetworkAuth("https", hostport=target.hostport, _header=header, _token=token)
 
 
 # --------------------------------------------------------------------------------------------
@@ -358,6 +359,55 @@ def timeout_seconds(cfg: Config, kind: NetworkKind) -> float:
     return float(min(seconds, MAX_TIMEOUT_SECONDS))
 
 
+# Subcommands whose argv carries a remote or URL; each needs a literal ``--`` before it, so an
+# option-like URL can never be read as an option (``fetch_target`` already refuses such a URL).
+_NEEDS_SEPARATOR = frozenset({"clone", "fetch", "ls-remote", "push"})
+
+
+def _require_separator(args: Sequence[str]) -> None:
+    if args and args[0] in _NEEDS_SEPARATOR and "--" not in args:
+        raise ValueError(f"a network {args[0]} needs a literal `--` before the remote or URL")
+
+
+def check_owned_config(git: Git, git_dir: str, owned_keys: frozenset[str], cwd: str) -> None:
+    """Refuse a repository whose config holds a key wtctl did not write.
+
+    A token goes only to a repository whose config wtctl wrote: a planted ``http.proxy``,
+    ``url.*.insteadOf``, ``http.<url>.proxy``, ``http.sslVerify`` or an include would redirect or
+    expose the header. ``owned_keys`` are the lowercase-section keys (``git config --list`` form)
+    that wtctl writes; any other key, an include included, is refused.
+    """
+    # --file reads the repository's own file only (a plain --list also prints the -c overrides).
+    r = git.run(
+        ["config", "--file", os.path.join(git_dir, "config"), "--no-includes", "--list", "-z"],
+        git_dir=git_dir,
+        cwd=cwd,
+        timeout=30,
+    )
+    if r.returncode != 0 or r.timed_out:
+        raise WtctlError("internal", f"could not read the config of {git_dir}")
+    keys = {key for key, _ in parse_config_list(r.stdout)}
+    foreign = sorted(keys - owned_keys)
+    if foreign:
+        raise WtctlError(
+            "unsafe_repo_config",
+            "the mirror's config holds keys wtctl did not write; a token is not sent",
+            details={"keys": [k[:200] for k in foreign[:20]]},
+        )
+
+
+def rejected_token_error(auth: NetworkAuth, error: WtctlError | None) -> WtctlError | None:
+    """The 401 message when a token was actually sent: the credential, not its absence, failed.
+
+    ``error`` is :func:`~wtctl.hardgit.outcome_error`'s result; the code stays ``auth_required``.
+    """
+    if error is None or error.code != "auth_required" or not auth.has_token:
+        return error
+    return WtctlError(
+        "auth_required", f"the remote rejected the configured token for {auth.hostport}"
+    )
+
+
 def run_network_git(
     git: Git,
     args: Sequence[str],
@@ -366,6 +416,7 @@ def run_network_git(
     auth: NetworkAuth,
     kind: NetworkKind,
     tool_owned: bool,
+    owned_keys: frozenset[str] | None = None,
     stdin: bytes | None = None,
     **build: object,
 ) -> GitResult:
@@ -375,15 +426,19 @@ def run_network_git(
     ``private_dir``). ``tool_owned`` is the caller's statement that the repository is one wtctl
     owns (mirror, fresh throwaway, new clone directory), as ``Git.build`` requires. The output
     is scrubbed of the credential.
+
+    ``clone``, ``fetch``, ``ls-remote`` and ``push`` need a literal ``--`` in ``args`` (a
+    ``ValueError`` otherwise). A call that carries a token inside a repository (``git_dir``)
+    passes ``owned_keys``, and the repository's config must hold no other key
+    (:func:`check_owned_config`); a clone into a new directory has no repository config to check.
+    Use :func:`rejected_token_error` on the classified outcome for the 401 message.
     """
-    # TODO(#13): put `--` before the URL in argv (or require it in `args`): `fetch_target` refuses
-    # option-like URLs, but argv is the second line of defense.
-    # TODO(#13): a token-bearing call is allowed only on a repository whose config wtctl wrote
-    # (mirror, fresh throwaway, new clone directory); verify or refuse a non-owned repository's
-    # config (http.proxy, url-scoped proxy, sslVerify, insteadOf) before sending a token.
-    # TODO(#13): when a header was sent and the remote answers 401, report "the remote rejected
-    # the configured token for <host>" (code stays auth_required) instead of "credentials wtctl
-    # does not have".
+    _require_separator(args)
+    if auth.has_token and build.get("git_dir") is not None:
+        if owned_keys is None:
+            raise ValueError("a token goes only to a repository whose config is checked")
+        cwd = build.get("cwd") or build["git_dir"]
+        check_owned_config(git, str(build["git_dir"]), owned_keys, str(cwd))
     # TODO(#5): when network calls are logged, log only the redacted argv and `scrub`bed text.
     result = git.run(
         args,
