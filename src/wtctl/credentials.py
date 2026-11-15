@@ -36,9 +36,18 @@ _URL_CHARS = re.compile(r"[\x21-\x7e]+\Z")  # no space, control or non-ASCII cha
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SCP_LIKE = re.compile(r"[^/:]+:")
 _HELPER_SYNTAX = re.compile(r"[A-Za-z0-9+.-]+::")  # git's ``ext::`` style transport helpers
-# A plain local path: absolute, explicitly relative or home-relative.
-_LOCAL_PATH_PREFIXES = ("/", "./", "../", "~")
+# A plain local path: absolute or explicitly relative (home-relative: see _is_home_path).
+_LOCAL_PATH_PREFIXES = ("/", "./", "../")
 MAX_TIMEOUT_SECONDS = 24 * 86400  # poll() takes milliseconds in a C int: 25 days overflow
+
+
+def _is_home_path(url: str) -> bool:
+    """``~`` is a path unless git would read a colon before any slash as scp-like ssh."""
+    if not url.startswith("~"):
+        return False
+    colon = url.find(":")
+    return colon < 0 or 0 <= url.find("/") < colon
+
 
 Warn = Callable[[str], None]
 
@@ -103,7 +112,7 @@ def fetch_target(url: str) -> FetchTarget:
     """
     if not url or url.startswith("-") or url[:1].isspace() or _CONTROL.search(url):
         raise ValueError("unsupported fetch URL (option-like, or control or leading whitespace)")
-    if url.startswith(_LOCAL_PATH_PREFIXES):
+    if url.startswith(_LOCAL_PATH_PREFIXES) or _is_home_path(url):
         return FetchTarget("file", None)
     if _HELPER_SYNTAX.match(url):
         raise ValueError("unsupported fetch URL (transport helper syntax)")

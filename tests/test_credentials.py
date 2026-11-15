@@ -295,6 +295,11 @@ def test_command_environment_is_the_given_one(tmp_path: Path) -> None:
         ("rel dir/repo", "file", None),
         ("~/repos/a b", "file", None),
         ("../up/repo", "file", None),
+        ("~/repo", "file", None),
+        ("~user/repo", "file", None),
+        ("~user/a:b", "file", None),  # a slash before the colon: still a path
+        ("~host:path", "ssh", None),  # git: a colon with no earlier slash is ssh
+        ("~x::y", "ssh", None),
     ],
 )
 def test_fetch_target(url: str, scheme: str, hostport: str | None) -> None:
