@@ -126,7 +126,11 @@ def test_directory_swapped_for_a_symlink_mid_delete_deletes_nothing_outside(
     swap_during_delete(monkeypatch, "classified", ("node_modules", "a"), swap)
     r = w.rm()
     assert (outside / "sub" / "keep").read_text() == "k"
-    assert r.code in (0, 1)
+    # the link was unlinked as a link; the moved tree is an entry the listing never saw, so its
+    # parent cannot be removed: partial, and a later remove deletes it
+    assert r.code == 1 and r.json()["error"]["code"] == "partial"
+    assert not a.exists() and (Path(str(a) + ".moved") / "f").exists()
+    assert w.state_of() == "partial"
 
 
 def test_ancestor_swapped_for_a_symlink_mid_delete_deletes_nothing_outside(

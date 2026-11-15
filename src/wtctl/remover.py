@@ -98,7 +98,6 @@ class Remover:
         self.merged_verified = False
         self.step6: dict[str, set[str]] = {}
         self.flipped = False  # this command moved the record to `partial`
-        self.deleting = False  # the first deletion has started
 
     # -- entry --------------------------------------------------------------------------------
 
@@ -559,14 +558,12 @@ class Remover:
         if rec["state"] == "active":
             self.state.transition(rec["id"], "active", "partial", last_error=IN_PROGRESS)
             self.flipped = True
-        self.deleting = True
 
     def _revert(self, rec: Record) -> None:
         """Nothing was deleted: the record is as it was."""
         if self.flipped:
             self.state.transition(rec["id"], "partial", "active", last_error=None)
             self.flipped = False
-        self.deleting = False
 
     def _after_tree(
         self, outcome: removal_delete.TreeOutcome, rec: Record, prepared: Prepared
