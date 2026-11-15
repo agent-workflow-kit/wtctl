@@ -29,7 +29,7 @@
         "string",
         "null"
       ],
-      "description": "The remote's default branch, read from the mirror's HEAD as set by its last refresh (never from the clone); null if the mirror was never refreshed."
+      "description": "The remote's default branch, the value stored in the repo's clones row by the last mirror refresh (never read from the clone or from the mirror's HEAD); null if none was stored."
     }
   },
   "additionalProperties": false,

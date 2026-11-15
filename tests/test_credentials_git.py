@@ -25,8 +25,10 @@ from wtctl.config import Config, HostConfig
 from wtctl.credentials import (
     NetworkKind,
     prepare_network_auth,
+    rejected_token_error,
     run_network_git,
 )
+from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway, run_git
 from wtctl.hardgit import FetchKind, Git, classify_fetch
 
@@ -40,6 +42,7 @@ class Capture:
     requests: list[dict[str, str]] = field(default_factory=list)
     redirect_to: str | None = None
     stall: bool = False
+    always_401: bool = False
     release: threading.Event = field(default_factory=threading.Event)
 
 
@@ -77,7 +80,7 @@ def server(tmp_path: Path) -> Iterator[Capture]:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            if "authorization" in self.headers:
+            if "authorization" in self.headers and not cap.always_401:
                 self.send_response(404)
             else:
                 self.send_response(401)
@@ -131,10 +134,20 @@ def trusting_gateway(cert: Path) -> Gateway:
     return Gateway(git_runner=runner)
 
 
-def ls_remote(git: Git, mirror: Path, cfg: Config, auth, url: str):  # noqa: ANN001, ANN201
+FRESH_KEYS = frozenset({"core.repositoryformatversion", "core.filemode", "core.bare"})
+
+
+def ls_remote(  # noqa: ANN201
+    git: Git,
+    mirror: Path,
+    cfg: Config,
+    auth,
+    url: str,
+    owned_keys: frozenset[str] = FRESH_KEYS,  # noqa: ANN001
+):
     return run_network_git(
         git, ["ls-remote", "--", url], cfg=cfg, auth=auth, kind=NetworkKind.NETWORK,
-        tool_owned=True, git_dir=mirror,
+        tool_owned=True, git_dir=mirror, owned_keys=owned_keys,
     )  # fmt: skip
 
 
@@ -259,7 +272,14 @@ def test_planted_repository_config_is_inert(
 
     cfg, auth = auth_for(url)
     git = Git(trusting_gateway(server.cert), GIT, str(private_home))
-    result = ls_remote(git, mirror, cfg, auth, url)
+    # The owned-config check (below) would refuse this repository before any request; it is
+    # declared satisfied here so the hardened invocation's own blanking is what is tested.
+    every_key = frozenset(
+        plain_git(["config", "--list", "--name-only"], cwd=mirror, home=private_home)
+        .stdout.decode()
+        .split("\n")
+    )
+    result = ls_remote(git, mirror, cfg, auth, url, owned_keys=every_key)
     assert result.returncode != 0
     assert server.requests
     assert not any("x-planted" in r for r in server.requests)
@@ -349,3 +369,77 @@ def test_a_stalled_server_times_out_end_to_end(
     result = ls_remote(git, mirror, cfg, auth, url)
     assert result.timed_out
     assert classify_fetch(result).cause == "timeout"
+
+
+# -- #13: separator, owned config, the token-rejected message ---------------------------------
+
+
+@pytest.mark.parametrize("sub", ["ls-remote", "fetch", "clone", "push"])
+def test_network_git_needs_a_separator_before_the_url(
+    sub: str, mirror: Path, private_home: Path
+) -> None:
+    git = Git(Gateway(), GIT, str(private_home))
+    cfg, auth = Config(), prepare_network_auth(
+        Config(), "https://forge.example/o/r.git", environ={}, gateway=Gateway(), warn=print
+    )  # fmt: skip
+    with pytest.raises(ValueError, match="--"):
+        run_network_git(
+            git, [sub, "https://forge.example/o/r.git"], cfg=cfg, auth=auth,
+            kind=NetworkKind.NETWORK, tool_owned=True, git_dir=mirror,
+        )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("http.proxy", "http://127.0.0.1:1"),
+        ("url.https://evil.example/.insteadOf", "https://127.0.0.1:1/"),
+        ("http.sslVerify", "false"),
+        ("include.path", "/nonexistent"),
+    ],
+)
+def test_a_token_is_not_sent_from_a_repository_with_foreign_config(
+    server: Capture, mirror: Path, private_home: Path, key: str, value: str
+) -> None:
+    plain_git(["config", key, value], cwd=mirror, home=private_home)
+    url = f"https://127.0.0.1:{server.port}/org/repo.git"
+    cfg, auth = auth_for(url)
+    git = Git(trusting_gateway(server.cert), GIT, str(private_home))
+    with pytest.raises(WtctlError) as exc:
+        ls_remote(git, mirror, cfg, auth, url)
+    assert exc.value.code == "unsafe_repo_config"
+    assert server.requests == []
+
+
+def test_a_token_call_inside_a_repository_must_declare_its_owned_keys(
+    server: Capture, mirror: Path, private_home: Path
+) -> None:
+    url = f"https://127.0.0.1:{server.port}/org/repo.git"
+    cfg, auth = auth_for(url)
+    git = Git(trusting_gateway(server.cert), GIT, str(private_home))
+    with pytest.raises(ValueError, match="checked"):
+        run_network_git(
+            git, ["ls-remote", "--", url], cfg=cfg, auth=auth, kind=NetworkKind.NETWORK,
+            tool_owned=True, git_dir=mirror,
+        )  # fmt: skip
+    assert server.requests == []
+
+
+def test_a_rejected_token_is_named_but_a_missing_one_is_not(
+    server: Capture, mirror: Path, private_home: Path
+) -> None:
+    from wtctl.hardgit import outcome_error
+
+    url = f"https://127.0.0.1:{server.port}/org/repo.git"
+    git = Git(trusting_gateway(server.cert), GIT, str(private_home))
+    server.always_401 = True
+    for env, expect in (({}, "credentials wtctl does not have"), (None, "rejected the configured")):
+        cfg, auth = auth_for(url) if env is None else (Config(), prepare_network_auth(
+            Config(), url, environ={}, gateway=Gateway(), warn=print
+        ))  # fmt: skip
+        server.requests.clear()
+        result = ls_remote(git, mirror, cfg, auth, url)
+        err = rejected_token_error(auth, outcome_error(classify_fetch(result), result))
+        assert err is not None and err.code == "auth_required"
+        assert expect in err.message
+    assert rejected_token_error(auth, None) is None

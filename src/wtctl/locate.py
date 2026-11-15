@@ -9,9 +9,10 @@ common dir is read through a no-follow chain and compared with the one recorded 
 TODO(#10): the no-follow chain (:func:`open_dir_nofollow`), the discovery walk and the removal of a
 failed clone's temporary directory use plain ``os.open`` with ``O_NOFOLLOW`` here; replace them
 with fsafe's anchored walks (which also refuse mount points) when #10 lands.
-TODO(#12): :meth:`Resolver._network` is where credentials (token header, ssh batch mode) attach.
-TODO(#13): ``default_branch`` is read from the mirror's HEAD; until the mirror exists it is the
-value stored in the repo's ``clones`` row (null).
+Network git (the clone) takes its credentials from ``credentials.prepare_network_auth``.
+``default_branch`` is the value stored in the repo's ``clones`` row, which a mirror refresh
+(``mirror.Mirror.refresh``) writes from the remote's HEAD; it is null until the first refresh. The
+mirror's config follows a changed fetch URL at its next use (``Mirror.ensure``), not here.
 TODO(#5): the human ``clone`` re-accept is audited as ``clone_accept``.
 """
 
@@ -28,6 +29,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import urls
+from .credentials import (
+    NetworkAuth,
+    NetworkKind,
+    prepare_network_auth,
+    rejected_token_error,
+    run_network_git,
+)
 from .errors import WtctlError
 from .gitsetup import private_dir
 from .hardgit import Git, classify_fetch, outcome_error, parse_config_list
@@ -638,19 +646,11 @@ class Resolver:
         base, parts, name = self.destination(repo_id)
         return os.path.join(base, *parts, name)
 
-    def _network(self, url: str) -> dict[str, Any]:
-        """Scheme and credentials of a network git call for ``url``.
-
-        TODO(#12): token header (``extra_config``) and ssh settings from ``hosts.<host>``; use
-        ``urls.url_host(url)`` for the host key.
-        """
-        scheme = urls.url_scheme(url)
-        if scheme is None:
-            raise WtctlError("remote_mismatch", f"unsupported clone URL scheme: {url!r}")
-        kw: dict[str, Any] = {"scheme": scheme, "tool_owned": True}
-        if scheme == "ssh" and os.environ.get("SSH_AUTH_SOCK"):
-            kw["ssh_auth_sock"] = os.environ["SSH_AUTH_SOCK"]
-        return kw
+    def _auth(self, url: str) -> NetworkAuth:
+        """Credentials of a network git call for ``url`` (an unusable URL: ``remote_mismatch``)."""
+        return prepare_network_auth(
+            self.config, url, environ=os.environ, gateway=self.git.gateway, warn=self.notes.append
+        )
 
     def clone(self, repo_id: str) -> Resolution:
         """Clone ``repo_id`` (auto-clone and ``clone``) under the per-repo lease.
@@ -758,18 +758,23 @@ class Resolver:
         if not os.path.samestat(os.fstat(pfd), os.stat(ppath)):
             raise WtctlError("clone_failed", f"{ppath} changed while cloning")
         remote = self.config.repo(repo_id).remote
-        net = self._network(url)
+        auth = self._auth(url)
         with private_dir() as p:
-            r = self.git.run(
+            r = run_network_git(
+                self.git,
                 [
                     "clone", "--template=", "-c", "protocol.version=2",
                     f"--origin={remote}", "--", url, tmp_path,
                 ],
+                cfg=self.config,
+                auth=auth,
+                kind=NetworkKind.CLONE,
+                tool_owned=True,
                 private_dir=p,
-                timeout=self.config.clone_timeout_s,
-                **net,
             )  # fmt: skip
-        err = outcome_error(classify_fetch(r), r, failure_code="clone_failed")
+        err = rejected_token_error(
+            auth, outcome_error(classify_fetch(r), r, failure_code="clone_failed")
+        )
         if err is not None:
             raise err
 

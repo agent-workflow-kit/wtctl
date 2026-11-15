@@ -77,9 +77,10 @@ DIFF_FAMILY = frozenset({"diff", "diff-files", "diff-index", "diff-tree", "log",
 # Subcommands that print patches and so can run a textconv driver.
 TEXTCONV_FAMILY = frozenset({"diff", "log", "show"})
 
-# TODO(#13): the forged-history vectors (replace refs, grafts, a forged commit-graph; spike E1a-f)
-# and the reachability helpers that need them land with the mirror. Here only the overrides
-# below (core.useReplaceRefs, core.commitGraph, GIT_NO_REPLACE_OBJECTS, GIT_GRAFT_FILE) are set.
+# The forged-history vectors (replace refs, grafts, a forged commit-graph; spike E1a-f) are tested
+# against real git in tests/test_mirror_pushed.py; the pushed check lives in mirror.py. Here the
+# overrides below (core.useReplaceRefs, core.commitGraph, GIT_NO_REPLACE_OBJECTS, GIT_GRAFT_FILE)
+# are set on every command.
 #
 # The override set of the recipe, on every call. ``core.alternateRefsCommand=true`` is the safety
 # check's addition (SAFE-3): an alternate's ref listing runs it through a shell during fetch

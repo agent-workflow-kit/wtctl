@@ -96,7 +96,7 @@ def run_git(
     ``timed_out`` is set only when git itself was still running at expiry; a git that already
     exited (its pipes held open by a descendant) is returned with its own exit status.
     """
-    # TODO(#13): stdout is buffered in memory; pack-objects --stdout needs stdout_path or an fd.
+    # TODO(#14): stdout is buffered in memory; pack-objects --stdout needs stdout_path or an fd.
     proc = subprocess.Popen(
         argv,
         env=dict(env),
