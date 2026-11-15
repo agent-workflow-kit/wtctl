@@ -502,15 +502,270 @@ def copy_env_files(
         src.close()
 
 
+# -- steps (Bootstrap steps 3 and 5) ----------------------------------------------------------
+
+
+def _safe_path(value: str) -> str:
+    """``PATH`` without empty and relative entries: they would resolve a bare command name in
+    the worktree, i.e. run repository content (the hardened git applies the same rule)."""
+    return ":".join(p for p in value.split(":") if p.startswith("/"))
+
+
+def step_env(
+    config: Any,
+    environ: Mapping[str, str],
+    settings: Any,
+    *,
+    record_id: str,
+    path: str,
+    repo: str,
+) -> dict[str, str]:
+    """The caller's environment minus every ``hosts.*.token_env`` variable, plus the caller's
+    values of ``bootstrap.pass_env``, plus ``bootstrap.env``, plus ``WTCTL_ID``, ``WTCTL_PATH``
+    and ``WTCTL_REPO``. Accident prevention, not a boundary (interface: Residual risks)."""
+    tokens = {h.token_env for h in config.hosts.values() if h.token_env}
+    env = {k: v for k, v in environ.items() if k not in tokens}
+    for name in settings.bootstrap.pass_env:
+        if name in environ:
+            env[name] = environ[name]
+    env.update(settings.bootstrap.env)
+    env.update(WTCTL_ID=record_id, WTCTL_PATH=path, WTCTL_REPO=repo)
+    if "PATH" in env:
+        env["PATH"] = _safe_path(env["PATH"])
+    return env
+
+
+def mask_names(config: Any) -> list[str]:
+    """Variables whose values never appear in a step's output tail: ``mask_env`` and, as a second
+    line of defence, every ``hosts.*.token_env`` (a token passed on by ``pass_env``)."""
+    names = list(config.mask_env)
+    names += [h.token_env for h in config.hosts.values() if h.token_env]
+    return list(dict.fromkeys(names))
+
+
+def mask_values(config: Any, env: Mapping[str, str]) -> set[str]:
+    return {env[n] for n in mask_names(config) if env.get(n)}
+
+
+def _mask(data: bytes, values: Sequence[str]) -> bytes:
+    for v in sorted({v.encode("utf-8", "replace") for v in values if v}, key=len, reverse=True):
+        data = data.replace(v, b"***")
+    return data
+
+
+def run_steps(
+    steps: Sequence[Any],
+    *,
+    env: Mapping[str, str],
+    cwd: str,
+    mask: Sequence[str],
+    warn: Warn,
+    runner: Callable[..., gateway.StepResult] = gateway.run_step,
+    on_tick: Callable[[], None] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run ``steps`` in order; stop at the first failure. Returns ``(results, failed)``.
+
+    Each result is a ``bootstrap_step`` object: the configured argv, the exit status (None when
+    the step was killed, timed out or could not start), the duration and the last 4096 bytes of
+    the combined output with the values of the ``mask`` variables (read from ``env``) masked.
+    """
+    values = [env[n] for n in mask if env.get(n)]
+    results: list[dict[str, Any]] = []
+    for step in steps:
+        argv = list(step.argv)
+        run_argv = gateway.sh_argv(argv[0]) if step.sh else argv
+        res = runner(
+            run_argv,
+            env=env,
+            cwd=cwd,
+            timeout=float(step.timeout),
+            max_stdout=STEP_CAPTURE_BYTES,
+            tail=True,
+            term_grace=TERM_GRACE,
+            merge_stderr=True,
+            on_tick=on_tick,
+        )
+        raw = res.stdout if res.start_error is None else res.start_error.encode()
+        text = _mask(raw, values)[-STEP_TAIL_BYTES:].decode("utf-8", "replace")
+        ok_exit = res.returncode if res.returncode is not None and res.returncode >= 0 else None
+        exit_ = None if res.timed_out else ok_exit
+        if res.output_incomplete:
+            warn("a step left a process holding its output open; the output may be incomplete")
+        results.append(
+            {
+                "argv": argv,
+                "exit": exit_,
+                "duration_ms": int(res.duration * 1000),
+                "output_tail": text,
+            }
+        )
+        if exit_ != 0:
+            return results, True
+    return results, False
+
+
+# -- nested repositories (Bootstrap step 4) ---------------------------------------------------
+
+
+def find_nested(wt: Worktree, dirs: Sequence[str], *, limit: int, warn: Warn) -> list[str]:
+    """Every ``.git`` file or directory inside the bootstrap-created directories ``dirs``
+    (relative paths), found by a no-follow walk that crosses no mount point and never descends
+    into a ``.git``. A walk that reaches ``limit`` entries stops with a warning (fail safe: what
+    it did not list is not exempt)."""
+    found: list[str] = []
+    for rel in dirs:
+        parts = tuple(rel.split("/"))
+        try:
+            fd = fsafe.open_chain(wt.anchor, wt.fd, parts, start_path=wt.anchor.path)
+        except fsafe.FsafeError:
+            continue
+        root_path = wt.anchor.path.rstrip("/") + "/" + rel
+        try:
+            for e in fsafe.walk_tree(
+                wt.anchor,
+                fd,
+                limit=limit,
+                descend=lambda ent: ent.path[-1] != ".git",
+                root_path=root_path,
+            ):
+                if e.path[-1] == ".git" and e.kind in ("file", "dir"):
+                    text = _text("/".join((*parts, *e.path)))
+                    if text is not None:
+                        found.append(text)
+        except fsafe.FsafeError as exc:
+            warn(
+                f"nested-repository scan of {_esc(rel)!r} stopped ({exc.kind}); "
+                "entries it did not list are not exempt"
+            )
+        finally:
+            os.close(fd)
+    return sorted(set(found))
+
+
+# -- the run ----------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Outcome:
+    """What one bootstrap run did. ``state`` is ``ok`` or ``failed``; ``paths`` and ``nested`` are
+    the bootstrap-created sets to add (``State.record_bootstrap``)."""
+
+    state: str
+    steps: list[dict[str, Any]]
+    failed_step: dict[str, Any] | None
+    paths: list[tuple[str, str, str | None]]
+    nested: list[str]
+    tracked_changes: list[str]
+    copied: list[Copied]
+
+
+_UNSTORABLE = ("unhashed:", "special:")
+
+
+def run_bootstrap(
+    *,
+    git: Git,
+    config: Any,
+    settings: Any,
+    record: Mapping[str, Any],
+    copy_env: bool,
+    run_the_steps: bool,
+    rerun: bool,
+    warn: Warn,
+    runner: Callable[..., gateway.StepResult] = gateway.run_step,
+    on_tick: Callable[[], None] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Outcome:
+    """Bootstrap steps 1 to 5 on the worktree of ``record``.
+
+    A create records every new untracked file; a re-run (``rerun``) records only new ignored
+    entries and the env files this run itself copied (a re-run never adopts other untracked
+    files, which an agent may have written).
+    """
+    env = step_env(
+        config,
+        os.environ if environ is None else environ,
+        settings,
+        record_id=record["id"],
+        path=record["path"],
+        repo=record["repo"],
+    )
+    with open_worktree(record["path"], record["admin_dir"], record["dir_id"]) as wt:
+        before = take_snapshot(git, wt)
+        copied: list[Copied] = []
+        if copy_env:
+            if not settings.copy_env:
+                warn("--copy-env: no copy_env patterns are configured; nothing was copied")
+            else:
+                copied = copy_env_files(
+                    wt,
+                    source_root=record["clone_path"],
+                    patterns=settings.copy_env,
+                    tracked=tracked_paths(git, wt),
+                    warn=warn,
+                    common_dir=record.get("common_dir"),
+                    common_id=record.get("common_id"),
+                )
+        results: list[dict[str, Any]] = []
+        failed = False
+        if run_the_steps:
+            results, failed = run_steps(
+                settings.bootstrap.steps,
+                env=env,
+                cwd=wt.cwd,
+                mask=mask_names(config),
+                warn=warn,
+                runner=runner,
+                on_tick=on_tick,
+            )
+        after = take_snapshot(git, wt)
+        for snap in (before, after):
+            if snap.skipped:
+                warn(f"{snap.skipped} path(s) that are not valid UTF-8 were not recorded")
+        paths: dict[str, tuple[str, str, str | None]] = {}
+        new_ignored = {p: d for p, d in after.ignored.items() if p not in before.ignored}
+        for p, is_dir in sorted(new_ignored.items()):
+            paths[p] = (p, "ignored_dir" if is_dir else "ignored_file", None)
+        if not rerun:
+            for p, digest in sorted(after.untracked.items()):
+                if p in before.untracked:
+                    continue
+                if digest.startswith(_UNSTORABLE):
+                    if digest.startswith("unhashed:"):
+                        warn(f"{_esc(p)!r} is too large to hash and is not recorded as created")
+                    continue
+                paths[p] = (p, "untracked", digest)
+        for c in copied:
+            paths[c.path] = (c.path, "untracked", c.digest)
+        scan = [p for p, d in sorted(new_ignored.items()) if d]
+        if not rerun:
+            scan += sorted(after.untracked_dirs - before.untracked_dirs)
+        nested = find_nested(wt, scan, limit=config.remove.nested_scan_limit, warn=warn)
+        tracked = sorted(after.tracked - before.tracked)
+    return Outcome(
+        state="failed" if failed else "ok",
+        steps=results,
+        failed_step=results[-1] if failed else None,
+        paths=list(paths.values()),
+        nested=nested,
+        tracked_changes=tracked,
+        copied=copied,
+    )
+
+
 __all__ = [
     "Copied",
-    "HashBudget",
-    "Mapping",
+    "Outcome",
     "Snapshot",
     "Worktree",
     "copy_env_files",
-    "gateway",
+    "find_nested",
+    "mask_names",
+    "mask_values",
     "open_worktree",
+    "run_bootstrap",
+    "run_steps",
+    "step_env",
     "take_snapshot",
     "tracked_paths",
 ]
