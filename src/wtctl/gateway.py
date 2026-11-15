@@ -139,7 +139,7 @@ class TokenCommandResult:
     failure: str | None = None
 
 
-def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+def _kill_token_group(proc: subprocess.Popen[bytes]) -> None:
     """SIGKILL the group this call created. The leader is unreaped (no ``poll``/``wait`` yet),
     so its pid still names that group even if the leader is a zombie."""
     try:
@@ -214,7 +214,7 @@ def run_token_command(
             failure = "timeout"
     if failure is not None and proc.returncode is None:
         # Only while the leader is unreaped does its pid certainly still name our group.
-        _kill_group(proc)
+        _kill_token_group(proc)
     try:
         proc.wait(timeout=KILL_GRACE)
     except subprocess.TimeoutExpired:
