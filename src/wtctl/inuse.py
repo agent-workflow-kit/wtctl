@@ -164,7 +164,7 @@ def check_in_use(
     found: list[dict[str, Any]] = []
     warnings: list[str] = []
     foreign = 0  # processes of other users: not ours to inspect
-    unreadable = 0  # processes of the invoking user whose cwd or descriptors could not be read
+    unreadable: list[int] = []  # of the invoking user, cwd or descriptors unreadable
     for info in sorted(procs, key=lambda p: p.pid):
         if info.pid in own:
             continue
@@ -172,7 +172,7 @@ def check_in_use(
             if info.other_user:
                 foreign += 1
             else:
-                unreadable += 1
+                unreadable.append(info.pid)
         hit = _match(info, target, dir_ids)
         if hit is None:
             continue
@@ -188,13 +188,13 @@ def check_in_use(
     if foreign:
         warnings.append(f"{foreign} process(es) of other users were not inspected")
     if unreadable:
+        shown = ", ".join(str(n) for n in unreadable[:10])
+        more = f" and {len(unreadable) - 10} more" if len(unreadable) > 10 else ""
         warnings.append(
-            f"{unreadable} process(es) of the invoking user could not be inspected, so a process "
-            "using the directory cannot be ruled out"
+            f"{len(unreadable)} process(es) of the invoking user could not be inspected; their "
+            f"working directory is unknown (pid {shown}{more})"
         )
-    if found:
-        return InUse("fail", found, warnings)
-    return InUse("unavailable" if unreadable else "pass", found, warnings)
+    return InUse("fail" if found else "pass", found, warnings)
 
 
 def require_unused(

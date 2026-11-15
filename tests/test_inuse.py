@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.removallib import FakeScanner, ReadableProcScanner
+from tests.removallib import FakeScanner
 from wtctl import inuse
 from wtctl.gateway import Gateway, ProcessInfo, ScannerUnavailable
 from wtctl.procscan import LsofScanner, ProcScanner, parse_lsof
@@ -101,18 +101,29 @@ def test_uninspected_processes_are_counted_in_a_warning() -> None:
     assert r.status == "pass" and any("1 process" in w for w in r.warnings)
 
 
-def test_r4_an_uninspectable_process_of_my_own_user_makes_the_check_unavailable() -> None:
+def test_s1_an_uninspectable_process_of_my_own_user_is_a_distinct_warning_not_unavailable() -> None:
     mine = ProcessInfo(20, "hidden", None, inspected=False)  # same user, entries unreadable
-    r = hit(mine, ProcessInfo(21, "me", "/home"))
-    assert r.status == "unavailable" and any("could not be inspected" in w for w in r.warnings)
+    other = ProcessInfo(22, "other-user", None, inspected=False, other_user=True)
+    r = hit(mine, other, ProcessInfo(21, "me", "/home"))
+    assert r.status == "pass"
+    assert any("1 process(es) of the invoking user could not be inspected" in w for w in r.warnings)
+    assert any("pid 20" in w for w in r.warnings)
+    assert any("1 process(es) of other users were not inspected" in w for w in r.warnings)
 
 
-def test_r4_a_found_process_still_fails_beside_an_uninspectable_one() -> None:
+def test_s1_the_unreadable_warning_names_at_most_ten_pids() -> None:
+    procs = [ProcessInfo(100 + i, "h", None, inspected=False) for i in range(12)]
+    (w,) = [x for x in hit(*procs).warnings if "invoking user" in x]
+    assert w.startswith("12 process(es)") and "100, 101" in w and "109" in w
+    assert "110" not in w and "2 more" in w
+
+
+def test_s1_a_found_process_still_fails_beside_an_uninspectable_one() -> None:
     r = hit(ProcessInfo(20, "hidden", None, inspected=False), ProcessInfo(21, "vim", T + "/x"))
     assert r.status == "fail" and [p["pid"] for p in r.processes] == [21]
 
 
-def test_r4_an_uninspectable_process_of_wtctls_own_tree_is_not_counted() -> None:
+def test_s1_an_uninspectable_process_of_wtctls_own_tree_is_not_counted() -> None:
     own = ProcessInfo(999_999, "wtctl", None, inspected=False)
     assert hit(own).status == "pass"
 
@@ -241,7 +252,7 @@ def sleepers() -> Iterator[list[Sleeper]]:
 
 
 def real_check(tree: Path, ids: set[tuple[int, int]] | None = None) -> inuse.InUse:
-    return inuse.check_in_use(Gateway(scanner=ReadableProcScanner()), str(tree), ids or set())
+    return inuse.check_in_use(Gateway(scanner=ProcScanner()), str(tree), ids or set())
 
 
 @linux_only
@@ -290,7 +301,7 @@ def test_real_process_with_a_mapped_file_whose_descriptor_is_closed(
 
 
 @linux_only
-def test_r4_a_real_non_dumpable_process_of_my_own_user_is_not_ignored(
+def test_s1_a_real_non_dumpable_process_of_my_own_user_is_not_ignored(
     tree: Path, sleepers: list[Sleeper], tmp_path: Path
 ) -> None:
     if os.geteuid() == 0:
@@ -302,7 +313,16 @@ def test_r4_a_real_non_dumpable_process_of_my_own_user_is_not_ignored(
     with pytest.raises(OSError):  # the precondition: this user cannot read the process's cwd
         os.readlink(f"/proc/{s.pid}/cwd")
     r = inuse.check_in_use(Gateway(scanner=ProcScanner()), str(tree), set())
-    assert r.status == "unavailable"
+    # the helper hides its cwd: not detected, but named by its own warning; never `unavailable`
+    assert r.status == "pass" and r.processes == []
+    # other non-dumpable processes (ssh-agent, ...) may fill the ten named pids: the count is exact
+    mine = ProcScanner().scan()
+    hidden = [p for p in mine if not p.inspected and not p.other_user]
+    assert s.pid in {p.pid for p in hidden}
+    assert any(
+        "of the invoking user could not be inspected; their working directory is unknown" in w
+        for w in r.warnings
+    )
 
 
 def fake_proc(root: Path, pid: int, *, uid: int, state: str = "S", cwd: Path | None = None) -> None:
@@ -318,7 +338,7 @@ def fake_proc(root: Path, pid: int, *, uid: int, state: str = "S", cwd: Path | N
 
 
 @linux_only
-def test_r4_scanner_tells_an_unreadable_process_of_mine_from_another_users(tmp_path: Path) -> None:
+def test_s1_scanner_tells_an_unreadable_process_of_mine_from_another_users(tmp_path: Path) -> None:
     proc = tmp_path / "proc"
     (proc / "self").mkdir(parents=True)
     fake_proc(proc, 100, uid=1000)  # mine, cwd cannot be read

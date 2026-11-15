@@ -14,6 +14,7 @@ from tests.createlib import REPO
 from tests.removallib import RW
 from tests.schemacheck import validate
 from wtctl.gateway import GitResult, ProcessInfo
+from wtctl.procscan import ProcScanner
 
 
 @pytest.fixture
@@ -567,12 +568,11 @@ def test_status_end_to_end_with_child_walks_and_the_real_process_scanner(
     real_w: RW,
     capsys,  # noqa: ANN001
 ) -> None:
-    from tests.removallib import ReadableProcScanner
     from tests.test_inuse import Sleeper
 
     w = real_w
     w.start(capsys)
-    w.scanner = ReadableProcScanner()  # type: ignore[assignment]
+    w.scanner = ProcScanner()  # type: ignore[assignment]
     (w.wt / "sub").mkdir()
     d = w.st(capsys)
     assert d["would_remove"] is True, d

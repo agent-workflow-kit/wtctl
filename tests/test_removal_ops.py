@@ -168,7 +168,19 @@ def test_walk_entries_carry_the_directory_identity(tree: Path) -> None:
         (["/"], "x", False, False),
         ([r"\*star"], "*star", False, True),
         ([r"\*star"], "xstar", False, False),
-        (["a[b"], "a[b", False, True),  # an unterminated class is literal
+        # git check-ignore --no-index (git 2.34 and 2.56): an unclosed '[' aborts, never matches
+        (["["], "[", False, False),
+        (["foo[bar"], "foo[bar", False, False),
+        (["a[b"], "a[b", False, False),
+        (["[a"], "a", False, False),
+        (["[[:alpha:]]"], "a", False, False),  # POSIX classes: git matches, we never do (safe)
+        (["[[:alpha:]]"], "a]", False, False),  # the old mis-parse matched this
+        (["[[:alpha:]"], "a", False, False),
+        (["[[:foo:]]"], "a", False, False),
+        (["[a[:]"], "a", False, False),
+        (["a//"], "a", True, False),  # git strips one trailing slash: "a/" never matches
+        (["a/"], "a", True, True),
+        (["d//"], "d/f", False, False),
         (["(x)+"], "(x)+", False, True),  # regex metacharacters are literal
         (["(x)+"], "xx", False, False),
         (["name"], "new\nline/name", False, True),

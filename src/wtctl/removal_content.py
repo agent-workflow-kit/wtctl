@@ -241,16 +241,21 @@ class Hasher:
                 return "not_dir"
             fd = fsafe.open_dir(self._wt.anchor, parent, parts[-1])
             try:
-                names = os.listdir(fd)
+                # bounded: a lookup for ``.git``, then at most one entry of the listing (a hostile
+                # directory may hold millions, and this runs in the wtctl process)
+                try:
+                    os.lstat(".git", dir_fd=fd)
+                    return "initialised"
+                except FileNotFoundError:
+                    pass
+                with os.scandir(fd) as it:
+                    return "empty" if next(it, None) is None else "contents"
             finally:
                 os.close(fd)
         except fsafe.FsafeError as exc:
             return "absent" if exc.kind == "missing" else "unreadable"
         except OSError:
             return "unreadable"
-        if not names:
-            return "empty"
-        return "initialised" if ".git" in names else "contents"
 
 
 def gitlink_paths(inp: Inputs) -> list[str]:

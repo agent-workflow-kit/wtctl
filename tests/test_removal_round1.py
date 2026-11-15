@@ -197,6 +197,73 @@ def test_r2_files_below_an_uninitialised_gitlink_are_not_clean(w: RW, capsys, re
     assert d["would_remove"] is False and d["reason"] == "dirty"
 
 
+def test_s3_a_huge_gitlink_directory_is_not_listed_in_full(
+    w: RW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    w.start(capsys)
+    add_gitlink(w)
+    sub = w.wt / "vendor" / "sub"
+    sub.mkdir(parents=True)
+    for i in range(10):
+        (sub / f"f{i}").write_text("x")
+    real_scandir = os.scandir
+
+    class Limited:
+        """A directory listing that fails if it is read beyond its second entry."""
+
+        def __init__(self, it: Any) -> None:
+            self.it, self.n = it, 0
+
+        def __enter__(self) -> Limited:
+            return self
+
+        def __exit__(self, *a: object) -> None:
+            self.it.close()
+
+        def __iter__(self) -> Limited:
+            return self
+
+        def __next__(self) -> Any:
+            self.n += 1
+            if self.n > 2:
+                raise AssertionError("listed more than the first entries")
+            return next(self.it)
+
+    real_listdir = os.listdir
+    ino = sub.stat().st_ino
+
+    inside = [False]  # only gitlink_state is bounded; the nested-repo walk lists the directory
+
+    def is_gitlink(path: Any) -> bool:
+        return inside[0] and isinstance(path, int) and os.fstat(path).st_ino == ino
+
+    orig_state = removal_content.Hasher.gitlink_state
+
+    def state(self: Any, rel: str) -> str:
+        inside[0] = True
+        try:
+            return orig_state(self, rel)
+        finally:
+            inside[0] = False
+
+    monkeypatch.setattr(removal_content.Hasher, "gitlink_state", state)
+
+    def scandir(path: Any = ".") -> Any:
+        it = real_scandir(path)
+        return Limited(it) if is_gitlink(path) else it
+
+    def listdir(path: Any = ".") -> Any:
+        assert not is_gitlink(path), "listed the whole directory"
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(os, "listdir", listdir)
+    d = w.st(capsys)
+    assert d["checks"]["nested_repos"]["details"] == [{"detail": "submodule", "path": "vendor/sub"}]
+
+
 @pytest.mark.parametrize("how", ["file", "symlink"])
 def test_r2_a_file_or_symlink_in_place_of_a_gitlink_is_tracked_dirty(
     w: RW,
@@ -442,14 +509,15 @@ def test_r19d_the_fetch_waits_for_the_lease_at_most_5_seconds(
     assert [wait for name, wait in seen if name == clone_lease(str(w.clone))] == [5]
 
 
-def test_r4_status_is_unknown_when_a_process_of_mine_cannot_be_inspected(w: RW, capsys) -> None:  # noqa: ANN001
+def test_s1_status_still_passes_when_a_process_of_mine_cannot_be_inspected(w: RW, capsys) -> None:  # noqa: ANN001
     from wtctl.gateway import ProcessInfo
 
     w.start(capsys)
     w.scanner.procs = [ProcessInfo(77, "hidden", None, inspected=False)]
     d = w.st(capsys)
-    assert d["checks"]["in_use"]["status"] == "unavailable"
-    assert (d["would_remove"], d["reason"]) == (None, None)
+    assert d["checks"]["in_use"]["status"] == "pass"
+    assert any("could not be inspected" in x for x in d["warnings"]), d
+    assert d["would_remove"] is True
 
 
 def test_r3_a_huge_modules_directory_is_incomplete_not_a_pass(w: RW, capsys) -> None:  # noqa: ANN001

@@ -3,7 +3,8 @@
 A trailing ``/`` matches directories only; a pattern without a ``/`` (apart from a trailing one)
 matches at any depth, one with a ``/`` is anchored at the worktree root; ``*`` and ``?`` do not
 cross ``/``; ``**`` as a whole component crosses any number of directories; ``[...]`` is a
-character class. A path is disposable when it, or any directory above it, matches (git does not
+character class (an unclosed one, or one with a POSIX class, matches nothing). A path is
+disposable when it, or any directory above it, matches (git does not
 look inside an excluded directory). A pattern this module does not understand (``!`` negation,
 comments) matches nothing: a path it fails to exempt stays dirty, which is the safe direction.
 """
@@ -22,12 +23,18 @@ class _Pattern:
     anchored: bool
 
 
-def _bracket(glob: str, start: int) -> tuple[str, int] | None:
-    """The regex of the character class opening at ``glob[start]`` and the index after its ``]``,
-    or None when it is not closed (the ``[`` is then a literal). As in git's wildmatch with
-    WM_PATHNAME: a backslash quotes the next character (so ``\\-`` is a literal ``-``, not a
-    range), ``]`` first in the class is a literal, and a class never matches ``/`` (not even a
-    negated one, or a range such as ``+-0`` that spans it)."""
+class _NeverMatches(Exception):
+    """The pattern can match nothing: git aborts on it (an unclosed ``[``) or this module does not
+    parse it (a POSIX class ``[:alpha:]``); not matching is the safe direction."""
+
+
+def _bracket(glob: str, start: int) -> tuple[str, int]:
+    """The regex of the character class opening at ``glob[start]`` and the index after its ``]``.
+    An unclosed class or one with a POSIX class (``[:`` inside) raises ``_NeverMatches``
+    (git's wildmatch aborts on the first and this module does not implement the second). As in
+    git's wildmatch with WM_PATHNAME: a backslash quotes the next character
+    (so ``\\-`` is a literal ``-``, not a range), ``]`` first in the class is a literal, and a
+    class never matches ``/`` (not even a negated one, or a range such as ``+-0`` that spans it)."""
     n = len(glob)
     j = start + 1
     neg = j < n and glob[j] in "!^"
@@ -37,13 +44,15 @@ def _bracket(glob: str, start: int) -> tuple[str, int] | None:
     items: list[tuple[str, bool]] = []  # (character, quoted)
     while True:
         if j >= n:
-            return None
+            raise _NeverMatches
         c = glob[j]
         if c == "]" and j > first:
             break
+        if c == "[" and glob.startswith("[:", j):
+            raise _NeverMatches
         if c == "\\":
             if j + 1 >= n:
-                return None
+                raise _NeverMatches
             items.append((glob[j + 1], True))
             j += 2
         else:
@@ -96,13 +105,8 @@ def _translate(glob: str) -> str:
             out.append("[^/]")
             i += 1
         elif c == "[":
-            parsed = _bracket(glob, i)
-            if parsed is None:
-                out.append(re.escape(c))
-                i += 1
-            else:
-                out.append(parsed[0])
-                i = parsed[1]
+            body, i = _bracket(glob, i)
+            out.append(body)
         else:
             out.append(re.escape(c))
             i += 1
@@ -130,7 +134,8 @@ def _compile(raw: str) -> _Pattern | None:
     if _dangling_backslash(p):
         return None  # git never matches a pattern that ends in a lone backslash
     dir_only = p.endswith("/")
-    p = p.rstrip("/")
+    if dir_only:
+        p = p[:-1]  # exactly one: git keeps the rest, so "a//" is "a/" and matches nothing
     if not p:
         return None
     anchored = "/" in p
@@ -139,7 +144,7 @@ def _compile(raw: str) -> _Pattern | None:
         return None
     try:
         return _Pattern(re.compile(_translate(p), re.DOTALL), dir_only, anchored)
-    except re.error:
+    except (re.error, _NeverMatches):
         return None
 
 
