@@ -377,7 +377,19 @@ class Mirror:
                 f"mirror path {self.path} exists and is not empty; it was not created by wtctl "
                 "for this clone, remove or move it"
             )
-        incomplete = any(not os.path.lexists(os.path.join(self.path, n)) for n in _CORE_ENTRIES)
+        # lstat every core entry: git init follows a symlinked objects or refs, so it runs only
+        # when each existing entry is a plain directory (objects, refs) or regular file (HEAD);
+        # otherwise check_layout refuses.
+        incomplete = False
+        for n in _CORE_ENTRIES:
+            try:
+                mode = os.lstat(os.path.join(self.path, n)).st_mode
+            except FileNotFoundError:
+                incomplete = True
+                continue
+            plain = stat.S_ISREG(mode) if n == "HEAD" else stat.S_ISDIR(mode)
+            if not plain:
+                return False, False
         forbidden = any(os.path.lexists(os.path.join(self.path, n)) for n in FORBIDDEN_ENTRIES)
         return False, incomplete and not forbidden
 

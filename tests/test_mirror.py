@@ -254,6 +254,26 @@ def test_a_head_that_is_not_a_regular_file_is_refused(w: World) -> None:
     assert exc.value.code == "fetch_failed" and "HEAD" in exc.value.message
 
 
+def test_a_symlinked_core_directory_is_never_followed_by_a_re_init(
+    w: World, tmp_path: Path
+) -> None:
+    import shutil
+
+    w.build()
+    m = w.mirror()
+    w.refresh(m)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    shutil.rmtree(Path(m.path, "refs"))
+    os.unlink(Path(m.path, "HEAD"))
+    shutil.rmtree(Path(m.path, "objects"))
+    os.symlink(scratch, Path(m.path, "objects"))
+    with pytest.raises(WtctlError) as exc:
+        w.refresh(m)
+    assert exc.value.code == "fetch_failed"
+    assert list(scratch.iterdir()) == []
+
+
 def test_a_half_initialised_mirror_with_a_forbidden_entry_is_not_repaired(w: World) -> None:
     import shutil
 
