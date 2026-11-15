@@ -25,14 +25,10 @@ def w(tmp_path: Path, private_home: Path) -> CW:
 
 
 def failed(r) -> dict:  # noqa: ANN001
-    """A bootstrap_failed error, validated against the schema (TODO(#17): the baseline digest
-    that only #17 records is stood in for)."""
+    """A bootstrap_failed error, validated against the schema."""
     assert r.code == 12, (r.out, r.err)
     doc = r.json()
-    rec = dict(doc["error"]["details"]["record"])
-    rec["baseline_digest"] = rec["baseline_digest"] or "0" * 64
-    shown = {"error": {**doc["error"], "details": {**doc["error"]["details"], "record": rec}}}
-    validate("wtctl/cli/error.json", shown)
+    validate("wtctl/cli/error.json", doc)
     return doc["error"]
 
 

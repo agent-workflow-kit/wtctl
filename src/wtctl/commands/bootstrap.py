@@ -1,8 +1,8 @@
 """``wtctl bootstrap <id|path>``: re-run Bootstrap on an owned, active worktree (human-only; the
 CLI's actor gate has already run).
 
-TODO(#17): refuse ``repo_config_changed`` on a change in either baseline class (as ``baseline
-check`` does), and re-record the baseline after a successful run.
+A change in either baseline class refuses ``repo_config_changed`` (as ``baseline check`` does,
+after the record-state checks and under the lease), and a successful run re-records the baseline.
 TODO(#19): refuse ``in_use`` when a process runs in the worktree.
 TODO(#5): log the ``bootstrap`` event.
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .. import bootstrapper, fsafe
+from .. import baselinesvc, bootstrapper, fsafe
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
 from ..gitsetup import open_git, with_filters
@@ -53,13 +53,14 @@ def run(ctx: Context) -> Result:
     else:
         _check(record)
     if ctx.dry_run:
+        baselinesvc.verify_unchanged(config, state, record)
         return _dry(ctx, record)
     with state.lease(record_lease(record["id"]), wait=config.lease_wait_s) as lease:
         record = state.get_record(record["id"])
         if record is None:
             raise WtctlError("not_found", f"no record for {a.target}")
         _check(record)
-        # TODO(#17): baseline refusal (either class) goes here.
+        baselinesvc.verify_unchanged(config, state, record)
         # TODO(#19): in_use refusal goes here.
         settings = config.repo(record["repo"])
         warnings: list[str] = []
@@ -104,9 +105,30 @@ def run(ctx: Context) -> Result:
                 f"bootstrap step {len(outcome.steps)} failed in {record['path']}",
                 details={"record": out, "step": outcome.failed_step},
             )
-        # TODO(#17): re-record the baseline here (after a successful run).
+        record = _rerecord(ctx, record)
+        out = record_object(record, summary)
         boot = {**summary, "tracked_changes": outcome.tracked_changes}
     return _result(out, boot, warnings, dry=False, human=f"bootstrapped {record['name']}")
+
+
+def _rerecord(ctx: Context, record: Record) -> Record:
+    """After a successful run: the new baseline, unless it cannot be computed in full."""
+    current = baselinesvc.record_current(ctx.config, record)
+    if current.has_detail():
+        items = [
+            {"class": i.cls, "path": i.path, "key": i.key, "before": "absent", "after": "absent",
+             "detail": i.detail}
+            for i in current.items
+            if i.detail
+        ]  # fmt: skip
+        raise baselinesvc.refusal(record, current, items)
+    return ctx.state.transition(
+        record["id"],
+        BOOTSTRAPPABLE,
+        BOOTSTRAPPABLE,
+        baseline_digest=current.digest,
+        baseline_items=baselinesvc.item_rows(current),
+    )
 
 
 def _dry(ctx: Context, record: Record) -> Result:

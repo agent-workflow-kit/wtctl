@@ -656,3 +656,55 @@ def test_modes_of_files_outside_hooks_do_not_matter_for_config(w: World) -> None
     os.chmod(Path(w.common) / "config", 0o600)
     assert w.digest() == a
     assert stat.S_ISREG(os.stat(Path(w.common) / "config").st_mode)
+
+
+# --- deadlines -----------------------------------------------------------------------------
+
+
+def test_a_collector_past_its_deadline_is_killed_and_is_an_incomplete_item(w: World) -> None:
+    import sys
+
+    from wtctl import fsafe_child
+
+    pids: list[int] = []
+
+    def slow(op: str, args: dict):  # noqa: ANN202
+        res = fsafe_child.run_op(
+            op,
+            args,
+            timeout=0.5,
+            argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+            on_start=pids.append,
+        )
+        return res
+
+    b = repobaseline.compute(w.spec(), runner=slow)
+    assert {(i.cls, i.detail) for i in b.items} == {("git", "incomplete"), ("claude", "incomplete")}
+    assert len(pids) == 2
+    for pid in pids:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)  # killed by its exact PID and reaped
+    assert b.digest != w.digest()
+
+
+def test_the_real_child_gives_the_same_baseline_as_in_process(w: World) -> None:
+    from wtctl import fsafe_child
+
+    a = repobaseline.compute(w.spec(), runner=fsafe_child.run_op)
+    assert a.digest == w.digest() and not a.has_detail()
+
+
+def test_names_that_are_not_utf8_become_storable_items(w: World) -> None:
+    raw = os.fsencode(str(w.wt)) + b"/CLAUDE\xff.md"
+    with open(raw, "wb") as fh:
+        fh.write(b"x")
+    b = w.compute()
+    item = [i for i in b.items if i.cls == "claude"][0]
+    item.path.encode("utf-8")  # storable and printable
+    assert item.path.startswith("␀hex:")
+    with open(raw, "wb") as fh:
+        fh.write(b"y")
+    assert w.digest() != b.digest
+    # a file whose name merely looks like the encoding is a different item
+    (w.wt / "CLAUDE.md").write_text("z")
+    assert len([i for i in w.compute().items if i.cls == "claude"]) == 2

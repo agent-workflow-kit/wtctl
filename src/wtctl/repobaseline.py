@@ -35,6 +35,14 @@ _DIGEST_VERSION = b"wtctl-baseline-v1\n"
 _SKIP_MODULE_DIRS = frozenset({"objects", "refs", "logs"})
 
 
+def _printable(text: str) -> str:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return "\u2400hex:" + os.fsencode(text).hex()
+    return text
+
+
 @dataclass(frozen=True)
 class Item:
     cls: str  # "git" or "claude"
@@ -44,6 +52,13 @@ class Item:
     sha256: str
     detail: str | None = None  # incomplete or mount_point
     anchor_id: str | None = None  # "<dev>:<ino>" of an external core.hooksPath directory
+
+    def __post_init__(self) -> None:
+        # a name that is not valid UTF-8 (undecodable bytes arrive as lone surrogates) could not be
+        # stored or printed: it becomes its bytes in hex behind a marker no real item starts with
+        object.__setattr__(self, "path", _printable(self.path))
+        if self.key is not None:
+            object.__setattr__(self, "key", _printable(self.key))
 
     def ident(self) -> tuple[str, str, str | None]:
         return (self.cls, self.path, self.key)

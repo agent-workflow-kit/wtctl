@@ -562,7 +562,15 @@ def test_a_newline_in_the_rendered_path_is_create_failed(w: CW, capsys) -> None:
 def test_golden_json_shape(w: CW, capsys) -> None:  # noqa: ANN001
     data = ok(w.create(capsys, "--name", "golden", "--label", "k=v", "--holder", "h"))
     rec = data["record"]
-    for volatile in ("id", "created", "updated", "dir_id", "common_id", "admin_dir"):
+    for volatile in (
+        "id",
+        "created",
+        "updated",
+        "dir_id",
+        "common_id",
+        "admin_dir",
+        "baseline_digest",
+    ):
         assert rec.pop(volatile)
     root = str(w.root.resolve() / "worktrees")
     assert rec == {
@@ -572,7 +580,7 @@ def test_golden_json_shape(w: CW, capsys) -> None:  # noqa: ANN001
         "name": "golden", "branch": "wt/golden", "created_branch": True,
         "base": "refs/heads/main", "base_sha": w.shas["c3"], "head_at_create": w.shas["c3"],
         "ref": None, "source": None, "depth": None, "fetch_url": str(w.remote),
-        "remote": "origin", "labels": ["k=v"], "holders": ["h"], "baseline_digest": None,
+        "remote": "origin", "labels": ["k=v"], "holders": ["h"],
         "bootstrap": {"state": "none", "steps": [], "created_paths_count": 0},
         "missing_since": None, "removed_at": None, "last_error": None,
     }  # fmt: skip

@@ -9,7 +9,6 @@ Handlers still to come:
 - TODO(#7): list, show, label_add, label_remove
 - TODO(#8): cron_install, cron_uninstall
 - TODO(#11): locate, clone
-- TODO(#17): baseline_check, baseline_accept
 - TODO(#18): adopt, forget
 - TODO(#19): status
 - TODO(#20): remove
