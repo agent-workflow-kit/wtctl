@@ -487,3 +487,15 @@ def test_walk_deadline_is_incomplete(w: RW, capsys, monkeypatch) -> None:  # noq
     monkeypatch.setattr(removalfs, "RUNNER", timed_out)
     d = w.st(capsys)
     assert d["checks"]["nested_repos"]["details"] == [{"detail": "incomplete", "path": None}]
+
+
+def test_planted_clone_config_is_inert_for_every_git_call(w: RW, capsys, tmp_path: Path) -> None:  # noqa: ANN001
+    marker = tmp_path / "ran"
+    w.start(capsys)
+    for key in ("core.fsmonitor", "core.pager", "core.editor", "diff.external",
+                "core.sshCommand", "core.hooksPath", "core.askPass"):  # fmt: skip
+        w.g(["config", key, f"touch {marker}"], w.clone)
+    w.g(["config", "alias.status", f"!touch {marker}"], w.clone)
+    d = w.st(capsys)
+    assert not marker.exists()
+    assert d["reason"] == "repo_config_changed"  # and the change is reported, not executed

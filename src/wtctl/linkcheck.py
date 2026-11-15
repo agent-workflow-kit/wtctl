@@ -6,9 +6,10 @@ the current one does not refuse (a file system may present a new ``st_dev`` afte
 current identities are returned and the caller shows and re-records them. Everything else
 (pointers, symlinks, mount points on the chain) still refuses.
 
-TODO(#20): the cross-check ``git rev-parse --git-common-dir`` (hardened, explicit ``--git-dir``)
-is not run here: ``baseline check``, ``baseline accept`` and a bootstrap re-run verify the files
-only. ``remove`` adds it with the other git-running checks (docs/interface.md, Baseline Details).
+The cross-check ``git rev-parse --git-common-dir`` (hardened, explicit ``--git-dir``) is not run
+here: ``baseline check``, ``baseline accept`` and a bootstrap re-run verify the files only.
+``wtctl.removal_integrity.integrity_check`` adds it for ``status`` and ``remove``
+(TODO(#20): the baseline commands and a bootstrap re-run may call it too).
 """
 
 from __future__ import annotations
