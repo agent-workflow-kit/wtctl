@@ -84,6 +84,7 @@ class Spec:
     max_file: int = MAX_FILE
     max_total: int = MAX_TOTAL
     hooks_identity: str | None = None  # the recorded identity of an external hooksPath directory
+    hooks_identity_path: str | None = None  # the path it was recorded for (None: whatever path)
     rebind_hooks: bool = False  # trust the current identity (baseline accept after inspection)
 
 
@@ -219,6 +220,29 @@ def _enc(s: str) -> bytes:
     return s.encode("utf-8", "surrogateescape")
 
 
+class Charge:
+    """Charges the entries an outer walk has read to the shared budget as they are consumed, so
+    nested listings started from inside the walk only see what is left of the bound."""
+
+    def __init__(self, budget: Budget) -> None:
+        self.budget = budget
+        self.progress = [0]
+        self._done = 0
+
+    def sync(self) -> None:
+        delta = self.progress[0] - self._done
+        self._done = self.progress[0]
+        if delta:
+            self.budget.entry(delta)
+
+    def settle(self) -> None:
+        """Charge the rest without raising (cleanup)."""
+        delta = self.progress[0] - self._done
+        self._done = self.progress[0]
+        self.budget.entries -= delta
+        self.budget.used_entries += delta
+
+
 # --- listing a directory tree --------------------------------------------------------------
 
 
@@ -328,21 +352,33 @@ class Tree:
 # --- the git class -------------------------------------------------------------------------
 
 
+def _norm(path: str) -> str:
+    """``path`` made absolute-clean. A ``..`` component is resolved physically (the kernel
+    resolves it after any symlink before it, normpath would not): the parent is resolved with
+    realpath and the final component is kept as is, so it is still read no-follow."""
+    if ".." not in path.split("/"):
+        return os.path.normpath(path)
+    parent, name = os.path.split(path)
+    if name == "..":
+        return os.path.realpath(path)
+    return os.path.join(os.path.realpath(parent), name)
+
+
 def _expand(raw: str, home: str, base: str) -> str | None:
     """A config path value as git expands it; None when it cannot be resolved."""
     if raw.startswith("~/"):
-        return os.path.normpath(os.path.join(home, raw[2:]))
+        return _norm(os.path.join(home, raw[2:]))
     if raw == "~":
-        return os.path.normpath(home)
+        return _norm(home)
     if raw.startswith("~"):
         user, _, rest = raw[1:].partition("/")
         try:
-            return os.path.normpath(os.path.join(pwd.getpwnam(user).pw_dir, rest))
+            return _norm(os.path.join(pwd.getpwnam(user).pw_dir, rest))
         except KeyError:
             return None
     if raw.startswith("%(prefix)/") or not raw:
         return None
-    return os.path.normpath(os.path.join(base, raw))
+    return _norm(os.path.join(base, raw))
 
 
 class GitCollector:
@@ -472,12 +508,15 @@ class GitCollector:
         except Stop:
             self._problem(path, "incomplete")
 
-    def _config_root(self, path: str) -> None:
+    def _config_root(self, path: str, *, applies: bool = True) -> None:
+        """One root config file's items. ``applies``: git reads this file for the record, so its
+        values (last wins) are the effective ones; the file's items are listed either way."""
         entries: list[gitconfig.Entry] = []
         self._flatten(path, 0, entries)
         grouped: dict[str, list[bytes | None]] = {}
         for e in entries:
-            self.effective[e.key] = e.value
+            if applies:
+                self.effective[e.key] = e.value
             if gitconfig.is_benign(e.key) or gitconfig.is_ignored(e.key, self.ignores):
                 continue
             grouped.setdefault(e.key, []).append(e.value)
@@ -490,6 +529,10 @@ class GitCollector:
     # -- the pieces -----------------------------------------------------------------------
 
     def _modules(self, base_path: str, base_fd: int) -> None:
+        """The git dirs of submodules below ``<base>/modules``: each one's ``config``,
+        ``config.worktree`` and ``hooks``. ``objects``, ``refs`` and ``logs`` are skipped only as
+        direct children of a git dir (a directory holding a ``HEAD`` file): a submodule may be
+        named like them. Names sort ``HEAD`` before them, so it is known by the time they come."""
         assert self.common is not None
         try:
             mfd = fsafe.open_dir(self.common, base_fd, "modules")
@@ -499,34 +542,43 @@ class GitCollector:
             return
         root = base_path + "/modules"
         tree = Tree(self.common, mfd, root, self.budget)
-        progress = [0]
+        charge = Charge(self.budget)
+        git_dirs: set[tuple[str, ...]] = set()
+
+        def descend(e: fsafe.Entry) -> bool:
+            if e.path[-1] == "hooks":
+                return False
+            return not (e.path[-1] in _SKIP_MODULE_DIRS and e.path[:-1] in git_dirs)
+
         try:
             walker = fsafe.walk_tree(
                 self.common,
                 mfd,
                 limit=max(self.budget.entries, 0),
-                descend=lambda e: e.path[-1] not in _SKIP_MODULE_DIRS and e.path[-1] != "hooks",
+                descend=descend,
                 root_path=root,
-                progress=progress,
+                progress=charge.progress,
             )
             for e in walker:
+                charge.sync()
                 name = e.path[-1]
                 full = root + "/" + "/".join(e.path)
+                if name == "HEAD" and e.kind in ("file", "symlink"):
+                    git_dirs.add(e.path[:-1])
                 if e.kind == "mount":
                     self._problem(full, "mount_point", "directory")
                 elif e.kind in ("unreadable", "changed"):
                     self._problem(full, "incomplete", "directory")
-                elif name == "config" and e.kind in ("file", "symlink"):
+                elif name in ("config", "config.worktree") and e.kind != "dir":
                     self._add_leaf(full)
-                elif name == "hooks" and e.kind == "dir":
+                elif name == "hooks":
                     self._add_leaf(full)
         except (fsafe.FsafeError, Stop) as exc:
             self._problem(root, _detail_for(exc), "directory")
         finally:
             tree.close()
             os.close(mfd)
-            self.budget.entries -= progress[0]
-            self.budget.used_entries += progress[0]
+            charge.settle()
 
     def _external_hooks(self, path: str) -> None:
         """A ``core.hooksPath`` directory outside the common dir: its own anchor."""
@@ -546,6 +598,8 @@ class GitCollector:
         try:
             cur = f"{anchor.identity.dev}:{anchor.identity.ino}"
             rec = self.spec.hooks_identity
+            if self.spec.hooks_identity_path not in (None, path):
+                rec = None  # another directory now: a new anchor, not a moved one
             if rec is not None and rec != cur and not self.spec.rebind_hooks:
                 self.items.append(Item("git", path, None, "directory", EMPTY, "mount_point", cur))
                 return
@@ -607,10 +661,14 @@ class GitCollector:
         assert self.common is not None
         c = self.common_path
         admin = self.spec.admin_dir
-        roots = [f"{c}/config", f"{c}/config.worktree"]
+        if admin in (c, self.spec.common_dir):
+            admin = None  # the main worktree: its admin dir is the common dir
+        # git reads config, then the worktree's own config.worktree: the common dir's for the
+        # main worktree, the admin entry's for a linked one, never the other one
+        roots = [(f"{c}/config", True), (f"{c}/config.worktree", admin is None)]
         admin_ok = False
         if admin:
-            roots.append(f"{admin}/config.worktree")
+            roots.append((f"{admin}/config.worktree", True))
             if admin.startswith(c + "/worktrees/"):
                 try:
                     self._admin_fd = fsafe.open_chain(
@@ -624,10 +682,10 @@ class GitCollector:
                     self._problem(admin, _detail_for(exc), "directory")
             else:
                 self._problem(admin, "incomplete", "directory")
-        for root in roots:
+        for root, applies in roots:
             if admin and root.startswith(admin + "/") and not admin_ok:
                 continue
-            self._config_root(root)
+            self._config_root(root, applies=applies)
         self._add_leaf(f"{c}/hooks")
         self._hooks_path()
         self._add_leaf(f"{c}/objects/info/alternates")
@@ -649,14 +707,20 @@ def _identity(text: str) -> fsafe.Identity:
 
 
 def _is_claude_md(name: str) -> bool:
-    return name.startswith("CLAUDE") and name.endswith(".md") and len(name) >= len("CLAUDE.md")
+    # case-insensitive: a default macOS volume loads claude.md as CLAUDE.md
+    low = name.casefold()
+    return low.startswith("claude") and low.endswith(".md") and len(low) >= len("claude.md")
+
+
+def _is_claude_name(name: str) -> bool:
+    return name.casefold() in (".claude", ".mcp.json")
 
 
 def _cc_writes(e: fsafe.Entry) -> bool:
     return (
         e.kind == "dir"
         and e.path[-1] == ".cc-writes"
-        and (len(e.path) == 1 or e.path[-2] == ".claude")
+        and (len(e.path) == 1 or e.path[-2].casefold() == ".claude")
     )
 
 
@@ -677,22 +741,21 @@ class ClaudeCollector:
             self._problem(".", _detail_for(exc))
             return self.items
         tree = Tree(anchor, anchor.fd, anchor.path, self.budget)
-        progress = [0]
+        charge = Charge(self.budget)
         try:
-            self._walk(anchor, tree, progress)
+            self._walk(anchor, tree, charge)
         except (fsafe.FsafeError, Stop, OSError) as exc:
             self._problem(".", _detail_for(exc) if not isinstance(exc, OSError) else "incomplete")
         finally:
             tree.close()
-            self.budget.entries -= progress[0]
-            self.budget.used_entries += progress[0]
+            charge.settle()
             anchor.close()
         return self.items
 
-    def _walk(self, anchor: fsafe.Anchor, tree: Tree, progress: list[int]) -> None:
+    def _walk(self, anchor: fsafe.Anchor, tree: Tree, charge: Charge) -> None:
         def descend(e: fsafe.Entry) -> bool:
             name = e.path[-1]
-            return name not in (".git", ".claude", ".mcp.json")
+            return name != ".git" and not _is_claude_name(name)
 
         for e in fsafe.walk_tree(
             anchor,
@@ -700,20 +763,21 @@ class ClaudeCollector:
             limit=max(self.budget.entries, 0),
             descend=descend,
             root_path=anchor.path,
-            progress=progress,
+            progress=charge.progress,
         ):
+            charge.sync()
             name = e.path[-1]
             rel = "/".join(e.path)
             if e.kind == "mount":
                 self._problem(rel, "mount_point")
                 continue
             if e.kind in ("unreadable", "changed"):
-                if name in (".claude", ".mcp.json") or _is_claude_md(name):
-                    self._problem(rel, "incomplete")
+                # whatever its name: an entry that cannot be read may hold any of the files
+                self._problem(rel, "incomplete")
                 continue
-            if name in (".claude", ".mcp.json"):
+            if _is_claude_name(name):
                 self._item(anchor, tree, e, rel)
-            elif _is_claude_md(name) and e.kind in ("file", "symlink"):
+            elif _is_claude_md(name) and e.kind != "dir":
                 self._item(anchor, tree, e, rel)
 
     def _item(self, anchor: fsafe.Anchor, tree: Tree, e: fsafe.Entry, rel: str) -> None:

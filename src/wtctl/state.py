@@ -543,10 +543,17 @@ class State:
         ``updates`` sets further columns in the same statement. ``baseline_items`` among them
         (dicts with ``cls path key type sha256 anchor_id``) is not a column: it replaces the
         record's baseline rows in the same transaction, so the rows and ``baseline_digest`` never
-        disagree. A lost race raises ``busy`` (exit 12), or ``not_found`` (exit 10, with
-        ``details``) when the record became a tombstone or does not exist; nothing is changed.
+        disagree. Two more non-columns share that transaction (``baseline accept`` writes the
+        record, its anchor and its clone's identity together or not at all): ``rerecord_anchor``
+        (``(path, dev_ino)``, as :meth:`rerecord_anchor`) and ``rebind_clone`` (``(repo,
+        common_dir, common_id)``: that repo's ``clones`` row gets the new ``common_id`` only when
+        its ``common_dir`` is the given one, so another clone's row is never touched). A lost
+        race raises ``busy`` (exit 12), or ``not_found`` (exit 10, with ``details``) when the
+        record became a tombstone or does not exist; nothing is changed.
         """
         baseline_items: Sequence[Mapping[str, Any]] | None = updates.pop("baseline_items", None)
+        anchor: tuple[str, str] | None = updates.pop("rerecord_anchor", None)
+        clone: tuple[str, str, str] | None = updates.pop("rebind_clone", None)
         exp = [expected] if isinstance(expected, str) else list(expected)
         for s in exp:
             _check_state(s)
@@ -586,6 +593,10 @@ class State:
                 )
             if baseline_items is not None:
                 self._write_baseline(c, record_id, baseline_items)
+            if anchor is not None:
+                self._write_anchor(c, *anchor)
+            if clone is not None:
+                self._rebind_clone(c, *clone)
         got = self.get_record(record_id)
         assert got is not None
         return got
@@ -837,15 +848,26 @@ class State:
 
     def rerecord_anchor(self, path: str, dev_ino: str) -> None:
         """Replace an anchor's recorded identity: only a human ``baseline accept`` calls this."""
+        with self._txn() as c:
+            self._write_anchor(c, path, dev_ino)
+
+    def _write_anchor(self, c: sqlite3.Connection, path: str, dev_ino: str) -> None:
         if not re.fullmatch(r"[0-9]+:[0-9]+", dev_ino):
             raise ValueError(f"invalid anchor identity {dev_ino!r}")
-        with self._txn() as c:
-            c.execute(
-                "INSERT INTO anchors(path, dev_ino, recorded_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(path) DO UPDATE SET dev_ino = excluded.dev_ino, "
-                "recorded_at = excluded.recorded_at",
-                (path, dev_ino, self._now()),
-            )
+        c.execute(
+            "INSERT INTO anchors(path, dev_ino, recorded_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET dev_ino = excluded.dev_ino, "
+            "recorded_at = excluded.recorded_at",
+            (path, dev_ino, self._now()),
+        )
+
+    def _rebind_clone(
+        self, c: sqlite3.Connection, repo: str, common_dir: str, common_id: str
+    ) -> None:
+        c.execute(
+            "UPDATE clones SET common_id = ?, verified_at = ? WHERE repo = ? AND common_dir = ?",
+            (common_id, self._now(), repo, common_dir),
+        )
 
     # -- addressing -----------------------------------------------------------------------
 

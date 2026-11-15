@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .. import baselinesvc, bootstrapper, fsafe
+from .. import baselinesvc, bootstrapper, fsafe, repobaseline
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
 from ..gitsetup import open_git, with_filters
@@ -112,16 +112,15 @@ def run(ctx: Context) -> Result:
 
 
 def _rerecord(ctx: Context, record: Record) -> Record:
-    """After a successful run: the new baseline, unless it cannot be computed in full."""
+    """After a successful run: the new baseline. One that cannot be computed in full is refused
+    (``repo_config_changed``, exit 20; the bootstrap bounds are the baseline's) and the old
+    baseline stays recorded; the refused items are the incomplete ones, each with its ``detail``
+    and its recorded state as ``before``."""
     current = baselinesvc.record_current(ctx.config, record)
     if current.has_detail():
-        items = [
-            {"class": i.cls, "path": i.path, "key": i.key, "before": "absent", "after": "absent",
-             "detail": i.detail}
-            for i in current.items
-            if i.detail
-        ]  # fmt: skip
-        raise baselinesvc.refusal(record, current, items)
+        recorded = baselinesvc.recorded_items(ctx.state, record["id"])
+        rows = [r for r in repobaseline.compare(recorded, current.items) if r.get("detail")]
+        raise baselinesvc.refusal(record, current, rows)
     return ctx.state.transition(
         record["id"],
         BOOTSTRAPPABLE,

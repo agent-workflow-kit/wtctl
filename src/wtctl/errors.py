@@ -90,7 +90,7 @@ _CODE_DETAILS = {
 }
 _REASON_DETAILS = {
     "held": ("holders",),
-    "repo_config_changed": ("digest", "recorded_digest", "changed_classes"),
+    "repo_config_changed": ("digest", "recorded_digest"),
     "branch_exists": ("tip",),
     "locked": ("lock_reason",),
 }
@@ -98,7 +98,6 @@ _REASON_DETAILS = {
 _REASON_FIELD = {
     "holder_path": "branch_in_use",
     "processes": "in_use",
-    "items": "repo_config_changed",
 }
 
 
@@ -146,6 +145,16 @@ def _validate(code: str, fields: Mapping[str, Any]) -> None:
     for name, owner in _REASON_FIELD.items():
         if (reason == owner) != (name in fields):
             fail(f"{name} is required for reason {owner} and forbidden otherwise")
+    if "items" in fields and reason != "repo_config_changed":
+        fail("items is only for reason repo_config_changed")
+    if reason == "repo_config_changed":
+        details = fields.get("details")
+        if "items" in fields:
+            if not fields["items"]:
+                fail("items needs at least 1 entry")
+            details_need(("changed_classes",))
+        elif not (isinstance(details, dict) and details.get("anchors")):
+            fail("items is required for reason repo_config_changed (or details.anchors)")
     if reason == "branch_in_use" and "holder_id" not in fields:
         fail("holder_id is required for reason branch_in_use")
     if "holder_id" in fields and reason not in ("branch_in_use", "path_exists"):

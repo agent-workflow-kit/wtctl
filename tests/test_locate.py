@@ -1534,3 +1534,27 @@ def test_the_first_recording_loser_keeps_the_winners_identity(w: World) -> None:
     assert out.recorded_id == "9:9" and out.anchor_changed
     stored = row()
     assert stored is not None and (stored["common_id"], stored["path"]) == ("9:9", "/winner")
+
+
+def test_the_reaccept_prompt_escapes_untrusted_mount_text(
+    w: World, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl.commands import clone as clone_cmd
+
+    clone = w.stub(w.tmp / "mine")
+    w.repos[REPO] = {"clone": str(clone)}
+    w.cli(capsys, "locate", REPO)
+    replace_clone(w, clone)
+    monkeypatch.setattr(
+        locate_mod,
+        "describe_mount",
+        lambda path, st: {
+            "fs_type": "ext4",
+            "mount_source": "src\x1b[2J",
+            "mount_point": "/mnt\x1b[H",
+        },
+    )
+    asked: list[str] = []
+    monkeypatch.setattr(clone_cmd, "confirm", lambda q, *, tty: asked.append(q) or False)
+    w.cli(capsys, "clone", REPO, human=True)
+    assert len(asked) == 1 and "\x1b" not in asked[0] and "\\x1b[2J" in asked[0]

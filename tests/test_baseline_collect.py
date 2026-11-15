@@ -57,6 +57,7 @@ def test_modules_configs_and_hooks_are_items(w: World) -> None:
     (mod / "hooks").mkdir(parents=True)
     (mod / "hooks" / "post-checkout").write_text("#!/bin/sh\n")
     (mod / "config").write_text("[core]\n\tworktree = ../../x\n")
+    (mod / "HEAD").write_text("ref: refs/heads/main\n")  # a git dir has a HEAD
     (mod / "objects" / "ab").mkdir(parents=True)
     (mod / "objects" / "ab" / "config").write_text("not a config, inert")
     adm = Path(w.repo.admin_dir) / "modules" / "s2"
@@ -589,7 +590,8 @@ def test_missing_worktree_directory_is_a_defined_incomplete_item(w: World) -> No
 
 
 def test_worktree_replaced_by_another_directory_does_not_match_the_identity(w: World) -> None:
-    subprocess.run(["rm", "-rf", str(w.wt)], check=True)
+    # kept, not removed: a removed directory's inode number may be reused by the new one
+    w.wt.rename(w.tmp / "wt-old")
     w.wt.mkdir()
     b = w.compute()
     assert any(i.cls == "claude" and i.detail == "mount_point" for i in b.items)

@@ -144,6 +144,15 @@ class Reused(Exception):
         self.record = record
 
 
+class _WaitForCreator(Exception):
+    """A live creator holds the lease of a ``creating`` record this holder's retry collides with:
+    unwind (releasing the per-clone lease), wait for the record's lease, then plan again."""
+
+    def __init__(self, record_id: str) -> None:
+        super().__init__(record_id)
+        self.record_id = record_id
+
+
 def _within(path: str, parent: str) -> bool:
     return path == parent or path.startswith(parent.rstrip("/") + "/")
 
@@ -157,6 +166,7 @@ class Creator:
         self.dry = ctx.dry_run
         self.warnings: list[str] = []
         self.settings = self.config.repo(opts.repo)
+        self._waited: set[str] = set()  # creating records whose creator was already waited for
 
     # -- entry ---------------------------------------------------------------------------
 
@@ -173,13 +183,27 @@ class Creator:
         self.res = res
         self.warnings += res.warnings
         self.wgit = self._git_with_filters()
+        while True:
+            try:
+                with self.state.lease(
+                    clone_lease(res.clone_path), wait=self.config.lease_wait_s
+                ) as lease:
+                    return self._locked(resolver, lease)
+            except Reused as r:
+                return self._result_reused(r.record)
+            except _WaitForCreator as w:
+                self._wait_for_creator(w.record_id)  # without the per-clone lease; then replan
+
+    def _wait_for_creator(self, record_id: str) -> None:
+        """Wait for a creator's record lease to be released. A timeout is not an error here: the
+        record is looked at again and, if it is not ``active``, the documented refusal follows."""
+        self._waited.add(record_id)
         try:
-            with self.state.lease(
-                clone_lease(res.clone_path), wait=self.config.lease_wait_s
-            ) as lease:
-                return self._locked(resolver, lease)
-        except Reused as r:
-            return self._result_reused(r.record)
+            with self.state.lease(record_lease(record_id), wait=self.config.lease_wait_s):
+                pass
+        except WtctlError as exc:
+            if exc.code != "busy":
+                raise
 
     def _git_with_filters(self) -> Git:
         return with_filters(
@@ -279,11 +303,11 @@ class Creator:
         """The retry rule: an active record that lists this holder is returned unchanged."""
         if rec is None or not self.o.holder or self.o.holder not in rec["holders"]:
             return
-        if rec["state"] == "creating":
-            # a live creator holds the record's lease: wait for it (then `busy`), and look again
-            # (the baseline step makes the `creating` window long enough for a concurrent retry)
-            with self.state.lease(record_lease(rec["id"]), wait=self.config.lease_wait_s):
-                rec = self.state.get_record(rec["id"]) or rec
+        if rec["state"] == "creating" and not self.dry and rec["id"] not in self._waited:
+            # a live creator holds the record's lease for the whole `creating` window (the
+            # baseline step makes it long enough for a concurrent retry): leave, without the
+            # per-clone lease, wait for it, and plan again. Not in a dry run (it takes no lease).
+            raise _WaitForCreator(rec["id"])
         if rec["state"] == "active":
             raise Reused(self.state.get_record(rec["id"]) or rec)
 

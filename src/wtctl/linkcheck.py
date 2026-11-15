@@ -5,6 +5,10 @@ refusal ``unlinked``. With ``rebind`` (``baseline accept``) a recorded *identity
 the current one does not refuse (a file system may present a new ``st_dev`` after a reboot): the
 current identities are returned and the caller shows and re-records them. Everything else
 (pointers, symlinks, mount points on the chain) still refuses.
+
+TODO(#20): the cross-check ``git rev-parse --git-common-dir`` (hardened, explicit ``--git-dir``)
+is not run here: ``baseline check``, ``baseline accept`` and a bootstrap re-run verify the files
+only. ``remove`` adds it with the other git-running checks (docs/interface.md, Baseline Details).
 """
 
 from __future__ import annotations
@@ -95,7 +99,7 @@ def _verify(
             ) as ranchor:
                 root_info = (base, recorded_root, _text(ranchor.identity))
                 rel = os.path.relpath(path, base)
-                if rel.startswith("..") or os.path.isabs(rel) or rel == ".":
+                if rel == ".." or rel.startswith("../") or os.path.isabs(rel) or rel == ".":
                     raise _unlinked(f"{path} is not below its root {base}")
                 fd = fsafe.open_chain(
                     ranchor,

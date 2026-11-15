@@ -24,7 +24,13 @@ ZERO_DIGEST = "0" * 64
 
 
 def describe(path: str) -> dict[str, str]:
-    """File-system type, mount source and mount point of ``path`` (untrusted text)."""
+    """File-system type, mount source and mount point of ``path`` (untrusted text).
+
+    TODO(#26): derive the mount from the opened fd (mount id of ``/proc/self/fdinfo``, macOS
+    ``fstatfs``) like fsafe does for its anchors; this looks the path up again by ``stat`` and
+    the mountinfo table, deferred with the macOS and FUSE work of #26 (non-blocking: the
+    identity compared is the opened fd's, only the text shown to the human is by path).
+    """
     try:
         return describe_mount(path, os.stat(path))
     except OSError:
@@ -53,6 +59,11 @@ def hooks_identity(items: list[Item]) -> str | None:
     return next((i.anchor_id for i in items if i.cls == "git" and i.anchor_id), None)
 
 
+def hooks_recorded_path(items: list[Item]) -> str | None:
+    """The path that identity was recorded for."""
+    return next((i.path for i in items if i.cls == "git" and i.anchor_id), None)
+
+
 def spec_for(
     config: Any,
     record: dict[str, Any],
@@ -60,6 +71,7 @@ def spec_for(
     common_id: str,
     dir_id: str,
     hooks_id: str | None = None,
+    hooks_path: str | None = None,
     rebind_hooks: bool = False,
 ) -> Spec:
     return Spec(
@@ -72,6 +84,7 @@ def spec_for(
         ignore=list(config.baseline.ignore_config_keys),
         limit=config.remove.nested_scan_limit,
         hooks_identity=hooks_id,
+        hooks_identity_path=hooks_path,
         rebind_hooks=rebind_hooks,
     )
 
@@ -94,19 +107,41 @@ def recorded_digest(record: dict[str, Any]) -> str:
     return record["baseline_digest"] or ZERO_DIGEST
 
 
-def refusal(record: dict[str, Any], current: Baseline, rows: list[dict[str, Any]]) -> WtctlError:
-    classes = repobaseline.changed_classes(rows)
-    what = " and ".join(classes) if classes else "recorded"
+def refusal(
+    record: dict[str, Any],
+    current: Baseline,
+    rows: list[dict[str, Any]],
+    *,
+    anchors: list[dict[str, Any]] | None = None,
+) -> WtctlError:
+    """``repo_config_changed`` with the changed items. Never an empty ``items`` or
+    ``changed_classes`` (the schema forbids them): with no rows, moved ``anchors`` stand alone in
+    ``details``; with neither, nothing differs from the record and the state only moved under
+    the caller (``busy``)."""
+    if not rows and not anchors:
+        return WtctlError(
+            "busy",
+            f"the baseline of {record['id']} moved while it was being confirmed; run it again",
+        )
+    details: dict[str, Any] = {
+        "digest": current.digest,
+        "recorded_digest": recorded_digest(record),
+    }
+    fields: dict[str, Any] = {}
+    what = "an anchor identity"
+    if rows:
+        classes = repobaseline.changed_classes(rows)
+        what = " and ".join(classes)
+        fields["items"] = rows
+        details["changed_classes"] = classes
+    if anchors:
+        details["anchors"] = anchors
     return WtctlError(
         "refused",
         f"the repo-config baseline of {record['id']} changed ({what})",
         reason="repo_config_changed",
-        items=rows,
-        details={
-            "digest": current.digest,
-            "recorded_digest": recorded_digest(record),
-            "changed_classes": classes,
-        },
+        details=details,
+        **fields,
     )
 
 
@@ -138,6 +173,7 @@ def verify_unchanged(
         common_id=record["common_id"],
         dir_id=record["dir_id"],
         hooks_id=hooks_identity(items),
+        hooks_path=hooks_recorded_path(items),
     )
     current = compute(spec)
     if is_changed(record, current):

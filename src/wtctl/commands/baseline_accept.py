@@ -21,6 +21,7 @@ from .. import baselinesvc, hooks, linkcheck, repobaseline
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
 from ..locate import is_fuse
+from ..output import escape_control
 from ..state import record_lease
 from . import clone as clone_cmd
 from .create import record_object
@@ -34,6 +35,15 @@ class Snapshot:
     anchors: list[dict[str, Any]]
     current: repobaseline.Baseline
     rows: list[dict[str, Any]]
+    clone_stale: bool = False  # the clone's row holds an identity other than the current one
+
+    def moved(self) -> list[dict[str, Any]]:
+        """The anchors to show with a refusal: the changed ones, or (only a stale clone row)
+        the common dir."""
+        out = [a for a in self.anchors if a["changed"]]
+        if not out and self.clone_stale:
+            out = [a for a in self.anchors if a["anchor"] == "common_dir"]
+        return out
 
 
 def _anchor(name: str, path: str, recorded: str | None, current: str) -> dict[str, Any] | None:
@@ -49,61 +59,82 @@ def _anchor(name: str, path: str, recorded: str | None, current: str) -> dict[st
     }
 
 
-def _anchors(
-    record: dict[str, Any], links: linkcheck.Links, hooks_item: repobaseline.Item | None,
-    hooks_recorded: str | None,
-) -> list[dict[str, Any]]:  # fmt: skip
+def _known_anchors(record: dict[str, Any], links: linkcheck.Links) -> list[dict[str, Any]]:
     out = [
         _anchor("common_dir", record["common_dir"], record["common_id"], links.common_id),
         _anchor("worktree_dir", record["path"], record["dir_id"], links.dir_id),
     ]
     if links.root is not None:
         out.append(_anchor("worktree_root", links.root[0], links.root[1], links.root[2]))
-    if hooks_item is not None and hooks_item.anchor_id:
-        out.append(_anchor("hooks_path", hooks_item.path, hooks_recorded, hooks_item.anchor_id))
     return [a for a in out if a is not None]
 
 
-def _snapshot(ctx: Context, record: dict[str, Any]) -> Snapshot:
-    config, state = ctx.config, ctx.state
-    links = linkcheck.verify_links(record, state, rebind=True)
-    recorded = baselinesvc.recorded_items(state, record["id"])
-    hooks_id = baselinesvc.hooks_identity(recorded)
-    spec = baselinesvc.spec_for(
-        config,
-        record,
-        common_id=links.common_id,
-        dir_id=links.dir_id,
-        hooks_id=hooks_id,
-        rebind_hooks=True,
-    )
-    current = baselinesvc.compute(spec)
-    hooks_item = next((i for i in current.items if i.cls == "git" and i.anchor_id), None)
-    anchors = _anchors(record, links, hooks_item, hooks_id)
-    changed_anchors = [a for a in anchors if a["changed"]]
-    if any(is_fuse(a["fs_type"]) for a in changed_anchors):
+def _refuse_fuse(record: dict[str, Any], anchors: list[dict[str, Any]]) -> None:
+    if any(is_fuse(a["fs_type"]) for a in anchors if a["changed"]):
         raise WtctlError(
             "refused",
             f"an anchor of {record['id']} is on a FUSE file system; it cannot be re-accepted",
             reason="unlinked",
             details={"cause": "fuse_anchor", "anchors": anchors},
         )
+
+
+def _snapshot(ctx: Context, record: dict[str, Any]) -> Snapshot:
+    config, state = ctx.config, ctx.state
+    links = linkcheck.verify_links(record, state, rebind=True)
+    known = _known_anchors(record, links)
+    _refuse_fuse(record, known)  # before the (possibly long) computation
+    recorded = baselinesvc.recorded_items(state, record["id"])
+    hooks_id = baselinesvc.hooks_identity(recorded)
+    hooks_path = baselinesvc.hooks_recorded_path(recorded)
+    spec = baselinesvc.spec_for(
+        config,
+        record,
+        common_id=links.common_id,
+        dir_id=links.dir_id,
+        hooks_id=hooks_id,
+        hooks_path=hooks_path,
+        rebind_hooks=True,
+    )
+    current = baselinesvc.compute(spec)
+    anchors = known
+    hooks_item = next((i for i in current.items if i.cls == "git" and i.anchor_id), None)
+    # an identity is compared only for the path it was recorded for: another path is a new anchor
+    if hooks_item is not None and hooks_path == hooks_item.path:
+        extra = _anchor("hooks_path", hooks_item.path, hooks_id, hooks_item.anchor_id or "")
+        if extra is not None:
+            anchors = [*known, extra]
+    _refuse_fuse(record, anchors)
+    clone = state.get_clone(record["repo"])
+    stale = (
+        clone is not None
+        and clone["common_dir"] == record["common_dir"]
+        and clone["common_id"] != links.common_id
+    )
     rows = repobaseline.compare(recorded, current.items)
-    return Snapshot(links, anchors, current, rows)
+    return Snapshot(links, anchors, current, rows, stale)
 
 
 def _question(record: dict[str, Any], snap: Snapshot) -> str:
+    """The confirmation prompt. Item paths, keys and mount facts come from the repository or the
+    file system, so every piece is escaped: this prompt is the human gate."""
+    esc = escape_control
     parts = [
-        f"{r['class']} {r['path']}" + (f" {r['key']}" if r["key"] else "") for r in snap.rows[:20]
+        esc(f"{r['class']} {r['path']}" + (f" {r['key']}" if r["key"] else ""))
+        for r in snap.rows[:20]
     ]
     more = f" (+{len(snap.rows) - 20} more)" if len(snap.rows) > 20 else ""
     moved = [a for a in snap.anchors if a["changed"]]
     ids = "; ".join(
-        f"{a['anchor']} {a['path']}: recorded {a['recorded']}, now {a['current']} "
-        f"({a['fs_type']} {a['mount_source']} on {a['mount_point']})"
+        esc(
+            f"{a['anchor']} {a['path']}: recorded {a['recorded']}, now {a['current']} "
+            f"({a['fs_type']} {a['mount_source']} on {a['mount_point']})"
+        )
         for a in moved
     )
-    text = f"{record['name']}: accept the baseline change? " + ", ".join(parts) + more
+    text = f"{esc(record['name'])}: accept the baseline change? " + ", ".join(parts) + more
+    if snap.clone_stale and not moved:
+        text += " The clone's recorded identity is out of date."
     return text + (f" Anchors: {ids}." if ids else "")
 
 
@@ -136,12 +167,12 @@ def _decide(ctx: Context, record: dict[str, Any], write_state: Any) -> Result:
     old = baselinesvc.recorded_digest(record)
     if snap.current.has_detail():
         raise baselinesvc.refusal(record, snap.current, snap.rows)
-    moved = any(x["changed"] for x in snap.anchors)
+    moved = any(x["changed"] for x in snap.anchors) or snap.clone_stale
     if snap.current.digest == record["baseline_digest"] and not moved:
         # nothing would be recorded: nothing for --expect-digest to protect either
         return _result(ctx, record, old, snap.current.digest, [], snap.anchors, dry=ctx.dry_run)
     if a.expect_digest is not None and a.expect_digest != snap.current.digest:
-        raise baselinesvc.refusal(record, snap.current, snap.rows)
+        raise baselinesvc.refusal(record, snap.current, snap.rows, anchors=snap.moved())
     if ctx.dry_run:
         return _result(ctx, record, old, snap.current.digest, snap.rows, snap.anchors, dry=True)
     if not ctx.yes and not clone_cmd.confirm(_question(record, snap), tty=ctx.runtime.stdin_isatty):
@@ -149,15 +180,27 @@ def _decide(ctx: Context, record: dict[str, Any], write_state: Any) -> Result:
             "confirmation_required", "accepting a baseline change needs confirmation (--yes)"
         )
     again = _snapshot(ctx, record)
-    if again.current.has_detail() or again.current.digest != snap.current.digest:
-        raise baselinesvc.refusal(record, again.current, again.rows)
-    if again.links.common_id != snap.links.common_id or again.links.dir_id != snap.links.dir_id:
-        raise baselinesvc.refusal(record, again.current, again.rows)
+    if (
+        again.current.has_detail()
+        or again.current.digest != snap.current.digest
+        or again.links.common_id != snap.links.common_id
+        or again.links.dir_id != snap.links.dir_id
+    ):
+        # it moved while the human decided (possibly back to the recorded state: then there are
+        # no rows to show and the refusal is `busy`)
+        raise baselinesvc.refusal(record, again.current, again.rows, anchors=again.moved())
     updates: dict[str, Any] = {}
     if again.links.common_id != record["common_id"]:
         updates["common_id"] = again.links.common_id
     if again.links.dir_id != record["dir_id"]:
         updates["dir_id"] = again.links.dir_id
+    root = again.links.root
+    if root is not None and root[1] != root[2]:
+        updates["rerecord_anchor"] = (root[0], root[2])
+    if "common_id" in updates or again.clone_stale:
+        # only a clones row of this very clone (same common dir) is touched
+        updates["rebind_clone"] = (record["repo"], record["common_dir"], again.links.common_id)
+    # one transaction: the record with its baseline rows, the anchor and the clone's identity
     new = state.transition(
         record["id"],
         "active",
@@ -166,10 +209,6 @@ def _decide(ctx: Context, record: dict[str, Any], write_state: Any) -> Result:
         baseline_items=baselinesvc.item_rows(again.current),
         **updates,
     )
-    if again.links.root is not None and again.links.root[1] != again.links.root[2]:
-        state.rerecord_anchor(again.links.root[0], again.links.root[2])
-    if "common_id" in updates:
-        state.put_clone(record["repo"], common_id=again.links.common_id)
     # TODO(#5): audit `baseline_accept` (the changed items and the anchors).
     result = _result(ctx, new, old, again.current.digest, snap.rows, again.anchors, dry=False)
     _post_hook(ctx, config, new, snap.rows, result)

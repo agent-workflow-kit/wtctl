@@ -12,6 +12,7 @@ from typing import Any
 from ..context import Context, Result
 from ..errors import WtctlError
 from ..locate import Resolution, Resolver, is_fuse, resolver_for
+from ..output import escape_control
 from ..state import repo_lease
 
 
@@ -40,12 +41,17 @@ def _reaccept(ctx: Context, resolver: Resolver, res: Resolution) -> list[dict[st
     if ctx.dry_run:
         return anchors
     if not ctx.yes:
+        # paths and mount facts are untrusted text and this prompt is the human gate: escape it
         shown = "; ".join(
-            f"{a['path']}: recorded {a['recorded']}, now {a['current']} "
-            f"({a['fs_type']} {a['mount_source']} on {a['mount_point']})"
+            escape_control(
+                f"{a['path']}: recorded {a['recorded']}, now {a['current']} "
+                f"({a['fs_type']} {a['mount_source']} on {a['mount_point']})"
+            )
             for a in anchors
         )
-        question = f"{res.repo}: the clone's directory changed ({shown}). Accept it?"
+        question = (
+            f"{escape_control(res.repo)}: the clone's directory changed ({shown}). Accept it?"
+        )
         if not confirm(question, tty=ctx.runtime.stdin_isatty):
             raise WtctlError(
                 "confirmation_required", "re-accepting a changed clone needs confirmation (--yes)"

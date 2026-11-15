@@ -188,3 +188,18 @@ def test_adopted_main_worktree(w: CW) -> None:
     with pytest.raises(WtctlError):
         linkcheck.verify_links(st.get_record(rid) or {}, st)
     st.close()
+
+
+def test_a_worktree_directory_named_with_leading_dots_is_not_outside_its_root(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    rid = made(w, capsys)
+    r, st = rec(w, rid)
+    st.close()
+    p = Path(r["path"])
+    moved = Path(r["base_dir"]) / "..odd"
+    p.rename(moved)
+    (Path(r["admin_dir"]) / "gitdir").write_text(f"{moved}/.git\n")
+    set_col(w, rid, path=str(moved))
+    assert verify(w, rid).dir_id == r["dir_id"]
