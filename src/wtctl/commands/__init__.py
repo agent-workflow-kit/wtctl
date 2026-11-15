@@ -5,9 +5,6 @@ failures. Nothing else needs editing to add one (see ``wtctl.registry.load_handl
 
 Handlers still to come:
 
-- TODO(#5): export
-- TODO(#7): list, show, label_add, label_remove
-- TODO(#8): cron_install, cron_uninstall
 - TODO(#11): locate, clone
 - TODO(#15): create
 - TODO(#16): bootstrap
