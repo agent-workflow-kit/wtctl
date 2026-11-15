@@ -22,6 +22,51 @@ class _Pattern:
     anchored: bool
 
 
+def _bracket(glob: str, start: int) -> tuple[str, int] | None:
+    """The regex of the character class opening at ``glob[start]`` and the index after its ``]``,
+    or None when it is not closed (the ``[`` is then a literal). As in git's wildmatch with
+    WM_PATHNAME: a backslash quotes the next character (so ``\\-`` is a literal ``-``, not a
+    range), ``]`` first in the class is a literal, and a class never matches ``/`` (not even a
+    negated one, or a range such as ``+-0`` that spans it)."""
+    n = len(glob)
+    j = start + 1
+    neg = j < n and glob[j] in "!^"
+    if neg:
+        j += 1
+    first = j
+    items: list[tuple[str, bool]] = []  # (character, quoted)
+    while True:
+        if j >= n:
+            return None
+        c = glob[j]
+        if c == "]" and j > first:
+            break
+        if c == "\\":
+            if j + 1 >= n:
+                return None
+            items.append((glob[j + 1], True))
+            j += 2
+        else:
+            items.append((c, False))
+            j += 1
+    parts: list[str] = []
+    k = 0
+    while k < len(items):
+        ch = items[k][0]
+        if k + 2 < len(items) and items[k + 1] == ("-", False):
+            hi = items[k + 2][0]
+            if ch <= hi:  # git matches nothing for a reversed range
+                parts.append(f"{re.escape(ch)}-{re.escape(hi)}")
+            k += 3
+        else:
+            parts.append(re.escape(ch))
+            k += 1
+    if not parts:
+        body = "(?!)" if not neg else "[^/]"
+        return body, j + 1
+    return f"(?!/)[{'^' if neg else ''}{''.join(parts)}]", j + 1
+
+
 def _translate(glob: str) -> str:
     out: list[str] = []
     i, n = 0, len(glob)
@@ -51,34 +96,39 @@ def _translate(glob: str) -> str:
             out.append("[^/]")
             i += 1
         elif c == "[":
-            j = i + 1
-            if j < n and glob[j] in "!^":
-                j += 1
-            if j < n and glob[j] == "]":
-                j += 1
-            while j < n and glob[j] != "]":
-                j += 1
-            if j >= n:
+            parsed = _bracket(glob, i)
+            if parsed is None:
                 out.append(re.escape(c))
                 i += 1
-                continue
-            body = glob[i + 1 : j]
-            neg = body[:1] in ("!", "^")
-            if neg:
-                body = body[1:]
-            body = body.replace("\\", "\\\\").replace("[", "\\[")
-            out.append(f"[{'^' if neg else ''}{body}]")
-            i = j + 1
+            else:
+                out.append(parsed[0])
+                i = parsed[1]
         else:
             out.append(re.escape(c))
             i += 1
     return "".join(out)
 
 
+def _quoted(p: str, idx: int) -> bool:
+    """Whether the character at ``idx`` is preceded by an odd number of backslashes."""
+    k = idx
+    while k > 0 and p[k - 1] == "\\":
+        k -= 1
+    return (idx - k) % 2 == 1
+
+
+def _dangling_backslash(p: str) -> bool:
+    return p.endswith("\\") and not _quoted(p, len(p) - 1)
+
+
 def _compile(raw: str) -> _Pattern | None:
     if not raw or raw.startswith(("!", "#")):
         return None
     p = raw
+    while p.endswith(" ") and not _quoted(p, len(p) - 1):  # git drops unquoted trailing spaces
+        p = p[:-1]
+    if _dangling_backslash(p):
+        return None  # git never matches a pattern that ends in a lone backslash
     dir_only = p.endswith("/")
     p = p.rstrip("/")
     if not p:

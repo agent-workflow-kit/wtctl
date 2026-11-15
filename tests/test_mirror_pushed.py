@@ -210,12 +210,13 @@ def test_e1b_grafts_do_not_forge_ancestry(w: World) -> None:
     assert (res.pushed, res.detail) == (False, "not_ancestor")
 
 
-def test_e1d_a_planted_shallow_file_only_cuts_history(w: World) -> None:
+def test_e1d_a_planted_shallow_file_changes_no_answer(w: World) -> None:
+    # `GIT_SHALLOW_FILE=/dev/null` on every call: a planted `shallow` file cuts no history
     shas = w.build()
     m = w.mirror()
     tips = w.refresh(m).tips
     Path(m.path, "shallow").write_text(shas[2] + "\n")
-    assert m.is_pushed(shas[0], tips).pushed is False  # fails safe
+    assert m.is_pushed(shas[0], tips).pushed is True
 
 
 def test_e1e_alternates_give_nothing_beyond_writing_the_store(w: World) -> None:

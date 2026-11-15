@@ -39,11 +39,18 @@ from .mirror import Mirror, Pushed, Tips
 
 SHA = re.compile(r"[0-9a-f]{40}")
 # Config that makes status compare content, never stat data or a cache the agent could forge.
+# Only ``core.ignoreStat`` and ``core.splitIndex`` are guarded by a test that fails without them
+# (tests/test_removal_round1.py, R13/R14). The other three are belt and braces: the private index
+# is rebuilt from ``ls-files -s`` and so holds no stat data and no untracked-cache extension that
+# a ``core.checkStat``, ``core.trustctime`` or ``core.untrackedCache`` setting could act on, and
+# no test can tell the difference (checked by dropping each: nothing observable changes).
 PRIVATE_INDEX_OVERRIDES = (
     ("core.untrackedCache", "false"),
     ("core.checkStat", "default"),
     ("core.trustctime", "true"),
     ("core.ignoreStat", "false"),
+    # a split index would write sharedindex.* files into the real git dir
+    ("core.splitIndex", "false"),
 )
 REFLOG_MAX_BYTES = 64 * 1024 * 1024
 STASH_REF = "refs/stash"
@@ -118,6 +125,7 @@ def private_index(inp: Inputs) -> Iterator[str]:
             git_dir=inp.gitdir,
             work_tree=inp.path,
             index_file=index,
+            overrides=PRIVATE_INDEX_OVERRIDES,
         )
         if r.timed_out or r.returncode != 0:
             raise _fail("update-index --index-info", None if r.timed_out else r.returncode, r.err)
@@ -216,6 +224,74 @@ class Hasher:
     def digest(self, rel: str) -> str | None:
         return bootstrapper._hash_entry(self._wt, self._cache, rel, self.budget)
 
+    def gitlink_state(self, rel: str) -> str:
+        """What stands at the tracked gitlink path ``rel``, without following links: ``absent``,
+        ``empty`` (an empty directory, what an uninitialised submodule leaves), ``initialised``
+        (a ``.git`` entry is there: the nested walk handles it), ``contents`` (files without a
+        ``.git``, which git's status never sees), ``not_dir`` (a file, link or special file in
+        place of the directory) or ``unreadable``."""
+        parts = rel.split("/")
+        try:
+            parent = self._cache.get(tuple(parts[:-1]))
+            try:
+                st = self._wt.anchor.fs.lstat_at(parent, parts[-1])
+            except FileNotFoundError:
+                return "absent"
+            if fsafe.kind_of_mode(st.mode) != "dir":
+                return "not_dir"
+            fd = fsafe.open_dir(self._wt.anchor, parent, parts[-1])
+            try:
+                names = os.listdir(fd)
+            finally:
+                os.close(fd)
+        except fsafe.FsafeError as exc:
+            return "absent" if exc.kind == "missing" else "unreadable"
+        except OSError:
+            return "unreadable"
+        if not names:
+            return "empty"
+        return "initialised" if ".git" in names else "contents"
+
+
+def gitlink_paths(inp: Inputs) -> list[str]:
+    """The gitlink (mode 160000) paths of the worktree's index. Git's status, run with
+    ``--ignore-submodules=all``, never looks below them, so wtctl does."""
+    staged = inp.run(["ls-files", "-s", "-z"], what="ls-files -s")
+    out: set[str] = set()
+    for entry in staged.split(b"\0"):
+        meta, _, path = entry.partition(b"\t")
+        if meta.startswith(b"160000 ") and path:
+            out.add(path.decode("utf-8", "surrogateescape"))
+    return sorted(out)
+
+
+def info_attributes_hide_changes(inp: Inputs) -> bool:
+    """``<common>/info/attributes`` is read by git for every worktree of the clone and cannot be
+    turned off (``* ident``, a filter or a ``-diff`` rule there can make an edit invisible to
+    status). True unless the file is missing or empty; a file wtctl cannot read counts as
+    non-empty."""
+    common = inp.record["common_dir"]
+    try:
+        with fsafe.open_anchor(common, expected=_ident(inp.record["common_id"])) as anchor:
+            try:
+                fd = fsafe.open_chain(anchor, anchor.fd, ["info"], start_path=anchor.path)
+            except fsafe.FsafeError as exc:
+                return exc.kind != "missing"
+            try:
+                try:
+                    anchor.fs.lstat_at(fd, "attributes")
+                except FileNotFoundError:
+                    return False
+                afd = fsafe.open_file(anchor, fd, "attributes")
+                try:
+                    return bool(os.read(afd, 1))
+                finally:
+                    os.close(afd)
+            finally:
+                os.close(fd)
+    except (fsafe.FsafeError, OSError):
+        return True
+
 
 # -- tracked, untracked, ignored -----------------------------------------------------------------
 
@@ -227,7 +303,11 @@ def tracked_untracked_ignored(inp: Inputs) -> dict[str, dict[str, Any]]:
     untracked: list[dict[str, Any]] = []
     ignored: list[dict[str, Any]] = []
     hidden = hidden_entries(inp)
+    gitlinks = gitlink_paths(inp)
     with private_index(inp) as index, Hasher(inp.record) as hasher:
+        for rel in gitlinks:  # a file or link where a submodule's directory belongs
+            if hasher.gitlink_state(rel) in ("not_dir", "unreadable"):
+                tracked.append({"path": _text(rel), "detail": "changed"})
         for e in _status(inp, index, ["--untracked-files=all", "--ignored=no"]):
             if e.kind in ("1", "2", "u"):
                 tracked.append({"path": _text(e.path), "detail": "changed"})
@@ -250,6 +330,8 @@ def tracked_untracked_ignored(inp: Inputs) -> dict[str, dict[str, Any]]:
                 continue
             ignored.append({"path": _text(e.path)})
     tracked += [{"path": _text(p), "detail": "hidden_changes"} for p in hidden]
+    if info_attributes_hide_changes(inp):
+        tracked.append({"path": "info/attributes", "detail": "attributes"})
     tracked.sort(key=lambda d: (d["path"], d["detail"]))
     untracked.sort(key=lambda d: d["path"])
     ignored.sort(key=lambda d: d["path"])
@@ -335,8 +417,100 @@ def nested_repos(inp: Inputs) -> dict[str, Any]:
             if parent in subs and _points_into_modules(g["content"], inp, parent):
                 kind = "submodule"
         details.append({"detail": kind, "path": _text(rel)})
+    details += gitlink_contents(inp) + module_git_dirs(inp)
     details.sort(key=lambda d: (d["detail"], d["path"] or ""))
     return check("fail" if details else "pass", details)
+
+
+def gitlink_contents(inp: Inputs) -> list[dict[str, Any]]:
+    """Files below a gitlink path whose directory has no ``.git`` (an uninitialised submodule
+    somebody wrote into): git sees none of them, and removal would delete them."""
+    try:
+        gitlinks = gitlink_paths(inp)
+        with Hasher(inp.record) as hasher:
+            states = {rel: hasher.gitlink_state(rel) for rel in gitlinks}
+    except fsafe.FsafeError:
+        return [{"detail": "incomplete", "path": None}]
+    out: list[dict[str, Any]] = []
+    for rel, state in states.items():
+        if state == "contents":
+            out.append({"detail": "submodule", "path": _text(rel)})
+        elif state == "unreadable":
+            out.append({"detail": "incomplete", "path": None})
+    return out
+
+
+MODULES_MAX_DEPTH = 64
+
+
+def module_git_dirs(inp: Inputs) -> list[dict[str, Any]]:
+    """Git dirs below ``<admin_dir>/modules`` and ``<common>/modules``: a submodule's repository
+    lives there, with any commits not pushed anywhere, and removal deletes the admin entry whether
+    or not the submodule's checkout (and so its ``.git`` file) is still there."""
+    common = inp.record["common_dir"]
+    admin = inp.record["admin_dir"]
+    roots = [(common, ["modules"])]
+    if admin:
+        roots.append((admin, [*os.path.relpath(admin, common).split(os.sep), "modules"]))
+    limit = inp.config.remove.nested_scan_limit
+    found: list[str] = []
+    incomplete = False
+    left = [limit]
+    try:
+        with fsafe.open_anchor(common, expected=_ident(inp.record["common_id"])) as anchor:
+            for base, chain in roots:
+                try:
+                    fd = fsafe.open_chain(anchor, anchor.fd, chain, start_path=anchor.path)
+                except fsafe.FsafeError as exc:
+                    incomplete = incomplete or exc.kind != "missing"
+                    continue
+                try:
+                    root_path = os.path.join(base, "modules")
+                    incomplete |= not _walk_git_dirs(anchor, fd, root_path, 0, left, found)
+                finally:
+                    os.close(fd)
+    except fsafe.FsafeError:
+        incomplete = True
+    out: list[dict[str, Any]] = [{"detail": "submodule", "path": _text(p)} for p in found]
+    if incomplete:
+        out.append({"detail": "incomplete", "path": None})
+    return out
+
+
+def _walk_git_dirs(
+    anchor: fsafe.Anchor, fd: int, path: str, depth: int, left: list[int], found: list[str]
+) -> bool:
+    """Collect the git dirs (directories holding ``HEAD``) below ``fd``; False when the walk was
+    cut short or something could not be read."""
+    if depth > MODULES_MAX_DEPTH:
+        return False
+    try:
+        names = sorted(os.listdir(fd))
+    except OSError:
+        return False
+    left[0] -= len(names)
+    if left[0] < 0:
+        return False
+    if "HEAD" in names:
+        found.append(path)
+        return True
+    complete = True
+    for name in names:
+        try:
+            st = anchor.fs.lstat_at(fd, name)
+            if fsafe.kind_of_mode(st.mode) != "dir":
+                continue
+            sub = fsafe.open_dir(anchor, fd, name)
+        except (fsafe.FsafeError, OSError):
+            complete = False
+            continue
+        try:
+            complete &= _walk_git_dirs(
+                anchor, sub, os.path.join(path, name), depth + 1, left, found
+            )
+        finally:
+            os.close(sub)
+    return complete
 
 
 # -- pushed state: stash, head, side branches ----------------------------------------------------
@@ -367,7 +541,9 @@ def stash(inp: Inputs, head: str) -> dict[str, Any]:
     has = inp.git.run(
         ["rev-parse", "--verify", "-q", STASH_REF], git_dir=common, cwd=common, timeout=60
     )
-    if has.returncode != 0:
+    if has.timed_out or has.returncode not in (0, 1):
+        raise _fail("rev-parse refs/stash", None if has.timed_out else has.returncode, has.err)
+    if has.returncode == 1:  # `rev-parse --verify -q` exits 1 for a missing ref, nothing else
         return check("pass")
     r = inp.git.run(
         ["log", "-g", "--format=%H %P", STASH_REF, "--"], git_dir=common, cwd=common, timeout=60
@@ -477,21 +653,30 @@ def reflog_tips(
     """The shas HEAD pointed at since the worktree was made, or None when neither anchor is
     usable. An entry is attributed when its timestamp is at or after the recorded start, or when
     it comes after the start entry (the first entry with the recorded sha at or before the start;
-    so an entry backdated with ``GIT_COMMITTER_DATE`` is still attributed)."""
+    so an entry backdated with ``GIT_COMMITTER_DATE`` is still attributed).
+
+    Reflog timestamps are whole seconds and the recorded start has milliseconds, so both are
+    compared at the start's second: an entry in that second counts as since the start, and the
+    time anchor needs an entry strictly before it (an entry in the start second cannot be told
+    from one made just after it)."""
+    start_sec = int(start_ts // 1)
     start_idx = None
     if start_sha is not None:
         for i, (_old, new, ts) in enumerate(entries):
-            if new == start_sha and ts <= start_ts:
+            if new == start_sha and ts <= start_sec:
                 start_idx = i
                 break
-    time_anchor = any(ts <= start_ts for _o, _n, ts in entries)
+    time_anchor = any(ts < start_sec for _o, _n, ts in entries)
     if start_idx is None and not time_anchor:
         return None
-    return {
+    tips = {
         new
         for i, (_old, new, ts) in enumerate(entries)
-        if ts >= start_ts or (start_idx is not None and i > start_idx)
+        if ts >= start_sec or (start_idx is not None and i > start_idx)
     }
+    if not tips and start_idx is None:
+        return None  # a reflog that shows nothing since the start, with no start entry, is cut
+    return tips
 
 
 def unpushed_branches(inp: Inputs, head: str) -> dict[str, Any]:
@@ -504,7 +689,10 @@ def unpushed_branches(inp: Inputs, head: str) -> dict[str, Any]:
     )
     if tips_seen is None:
         return check("fail", [{"branch": None, "sha": None, "detail": "reflog_unavailable"}])
-    heads = worktrees.local_heads(inp.git, inp.record["common_dir"])
+    try:
+        heads = worktrees.local_heads(inp.git, inp.record["common_dir"])
+    except WtctlError as exc:
+        raise WtctlError("internal", exc.message) from exc
     candidates = sorted(
         (ref, sha) for ref, sha in heads.items() if sha in tips_seen and sha != head
     )

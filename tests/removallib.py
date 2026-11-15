@@ -12,6 +12,7 @@ from tests.createlib import CW
 from tests.schemacheck import validate
 from tests.test_create import ok
 from wtctl.gateway import Gateway, ProcessInfo, ScannerUnavailable
+from wtctl.procscan import ProcScanner
 
 
 class FakeScanner:
@@ -27,6 +28,15 @@ class FakeScanner:
         if self.fail:
             raise ScannerUnavailable("no scanner")
         return list(self.procs)
+
+
+class ReadableProcScanner(ProcScanner):
+    """The real ``/proc`` scanner without the same-user processes it cannot read: a developer's
+    machine runs non-dumpable processes (an editor, a coding agent) that make every real in-use
+    check ``unavailable``, which is the right answer but hides what these tests look at."""
+
+    def scan(self, target: str | None = None) -> list[ProcessInfo]:
+        return [p for p in super().scan(target) if p.inspected or p.other_user]
 
 
 class RW(CW):

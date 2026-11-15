@@ -120,7 +120,7 @@ OVERRIDES: tuple[tuple[str, str], ...] = (
     ("interactive.diffFilter", ""),
     # A nested repository (submodule) is diffed by a child git that reads its own, unblanked
     # config: only the short summary is safe (`diff` and `log` formats run that child).
-    ("diff.submodule", "short"),
+    ("diff.submodule", "short"),  # belt and braces: nothing wtctl runs today diffs a submodule
 )
 # The only keys a caller may add to the override set (`Git.build(overrides=...)`), lowercase. The
 # tree fetch into the mirror needs `fetch.negotiationAlgorithm=noop` (interface.md, Mirror).
@@ -133,6 +133,7 @@ CALLER_OVERRIDE_KEYS = frozenset(
         "core.checkstat",
         "core.trustctime",
         "core.ignorestat",
+        "core.splitindex",
     }
 )
 NETWORK_OVERRIDES: tuple[tuple[str, str], ...] = (
@@ -216,6 +217,7 @@ def build_env(
     ssh_auth_sock: str | None = None,
     ceiling: str | None = None,
     index_file: str | None = None,
+    allow_shallow: bool = False,
 ) -> dict[str, str]:
     """The complete environment of one git process. Nothing of the caller's reaches git."""
     _check_git_bin(git_bin)
@@ -236,6 +238,11 @@ def build_env(
         "GIT_GRAFT_FILE": "/dev/null/none",
         "GIT_SSH_VARIANT": "ssh",
     }
+    if not allow_shallow:
+        # a `shallow` file in the (agent-writable) clone cuts history short and so changes every
+        # `merge-base --is-ancestor`; only the local-throwaway fill, which copies from a possibly
+        # shallow source into a shallow throwaway on purpose, reads one
+        env["GIT_SHALLOW_FILE"] = "/dev/null"
     if ssh_auth_sock is not None and scheme == "ssh":
         env["SSH_AUTH_SOCK"] = ssh_auth_sock
     if ceiling is not None:
@@ -443,6 +450,7 @@ class Git:
         extra_path: Sequence[str],
         overrides: Sequence[tuple[str, str]] = (),
         index_file: str | None = None,
+        allow_shallow: bool = False,
     ) -> GitCommand:
         if not args or not re.fullmatch(r"[a-z][a-z-]*", args[0]) or args[0] not in SUBCOMMANDS:
             raise ValueError(f"not a git subcommand wtctl runs: {args[:1]!r}")
@@ -486,6 +494,7 @@ class Git:
             ssh_auth_sock=ssh_auth_sock,
             ceiling=ceiling,
             index_file=index_file,
+            allow_shallow=allow_shallow,
         )
         return GitCommand(argv, env, cwd)
 
@@ -504,6 +513,7 @@ class Git:
         tool_owned: bool = False,
         overrides: Sequence[tuple[str, str]] = (),
         index_file: str | None = None,
+        allow_shallow: bool = False,
     ) -> GitCommand:
         """Build the argv, environment and cwd of one command (``run`` runs the result).
 
@@ -558,6 +568,7 @@ class Git:
             extra_path=extra_path,
             overrides=overrides,
             index_file=None if index_file is None else _check_path(index_file, "index file"),
+            allow_shallow=allow_shallow,
         )
 
     def run(

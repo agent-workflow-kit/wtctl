@@ -21,6 +21,7 @@ from . import (
     fsafe,
     fsafe_child,
     inuse,
+    linkcheck,
     removal_content,
     removal_integrity,
     repobaseline,
@@ -71,6 +72,10 @@ ORDER = (
     "unpushed_branches",
 )
 SHA = re.compile(r"[0-9a-f]{40}")
+# The integrity steps whose failure is what a half-deleted worktree looks like (its pointers or
+# its admin entry are gone). A failure of the git step (``git_common_dir``) is a git answer that
+# disagrees or did not come: the pointers are intact, so the normal checks must decide.
+PARTIAL_FALLBACK_STEPS = ("path", "root", "dotgit", "admin_gitdir", "commondir")
 NOT_ACTIVE = ("creating", "unlinked", "missing", "clone_missing")
 
 
@@ -218,7 +223,7 @@ class Status:
         self.checks["integrity"] = check
         if links is None:
             self.skip_git_checks()
-            if r["state"] == "partial":
+            if r["state"] == "partial" and check["details"][0]["step"] in PARTIAL_FALLBACK_STEPS:
                 self.partial_worktree_unlinked()
             self.in_use()
             self.held(holder)
@@ -253,11 +258,21 @@ class Status:
         try:
             self.checks.update(removal_content.run_all(inp))
         except fsafe.FsafeError as exc:
-            raise WtctlError(
-                "refused",
-                f"{r['path']} is not the recorded worktree ({exc.kind})",
-                reason="unlinked",
-            ) from exc
+            # the directory changed identity under the scan: integrity no longer holds
+            self.checks["integrity"] = {
+                "status": "fail",
+                "details": [
+                    {
+                        "step": linkcheck.exc_step(exc, r),
+                        "expected": r["path"],
+                        "actual": None,
+                    }
+                ],
+            }
+            self.checks.update(removal_content.not_run())
+            self.warnings.append(
+                f"{_escape(r['path'])} changed while it was being checked ({exc.kind})"
+            )
 
     def skip_git_checks(self) -> None:
         self.checks.setdefault("locked", removal_content.skipped())
@@ -313,8 +328,7 @@ class Status:
         content checks do not run (Partial records)."""
         r = self.record
         try:
-            with fsafe.open_anchor(r["path"], expected=removal_content._ident(r["dir_id"])):
-                pass
+            self._open_recorded_directory()
         except fsafe.FsafeError:
             return
         self.checks["integrity"] = {"status": "pass", "details": []}
@@ -323,6 +337,29 @@ class Status:
             f"{_escape(r['path'])} is partial and its git pointers are gone; content checks "
             "were skipped and remove only checks that nothing uses it"
         )
+
+    def _open_recorded_directory(self) -> None:
+        """Open the remaining path as Partial records require: an owned record component by
+        component below its recorded ``base_dir`` (whose identity is the recorded one, every
+        component on its device and mount), an adopted one by its own path; the opened directory
+        must have the recorded ``dir_id``."""
+        r = self.record
+        expected = removal_content._ident(r["dir_id"])
+        base = r["base_dir"]
+        if not (r["owned"] and base):
+            with fsafe.open_anchor(r["path"], expected=expected):
+                return
+        rel = os.path.relpath(r["path"], base)
+        if rel in (".", "..") or rel.startswith("../") or os.path.isabs(rel):
+            raise fsafe.FsafeError("identity", f"{r['path']} is not below its root {base}")
+        recorded = removal_content._ident(self.state.anchor_identity(base))
+        if recorded is None:
+            raise fsafe.FsafeError("identity", f"no identity is recorded for the root {base}")
+        with fsafe.open_anchor(base, expected=recorded) as anchor:
+            fd = fsafe.open_chain(
+                anchor, anchor.fd, rel.split(os.sep), expected=expected, start_path=anchor.path
+            )
+            os.close(fd)
 
     # -- the verdict --------------------------------------------------------------------------
 
@@ -353,9 +390,12 @@ class Status:
         for reason in REASONS:
             if reason in found:
                 return False, reason
-        unknown = (
-            any(v["status"] in ("skipped", "unavailable") for v in c.values())
-            and not self.by_design_skipped
+        # A partial record whose pointers are gone runs no git on purpose, so the checks that
+        # need git are excused; the in-use check is not: no answer is never "nothing uses it".
+        unknown = any(
+            v["status"] in ("skipped", "unavailable")
+            for name, v in c.items()
+            if not (self.by_design_skipped and name != "in_use")
         )
         if unknown or failed("fetch"):
             return None, None

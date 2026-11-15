@@ -516,6 +516,8 @@ class ProcessInfo:
     ppid: int | None = None
     start: str | None = None  # opaque start time, as ``ProcessIdentity.start_time`` reports it
     inspected: bool = True  # False: other user or unreadable entries
+    other_user: bool = False  # not inspected because it belongs to another user (a process of
+    # the invoking user that could not be inspected is what makes the in-use check unavailable)
 
 
 class ScannerUnavailable(Exception):

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.removallib import FakeScanner
+from tests.removallib import FakeScanner, ReadableProcScanner
 from wtctl import inuse
 from wtctl.gateway import Gateway, ProcessInfo, ScannerUnavailable
 from wtctl.procscan import LsofScanner, ProcScanner, parse_lsof
@@ -96,8 +96,25 @@ def test_unavailable_scanner() -> None:
 
 
 def test_uninspected_processes_are_counted_in_a_warning() -> None:
-    r = hit(ProcessInfo(20, "other-user", None, inspected=False), ProcessInfo(21, "me", "/home"))
+    other = ProcessInfo(20, "other-user", None, inspected=False, other_user=True)
+    r = hit(other, ProcessInfo(21, "me", "/home"))
     assert r.status == "pass" and any("1 process" in w for w in r.warnings)
+
+
+def test_r4_an_uninspectable_process_of_my_own_user_makes_the_check_unavailable() -> None:
+    mine = ProcessInfo(20, "hidden", None, inspected=False)  # same user, entries unreadable
+    r = hit(mine, ProcessInfo(21, "me", "/home"))
+    assert r.status == "unavailable" and any("could not be inspected" in w for w in r.warnings)
+
+
+def test_r4_a_found_process_still_fails_beside_an_uninspectable_one() -> None:
+    r = hit(ProcessInfo(20, "hidden", None, inspected=False), ProcessInfo(21, "vim", T + "/x"))
+    assert r.status == "fail" and [p["pid"] for p in r.processes] == [21]
+
+
+def test_r4_an_uninspectable_process_of_wtctls_own_tree_is_not_counted() -> None:
+    own = ProcessInfo(999_999, "wtctl", None, inspected=False)
+    assert hit(own).status == "pass"
 
 
 def test_hostile_command_and_path_are_escaped() -> None:
@@ -224,7 +241,7 @@ def sleepers() -> Iterator[list[Sleeper]]:
 
 
 def real_check(tree: Path, ids: set[tuple[int, int]] | None = None) -> inuse.InUse:
-    return inuse.check_in_use(Gateway(scanner=ProcScanner()), str(tree), ids or set())
+    return inuse.check_in_use(Gateway(scanner=ReadableProcScanner()), str(tree), ids or set())
 
 
 @linux_only
@@ -253,16 +270,64 @@ def test_real_process_with_a_mapped_file_whose_descriptor_is_closed(
     tree: Path, sleepers: list[Sleeper], tmp_path: Path
 ) -> None:
     (tree / "big.bin").write_bytes(b"x" * 8192)
+    # libc mmap, then close the only descriptor (Python's mmap module keeps a duplicate open)
     code = (
-        "import mmap\n"
-        f"fh = open({str(tree / 'big.bin')!r}, 'rb')\n"
-        "m = mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ)\n"
-        "fh.close()\n"
+        "import ctypes\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "libc.mmap.restype = ctypes.c_void_p\n"
+        "libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,\n"
+        "                      ctypes.c_int, ctypes.c_long]\n"
+        f"fd = os.open({str(tree / 'big.bin')!r}, os.O_RDONLY)\n"
+        "addr = libc.mmap(None, 8192, 1, 1, fd, 0)\n"  # PROT_READ, MAP_SHARED
+        "assert addr is not None and addr != ctypes.c_void_p(-1).value\n"
+        "os.close(fd)\n"
     )
     s = Sleeper(code, tmp_path, tmp_path / "r3")
     sleepers.append(s)
-    assert not os.listdir(f"/proc/{s.pid}/fd").count(str(tree))  # no descriptor is left
+    targets = [os.readlink(f"/proc/{s.pid}/fd/{n}") for n in os.listdir(f"/proc/{s.pid}/fd")]
+    assert str(tree / "big.bin") not in targets  # no descriptor is left, only the mapping
     assert [p["path"] for p in real_check(tree).processes] == [str(tree / "big.bin")]
+
+
+@linux_only
+def test_r4_a_real_non_dumpable_process_of_my_own_user_is_not_ignored(
+    tree: Path, sleepers: list[Sleeper], tmp_path: Path
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root can read every process")
+    # PR_SET_DUMPABLE=0 makes /proc/<pid> root-owned and its cwd unreadable to the same user
+    code = "import ctypes\nctypes.CDLL(None).prctl(4, 0, 0, 0, 0)\n"
+    s = Sleeper(code, tree / "sub", tmp_path / "r4")
+    sleepers.append(s)
+    with pytest.raises(OSError):  # the precondition: this user cannot read the process's cwd
+        os.readlink(f"/proc/{s.pid}/cwd")
+    r = inuse.check_in_use(Gateway(scanner=ProcScanner()), str(tree), set())
+    assert r.status == "unavailable"
+
+
+def fake_proc(root: Path, pid: int, *, uid: int, state: str = "S", cwd: Path | None = None) -> None:
+    d = root / str(pid)
+    (d / "fd").mkdir(parents=True)
+    (d / "comm").write_text("fake\n")
+    (d / "status").write_text(f"Name:\tfake\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+    fields = [state, "1"] + ["0"] * 17 + ["12345"]
+    (d / "stat").write_text(f"{pid} (fake) " + " ".join(fields) + "\n")
+    (d / "maps").write_text("")
+    if cwd is not None:
+        os.symlink(cwd, d / "cwd")
+
+
+@linux_only
+def test_r4_scanner_tells_an_unreadable_process_of_mine_from_another_users(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    fake_proc(proc, 100, uid=1000)  # mine, cwd cannot be read
+    fake_proc(proc, 101, uid=2000)  # someone else's
+    fake_proc(proc, 102, uid=1000, state="Z")  # a zombie of mine has nothing to read
+    by = {p.pid: p for p in ProcScanner(proc=str(proc), uid=1000).scan()}
+    assert (by[100].inspected, by[100].other_user) == (False, False)
+    assert (by[101].inspected, by[101].other_user) == (False, True)
+    assert by[102].inspected
 
 
 @linux_only
@@ -297,7 +362,7 @@ def test_real_scanner_reports_ids_parents_and_start_times() -> None:
 @linux_only
 def test_real_scanner_marks_other_users_uninspected() -> None:
     procs = ProcScanner(uid=os.getuid() + 12345).scan()
-    assert procs and not any(p.inspected for p in procs)
+    assert procs and not any(p.inspected for p in procs) and all(p.other_user for p in procs)
 
 
 @linux_only
@@ -411,3 +476,39 @@ def test_lsof_missing_is_unavailable() -> None:
 
     with pytest.raises(ScannerUnavailable):
         LsofScanner(runner=runner).scan("/x")
+
+
+def _lsof_runner(results: list[tuple[int, str, str]]):  # noqa: ANN202
+    calls = iter(results)
+
+    def runner(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        code, out, err = next(calls)
+        return subprocess.CompletedProcess(argv, code, out, err)
+
+    return runner
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [(2, "", ""), (3, "p1\ncx\nn/a\n", ""), (-9, "", ""), (1, "", "lsof: WARNING: boom")],
+)
+@pytest.mark.parametrize("which", [0, 1])
+def test_r8_a_failed_lsof_is_an_unavailable_scanner_not_an_empty_one(
+    bad: tuple[int, str, str], which: int
+) -> None:
+    ok = (0, "p10\ncbash\nn/elsewhere\n", "")
+    results = [bad, ok] if which == 0 else [ok, bad]
+    with pytest.raises(ScannerUnavailable):
+        LsofScanner(runner=_lsof_runner(results), uid=1).scan("/w/tree")
+
+
+def test_r8_lsof_exit_1_with_nothing_to_list_is_an_empty_answer() -> None:
+    assert LsofScanner(runner=_lsof_runner([(1, "", ""), (1, "", "")]), uid=1).scan("/w") == []
+
+
+def test_r8_a_timed_out_lsof_is_unavailable() -> None:
+    def runner(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, 120)
+
+    with pytest.raises(ScannerUnavailable):
+        LsofScanner(runner=runner, uid=1).scan("/w")

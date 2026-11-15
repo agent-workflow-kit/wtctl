@@ -50,6 +50,19 @@ class ProcScanner:
                     out.append(info)
         return out
 
+    @staticmethod
+    def _real_uid(base: str, fallback: int) -> int:
+        """The real uid from ``status`` (world-readable). ``/proc/<pid>`` itself belongs to root
+        when the process is not dumpable (``prctl(PR_SET_DUMPABLE, 0)``), whoever runs it."""
+        try:
+            with open(f"{base}/status", "rb") as fh:
+                for line in fh.read(8192).decode("utf-8", "replace").split("\n"):
+                    if line.startswith("Uid:"):
+                        return int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return fallback
+
     def _one(self, pid: int) -> ProcessInfo | None:
         base = f"{self.proc}/{pid}"
         try:
@@ -57,11 +70,17 @@ class ProcScanner:
         except FileNotFoundError:
             return None  # gone since the listing
         except OSError:
+            # nobody to attribute it to: treated as mine, so that it is never silently ignored
             return ProcessInfo(pid, "?", None, inspected=False)
-        ppid, start = self._stat(base)
+        owner = self._real_uid(base, owner)
+        ppid, start, state = self._stat(base)
         command = self._comm(base)
         if owner != self.uid:
-            return ProcessInfo(pid, command, None, ppid=ppid, start=start, inspected=False)
+            return ProcessInfo(
+                pid, command, None, ppid=ppid, start=start, inspected=False, other_user=True
+            )
+        if state == "Z":  # a zombie has no cwd or descriptors left to read
+            return ProcessInfo(pid, command, None, cwd_id=None, ppid=ppid, start=start)
         cwd: str | None = None
         cwd_id: tuple[int, int] | None = None
         ok = True
@@ -93,15 +112,15 @@ class ProcScanner:
             return "?"
 
     @staticmethod
-    def _stat(base: str) -> tuple[int | None, str | None]:
+    def _stat(base: str) -> tuple[int | None, str | None, str | None]:
         try:
             with open(f"{base}/stat", "rb") as fh:
                 rest = _stat_fields(fh.read(4096).decode("utf-8", "replace"))
         except OSError:
-            return None, None
+            return None, None, None
         if rest is None:
-            return None, None
-        return int(rest[1]), rest[19]
+            return None, None, None
+        return int(rest[1]), rest[19], rest[0]
 
     @staticmethod
     def _fds(base: str) -> tuple[list[str], bool]:
@@ -188,10 +207,13 @@ class LsofScanner:
             r = self.runner(["lsof", *argv], timeout=120)
         except (OSError, subprocess.SubprocessError) as exc:
             raise ScannerUnavailable(f"cannot run lsof: {exc}") from exc
-        # lsof exits 1 when it lists nothing (and for some unreadable entries); output decides
-        if r.returncode not in (0, 1) or (r.returncode == 1 and r.stderr.strip() and not r.stdout):
-            if r.returncode in (126, 127):
-                raise ScannerUnavailable("lsof is not installed")
+        # lsof exits 1 when it lists nothing; any other failure (a signal, 2 or more, or exit 1
+        # with a complaint on stderr) means the listing may be incomplete: no answer, not "empty"
+        if r.returncode in (126, 127):
+            raise ScannerUnavailable("lsof is not installed")
+        if r.returncode < 0 or r.returncode >= 2 or (r.returncode == 1 and r.stderr.strip()):
+            why = r.stderr.strip().splitlines()[0][:200] if r.stderr.strip() else ""
+            raise ScannerUnavailable(f"lsof failed (exit {r.returncode}) {why}".strip())
         return r.stdout
 
     def scan(self, target: str | None = None) -> list[ProcessInfo]:
