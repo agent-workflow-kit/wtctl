@@ -69,6 +69,16 @@ Host = Annotated[
         )
     ),
 ]
+
+
+def _not_default_port(value: str) -> str:
+    if value.endswith(":443"):
+        raise ValueError("use the bare host (the default port :443 is dropped)")
+    return value
+
+
+HostKey = Annotated[Host, AfterValidator(_not_default_port)]
+TokenUser = Annotated[StrictStr, StringConstraints(pattern=r"^[!-9;-~]{1,256}\Z")]
 RepoId = Annotated[
     StrictStr,
     StringConstraints(
@@ -132,7 +142,7 @@ class HostConfig(_Model):
     clone_url: NonEmpty = "https://{host}/{path}.git"
     token_env: EnvName | None = None
     token_command: Annotated[list[NonEmpty], Field(min_length=1)] | None = None
-    token_user: NonEmpty = "x-access-token"
+    token_user: TokenUser = "x-access-token"
 
 
 class CreateGlobal(_Model):
@@ -265,7 +275,7 @@ class Config(_Model):
     network_timeout: Duration = "120s"
     clone_timeout: Duration = "30m"
     lease_wait: Duration = "10m"
-    hosts: dict[Host, HostConfig] = Field(default_factory=dict)
+    hosts: dict[HostKey, HostConfig] = Field(default_factory=dict)
     create: CreateGlobal = Field(default_factory=CreateGlobal)
     baseline: BaselineCfg = Field(default_factory=BaselineCfg)
     throwaway: ThrowawayCfg = Field(default_factory=ThrowawayCfg)

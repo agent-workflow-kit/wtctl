@@ -16,6 +16,7 @@ import enum
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 from .config import Config
 from .gateway import Gateway, GitResult
@@ -29,10 +30,15 @@ MAX_USER_LENGTH = 256
 
 _VISIBLE_ASCII = re.compile(r"[\x21-\x7e]+\Z")
 _HOSTPORT = re.compile(
-    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?\Z"
+    r"([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)(?::([1-9][0-9]{0,4}))?\Z"
 )
-_URL_CHARS = re.compile(r"[\x21-\x7e]+\Z")  # no space, control character, backslash is checked
+_URL_CHARS = re.compile(r"[\x21-\x7e]+\Z")  # no space, control or non-ASCII character
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SCP_LIKE = re.compile(r"[^/:]+:")
+_HELPER_SYNTAX = re.compile(r"[A-Za-z0-9+.-]+::")  # git's ``ext::`` style transport helpers
+# A plain local path: absolute, explicitly relative or home-relative.
+_LOCAL_PATH_PREFIXES = ("/", "./", "../", "~")
+MAX_TIMEOUT_SECONDS = 24 * 86400  # poll() takes milliseconds in a C int: 25 days overflow
 
 Warn = Callable[[str], None]
 
@@ -76,20 +82,38 @@ class FetchTarget:
     hostport: str | None  # lowercase ``host[:port]`` of an https URL, default port dropped
 
 
+def _valid_hostport(hostport: str) -> bool:
+    m = _HOSTPORT.fullmatch(hostport)
+    return m is not None and (m.group(2) is None or int(m.group(2)) <= 65535)
+
+
 def fetch_target(url: str) -> FetchTarget:
-    """Scheme and host of an already normalized fetch URL (userinfo stripped, no whitespace).
+    """Scheme and host of an already normalized fetch URL (userinfo stripped).
+
+    A URL starting with ``-`` (git would read it as an option), or holding a control character or
+    leading whitespace, is refused. A plain local path (``/``, ``./``, ``../``, ``~`` or no
+    scheme-like prefix) is kind ``file`` and may contain spaces and non-ASCII characters; only a
+    string with ``://`` or scp-like syntax gets the URL grammar checks. The scheme must be
+    lowercase (git refuses another spelling). The port must be 1-65535 without leading zeros;
+    exactly ``:443`` is dropped.
 
     TODO(#11): switch to the ``urls`` module's parser once it lands; this minimal helper only
     refuses what it cannot place with certainty. Anything unexpected raises ``ValueError`` (the
     message never contains the URL, which could carry a secret).
     """
+    if not url or url.startswith("-") or url[:1].isspace() or _CONTROL.search(url):
+        raise ValueError("unsupported fetch URL (option-like, or control or leading whitespace)")
+    if url.startswith(_LOCAL_PATH_PREFIXES):
+        return FetchTarget("file", None)
+    if _HELPER_SYNTAX.match(url):
+        raise ValueError("unsupported fetch URL (transport helper syntax)")
+    if "://" not in url and not _SCP_LIKE.match(url):
+        return FetchTarget("file", None)
     if not _URL_CHARS.fullmatch(url) or "\\" in url:
         raise ValueError("unsupported fetch URL (whitespace, control or non-ASCII character)")
     if "://" not in url:
-        # scp-like ``[user@]host:path`` is ssh; a colon after the first slash is a plain path.
-        return FetchTarget("ssh" if _SCP_LIKE.match(url) else "file", None)
+        return FetchTarget("ssh", None)  # scp-like ``[user@]host:path``
     scheme, _, rest = url.partition("://")
-    scheme = scheme.lower()
     if scheme in ("ssh", "file"):
         return FetchTarget(scheme, None)
     if scheme != "https":
@@ -98,10 +122,10 @@ def fetch_target(url: str) -> FetchTarget:
     if "@" in authority:
         raise ValueError("fetch URL carries userinfo; it must be stripped first")
     hostport = authority.lower()
+    if not _valid_hostport(hostport):
+        raise ValueError("unsupported host in fetch URL")
     if hostport.endswith(":443"):
         hostport = hostport[: -len(":443")]
-    if not _HOSTPORT.fullmatch(hostport):
-        raise ValueError("unsupported host in fetch URL")
     return FetchTarget("https", hostport)
 
 
@@ -119,13 +143,15 @@ def _from_command(
     hostport: str,
     *,
     environ: Mapping[str, str],
+    drop_env: frozenset[str] = frozenset(),
     gateway: Gateway,
     warn: Warn,
     timeout: float,
 ) -> Secret | None:
     command = [hostport if a == "{host}" else a for a in argv]
+    env = {k: v for k, v in environ.items() if k not in drop_env}
     result = gateway.token_command(
-        command, env=dict(environ), timeout=timeout, max_bytes=TOKEN_COMMAND_MAX_OUTPUT
+        command, env=env, timeout=timeout, max_bytes=TOKEN_COMMAND_MAX_OUTPUT
     )
     if result.failure is not None:
         warn(f"token_command for {hostport} failed ({result.failure}); continuing without a token")
@@ -143,6 +169,16 @@ def _from_command(
         warn(f"token_command for {hostport} printed an invalid token; continuing without one")
         return None
     return Secret(text)
+
+
+def _other_hosts_token_env(cfg: Config, hostport: str) -> frozenset[str]:
+    """The ``token_env`` names of every other configured host (not this host's own)."""
+    own = cfg.host(hostport).token_env
+    return frozenset(
+        h.token_env
+        for key, h in cfg.hosts.items()
+        if key != hostport and h.token_env is not None and h.token_env != own
+    )
 
 
 def resolve_token(
@@ -174,6 +210,7 @@ def resolve_token(
             host.token_command,
             hostport,
             environ=environ,
+            drop_env=_other_hosts_token_env(cfg, hostport),
             gateway=gateway,
             warn=warn,
             timeout=command_timeout,
@@ -187,7 +224,7 @@ def token_header(hostport: str, token_user: str, token: Secret) -> tuple[str, Se
     The key is URL-scoped, so git sends the header to no other host or port; redirects are off
     in the hardened invocation. The value is wrapped so it cannot leak through a ``repr``.
     """
-    if not _HOSTPORT.fullmatch(hostport):
+    if not _valid_hostport(hostport):
         raise ValueError("invalid host for a token header")
     if (
         not token_user
@@ -222,17 +259,31 @@ class NetworkAuth:
         return ((self._header[0], self._header[1].reveal()),)
 
     def scrub(self, result: GitResult) -> GitResult:
-        """Replace any echo of the credential in git's output (a server can print what it likes)."""
-        secrets: list[str] = []
+        """Replace any echo of the credential in git's output (a server can print what it likes).
+
+        Covered: the token, its percent-encoded form, base64 of the token and of ``user:token``
+        (padded and unpadded, and the percent-encoded base64), and the whole header value. Not
+        covered: a server that splits the secret across lines or re-encodes it some other way.
+        """
+        secrets: set[str] = set()
         if self._token is not None:
-            secrets.append(self._token.reveal())
+            token = self._token.reveal()
+            b64 = base64.b64encode(token.encode("ascii")).decode("ascii")
+            secrets |= {token, quote(token, safe=""), b64, b64.rstrip("=")}
         if self._header is not None:
             value = self._header[1].reveal()
-            secrets += [value, value.removeprefix("Authorization: Basic ")]
+            blob = value.removeprefix("Authorization: Basic ")
+            secrets |= {
+                value,
+                blob,
+                blob.rstrip("="),
+                quote(blob, safe=""),
+                quote(blob.rstrip("="), safe=""),
+            }
         out, err = result.stdout, result.stderr
-        for s in secrets:
-            out = out.replace(s.encode(), b"***")
-            err = err.replace(s.encode(), b"***")
+        for secret in sorted(secrets, key=len, reverse=True):
+            out = out.replace(secret.encode(), b"***")
+            err = err.replace(secret.encode(), b"***")
         return GitResult(result.returncode, out, err, result.timed_out)
 
 
@@ -250,6 +301,9 @@ def prepare_network_auth(
     https: the token of ``hosts.<host>`` as a header scoped to that host, if there is one; ssh:
     the caller's ``SSH_AUTH_SOCK``; file: nothing. The caller's ``GIT_SSH_COMMAND`` and the rest
     of its environment never reach git (hardgit builds the environment from scratch).
+
+    Raises ``ValueError`` for a URL :func:`fetch_target` refuses (the message never contains the
+    URL). TODO(#13): the callers map it to a typed ``WtctlError``.
     """
     target = fetch_target(url)
     if target.scheme == "ssh":
@@ -290,7 +344,9 @@ class NetworkKind(enum.Enum):
 
 
 def timeout_seconds(cfg: Config, kind: NetworkKind) -> float:
-    return float(cfg.network_timeout_s if kind is NetworkKind.NETWORK else cfg.clone_timeout_s)
+    """The limit in seconds, capped at 24 days (a huge duration would overflow the runner)."""
+    seconds = cfg.network_timeout_s if kind is NetworkKind.NETWORK else cfg.clone_timeout_s
+    return float(min(seconds, MAX_TIMEOUT_SECONDS))
 
 
 def run_network_git(
@@ -311,6 +367,14 @@ def run_network_git(
     owns (mirror, fresh throwaway, new clone directory), as ``Git.build`` requires. The output
     is scrubbed of the credential.
     """
+    # TODO(#13): put `--` before the URL in argv (or require it in `args`): `fetch_target` refuses
+    # option-like URLs, but argv is the second line of defense.
+    # TODO(#13): a token-bearing call is allowed only on a repository whose config wtctl wrote
+    # (mirror, fresh throwaway, new clone directory); verify or refuse a non-owned repository's
+    # config (http.proxy, url-scoped proxy, sslVerify, insteadOf) before sending a token.
+    # TODO(#13): when a header was sent and the remote answers 401, report "the remote rejected
+    # the configured token for <host>" (code stays auth_required) instead of "credentials wtctl
+    # does not have".
     # TODO(#5): when network calls are logged, log only the redacted argv and `scrub`bed text.
     result = git.run(
         args,

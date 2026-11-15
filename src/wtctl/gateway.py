@@ -132,7 +132,7 @@ class TokenCommandResult:
     """
 
     returncode: int | None
-    stdout: bytes = field(default=b"", repr=False)
+    stdout: bytes = field(default=b"", repr=False, compare=False)
     failure: str | None = None
 
 
@@ -182,12 +182,18 @@ def run_token_command(
     fd = proc.stdout.fileno()
     with selectors.DefaultSelector() as sel:
         sel.register(fd, selectors.EVENT_READ)
+        leader_gone = False
         while failure is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failure = "timeout"
                 break
-            if not sel.select(remaining):
+            # Poll in short slices so a leader that exited is noticed even while a descendant
+            # still holds the pipe open (end-of-file would then never come).
+            if not sel.select(0 if leader_gone else min(remaining, 0.1)):
+                if leader_gone:
+                    break  # everything already written has been read
+                leader_gone = proc.poll() is not None
                 continue
             data = os.read(fd, 65536)
             if not data:
@@ -203,7 +209,8 @@ def run_token_command(
             proc.wait(timeout=max(deadline - time.monotonic(), 0.0))
         except subprocess.TimeoutExpired:
             failure = "timeout"
-    if failure is not None:
+    if failure is not None and proc.returncode is None:
+        # Only while the leader is unreaped does its pid certainly still name our group.
         _kill_group(proc)
     try:
         proc.wait(timeout=KILL_GRACE)

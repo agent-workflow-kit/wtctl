@@ -39,6 +39,8 @@ class Capture:
     cert: Path
     requests: list[dict[str, str]] = field(default_factory=list)
     redirect_to: str | None = None
+    stall: bool = False
+    release: threading.Event = field(default_factory=threading.Event)
 
 
 @pytest.fixture
@@ -66,6 +68,9 @@ def server(tmp_path: Path) -> Iterator[Capture]:
             cap.requests.append(
                 {"path": self.path, **{k.lower(): v for k, v in self.headers.items()}}
             )
+            if cap.stall:
+                cap.release.wait(15)
+                return
             if cap.redirect_to and self.path.startswith("/redir"):
                 self.send_response(302)
                 self.send_header("Location", cap.redirect_to + "/after-redirect")
@@ -93,6 +98,7 @@ def server(tmp_path: Path) -> Iterator[Capture]:
     try:
         yield cap
     finally:
+        cap.release.set()
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=10)
@@ -260,6 +266,21 @@ def test_planted_repository_config_is_inert(
     assert list(marker.iterdir()) == []
 
 
+def _shadow_bin(tmp_path: Path, log: Path) -> Path:
+    """A bin directory whose ``ssh`` only records that it ran; ``git`` forwards to the real one."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    ssh = bindir / "ssh"
+    ssh.write_text(
+        f'#!/bin/sh\n{{ echo "sock=$SSH_AUTH_SOCK"; printf "%s\\n" "$@"; }} > {log}\nexit 255\n'
+    )
+    ssh.chmod(0o755)
+    wrapper = bindir / "git"  # hardgit puts the git binary's directory first on PATH
+    wrapper.write_text(f'#!/bin/sh\nexec {GIT} "$@"\n')
+    wrapper.chmod(0o755)
+    return wrapper
+
+
 def test_caller_environment_cannot_enable_tracing_or_replace_ssh(
     server: Capture,
     mirror: Path,
@@ -267,38 +288,39 @@ def test_caller_environment_cannot_enable_tracing_or_replace_ssh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    marker = tmp_path / "ssh-ran"
-    fake_ssh = tmp_path / "fake-ssh.sh"
-    fake_ssh.write_text(f"#!/bin/sh\ntouch {marker}\nexit 255\n")
-    fake_ssh.chmod(0o755)
+    ssh_log = tmp_path / "ssh-ran"
+    wrapper = _shadow_bin(tmp_path, ssh_log)
+    marker = tmp_path / "caller-ssh-ran"
+    caller_ssh = tmp_path / "caller-ssh.sh"
+    caller_ssh.write_text(f"#!/bin/sh\ntouch {marker}\nexit 255\n")
+    caller_ssh.chmod(0o755)
     trace = tmp_path / "trace.log"
-    monkeypatch.setenv("GIT_SSH_COMMAND", str(fake_ssh))
-    monkeypatch.setenv("GIT_SSH", str(fake_ssh))
+    monkeypatch.setenv("GIT_SSH_COMMAND", str(caller_ssh))
+    monkeypatch.setenv("GIT_SSH", str(caller_ssh))
     monkeypatch.setenv("GIT_TRACE", str(trace))
     monkeypatch.setenv("GIT_TRACE_CURL", str(trace))
     monkeypatch.setenv("GIT_CURL_VERBOSE", "1")
     url = f"https://127.0.0.1:{server.port}/org/repo.git"
     cfg, auth = auth_for(url)
-    git = Git(trusting_gateway(server.cert), GIT, str(private_home))
+    git = Git(trusting_gateway(server.cert), str(wrapper), str(private_home))
     result = ls_remote(git, mirror, cfg, auth, url)
+    assert server.requests, "the https call must really have run"
     assert not trace.exists()
     assert TOKEN not in result.err and expected_basic().split()[1] not in result.err
-    # And an ssh URL ignores GIT_SSH_COMMAND as well.
+    # And an ssh URL runs the shadowed ssh from PATH, never the caller's GIT_SSH(_COMMAND).
+    ssh_url = "ssh://forge.example/x"
     ls_remote(git, mirror, cfg, prepare_network_auth(
-        cfg, "ssh://127.0.0.1:1/x", environ={}, gateway=Gateway(), warn=lambda m: None
-    ), "ssh://127.0.0.1:1/x")  # fmt: skip
+        cfg, ssh_url, environ={}, gateway=Gateway(), warn=lambda m: None
+    ), ssh_url)  # fmt: skip
+    assert ssh_log.exists(), "the PATH-shadowed ssh must be what ran"
     assert not marker.exists()
 
 
-def test_ssh_runs_in_batch_mode(mirror: Path, private_home: Path, tmp_path: Path) -> None:
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
+def test_ssh_runs_in_batch_mode_with_the_agent_socket(
+    mirror: Path, private_home: Path, tmp_path: Path
+) -> None:
     log = tmp_path / "ssh-argv"
-    (bindir / "ssh").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {log}\nexit 255\n')
-    (bindir / "ssh").chmod(0o755)
-    wrapper = bindir / "git"  # hardgit puts the git binary's directory first on PATH
-    wrapper.write_text(f'#!/bin/sh\nexec {GIT} "$@"\n')
-    wrapper.chmod(0o755)
+    wrapper = _shadow_bin(tmp_path, log)
     git = Git(Gateway(), str(wrapper), str(private_home))
     cfg = Config()
     auth = prepare_network_auth(
@@ -312,3 +334,17 @@ def test_ssh_runs_in_batch_mode(mirror: Path, private_home: Path, tmp_path: Path
     assert result.returncode != 0
     argv = log.read_text().split("\n")
     assert "-o" in argv and "BatchMode=yes" in argv
+    assert "sock=/run/agent.sock" in argv
+
+
+def test_a_stalled_server_times_out_end_to_end(
+    server: Capture, mirror: Path, private_home: Path
+) -> None:
+    server.stall = True
+    url = f"https://127.0.0.1:{server.port}/org/repo.git"
+    cfg, auth = auth_for(url)
+    cfg = cfg.model_copy(update={"network_timeout": "1s"})
+    git = Git(trusting_gateway(server.cert), GIT, str(private_home))
+    result = ls_remote(git, mirror, cfg, auth, url)
+    assert result.timed_out
+    assert classify_fetch(result).cause == "timeout"

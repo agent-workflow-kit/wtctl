@@ -6,6 +6,7 @@ import base64
 import copy
 import os
 import pickle
+import subprocess
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -232,8 +233,10 @@ def test_command_timeout_kills_the_process_group(tmp_path: Path) -> None:
             except ProcessLookupError:
                 break
             # A zombie still answers kill(0); it is reaped by init shortly.
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            if state == "Z":
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
                 break
             time.sleep(0.1)
         else:
@@ -276,7 +279,6 @@ def test_command_environment_is_the_given_one(tmp_path: Path) -> None:
         ("https://Forge.Example/org/repo.git", "https", "forge.example"),
         ("https://forge.example:443/org/repo", "https", "forge.example"),
         ("https://forge.example:8443/org/repo", "https", "forge.example:8443"),
-        ("HTTPS://FORGE.EXAMPLE/x", "https", "forge.example"),
         ("https://xn--bcher-kva.example/x", "https", "xn--bcher-kva.example"),
         ("https://127.0.0.1:9/x", "https", "127.0.0.1:9"),
         ("https://forge.example", "https", "forge.example"),
@@ -287,6 +289,12 @@ def test_command_environment_is_the_given_one(tmp_path: Path) -> None:
         ("/srv/git/repo.git", "file", None),
         ("./rel/repo", "file", None),
         ("file:///srv/git/repo.git", "file", None),
+        ("/tmp/my repo/x.git", "file", None),  # R9: spaces and non-ASCII in plain paths
+        ("/tmp/dépôt/x.git", "file", None),
+        ("/tmp/a://b", "file", None),
+        ("rel dir/repo", "file", None),
+        ("~/repos/a b", "file", None),
+        ("../up/repo", "file", None),
     ],
 )
 def test_fetch_target(url: str, scheme: str, hostport: str | None) -> None:
@@ -318,12 +326,38 @@ def test_fetch_target(url: str, scheme: str, hostport: str | None) -> None:
         "",
         "https://.forge.example/x",
         "https://-forge.example/x",
+        "HTTPS://FORGE.EXAMPLE/x",  # R12: git refuses an uppercase scheme
+        "Https://forge.example/x",
+        "SSH://forge.example/x",
+        "--upload-pack=touch /tmp/x",  # R1: option-like URLs
+        "-oProxyCommand=x:y",
+        "--upload-pack=x",
+        " --upload-pack=x",
+        "/tmp/x\ny",
+        "/tmp/x\x00y",
+        "https://github.com:443:443/x",  # R11
+        "https://forge.example:0443/x",
+        "https://forge.example:65536/x",
+        "https://forge.example:0/x",
     ],
 )
 def test_fetch_target_refuses_what_it_cannot_place(url: str) -> None:
     with pytest.raises(ValueError) as exc:
         fetch_target(url)
     assert "pw" not in str(exc.value)
+
+
+@pytest.mark.parametrize("url", ["--upload-pack=x", "-oProxyCommand=x:y", "-x"])
+def test_fetch_target_refusal_does_not_echo_the_url(url: str) -> None:
+    with pytest.raises(ValueError) as exc:
+        fetch_target(url)
+    assert url not in str(exc.value)
+
+
+def test_fetch_target_keeps_a_nondefault_port_and_drops_only_exactly_443() -> None:
+    assert fetch_target("https://forge.example:443/x").hostport == "forge.example"
+    assert fetch_target("https://forge.example:65535/x").hostport == "forge.example:65535"
+    assert fetch_target("https://forge.example:4430/x").hostport == "forge.example:4430"
 
 
 # -- header --------------------------------------------------------------------------------------
@@ -404,7 +438,10 @@ def test_prepare_without_token_is_anonymous() -> None:
 def test_prepare_bad_token_user_warns_without_leaking() -> None:
     warnings: list[str] = []
     auth = prepare_network_auth(
-        cfg_with(token_env="T", token_user="a:b"),
+        # Config load refuses this value (R7); the header builder still defends itself.
+        Config.model_construct(
+            hosts={"forge.example": HostConfig.model_construct(token_env="T", token_user="a:b")}
+        ),
         "https://forge.example/x",
         environ={**ENV, "T": TOKEN},
         gateway=Gateway(),
@@ -549,3 +586,121 @@ def test_run_network_git_passes_the_agent_socket_for_ssh_only(
         )  # fmt: skip
     assert calls[0]["env"]["SSH_AUTH_SOCK"] == "/run/a.sock"
     assert "SSH_AUTH_SOCK" not in calls[1]["env"]
+
+
+# -- review fixes --------------------------------------------------------------------------------
+
+
+def test_built_command_repr_and_equality_hide_the_environment(
+    tmp_path: Path, private_home: Path
+) -> None:
+    git = Git(Gateway(), GIT, str(private_home))
+    header = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+    kw = dict(
+        git_dir=tmp_path, scheme="https", tool_owned=True,
+    )  # fmt: skip
+    cmd = git.build(
+        ["ls-remote", "--", "https://forge.example/x"],
+        extra_config=[
+            ("http.https://forge.example/.extraHeader", f"Authorization: Basic {header}")
+        ],
+        **kw,  # type: ignore[arg-type]
+    )
+    other = git.build(["ls-remote", "--", "https://forge.example/x"], **kw)  # type: ignore[arg-type]
+    text = repr(cmd) + str(cmd)
+    assert "GIT_CONFIG_VALUE" not in text and header not in text and TOKEN not in text
+    assert cmd.env != other.env  # the header really is in the environment
+    same = type(cmd)(cmd.argv, {"X": "different"}, cmd.cwd)
+    assert same == cmd  # env is not compared, so an assertion diff never prints it
+
+
+def test_scrub_covers_more_encodings_of_the_credential() -> None:
+    from urllib.parse import quote
+
+    auth = prepare_network_auth(
+        cfg_with(token_env="T"), "https://forge.example/x", environ={**ENV, "T": TOKEN},
+        gateway=Gateway(), warn=lambda m: None,
+    )  # fmt: skip
+    # A token whose base64 contains '+', '/' or '=' so percent-encoding differs.
+    user_token = base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+    forms = {
+        user_token,
+        user_token.rstrip("="),
+        quote(user_token, safe=""),
+        base64.b64encode(TOKEN.encode()).decode(),
+        base64.b64encode(TOKEN.encode()).decode().rstrip("="),
+        quote(TOKEN, safe=""),
+        TOKEN,
+    }
+    blob = " | ".join(sorted(forms))
+    clean = auth.scrub(GitResult(1, blob.encode(), blob.encode()))
+    for form in forms:
+        assert form.encode() not in clean.stdout and form.encode() not in clean.stderr
+
+
+def test_scrub_percent_form_is_covered_for_a_token_with_special_characters() -> None:
+    from urllib.parse import quote
+
+    token = "tok-SECRET-a/b+c=d"
+    auth = prepare_network_auth(
+        cfg_with(token_env="T"), "https://forge.example/x", environ={**ENV, "T": token},
+        gateway=Gateway(), warn=lambda m: None,
+    )  # fmt: skip
+    assert quote(token, safe="") != token
+    clean = auth.scrub(GitResult(1, quote(token, safe="").encode(), b""))
+    assert b"SECRET" not in clean.stdout
+
+
+def test_command_environment_drops_other_hosts_token_variables(tmp_path: Path) -> None:
+    out = tmp_path / "seen"
+    cfg = Config(
+        hosts={
+            "forge.example": HostConfig(
+                token_env="OWN_T",
+                token_command=sh(f'echo "$OTHER_T|$OWN_T|$KEEP" > {out}; echo {TOKEN}'),
+            ),
+            "other.example": HostConfig(token_env="OTHER_T"),
+        }
+    )
+    token, _ = resolve(cfg, {**ENV, "OTHER_T": "tok-SECRET-other", "OWN_T": " ", "KEEP": "kept"})
+    assert token is not None
+    seen = out.read_text().strip().split("|")
+    assert seen[0] == "" and seen[2] == "kept"  # OTHER_T dropped, the rest kept
+    assert seen[1] == " "  # this host's own variable is not touched
+    assert "tok-SECRET-other" not in out.read_text()
+
+
+def test_timeout_seconds_is_clamped(tmp_path: Path) -> None:
+    cfg = Config(network_timeout="99999999999999w", clone_timeout="99999999999999w")
+    assert timeout_seconds(cfg, NetworkKind.NETWORK) == 24 * 86400
+    assert timeout_seconds(cfg, NetworkKind.CLONE) == 24 * 86400
+
+
+def test_run_network_git_with_a_huge_timeout_does_not_overflow(
+    tmp_path: Path, private_home: Path
+) -> None:
+    mirror = tmp_path / "m.git"
+    git = Git(Gateway(), GIT, str(private_home))
+    from tests.vectorlib import plain_git
+
+    plain_git(["init", "-q", "--bare", str(mirror)], cwd=tmp_path, home=private_home)
+    cfg = Config(network_timeout="99999999999999w")
+    result = run_network_git(
+        git, ["ls-remote", "--", str(mirror)], cfg=cfg, auth=NetworkAuth("file"),
+        kind=NetworkKind.NETWORK, tool_owned=True, git_dir=mirror,
+    )  # fmt: skip
+    assert result.returncode == 0
+
+
+def test_valid_token_is_returned_although_a_descendant_holds_the_pipe() -> None:
+    start = time.monotonic()
+    result = run_token_command(
+        sh(f"echo {TOKEN}; sleep 3 &"), env=ENV, timeout=10.0, max_bytes=1024
+    )
+    assert result.failure is None and result.stdout.strip() == TOKEN.encode()
+    assert time.monotonic() - start < 2.5
+
+
+def test_token_command_result_stdout_is_not_compared() -> None:
+    a, b = TokenCommandResult(0, b"one"), TokenCommandResult(0, b"two")
+    assert a == b
