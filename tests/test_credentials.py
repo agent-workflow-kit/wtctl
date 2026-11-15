@@ -371,7 +371,9 @@ def test_prepare_https_with_token_env() -> None:
     assert auth.scheme == "https"
     ((key, value),) = auth.extra_config
     assert key == "http.https://forge.example/.extraHeader"
-    assert base64.b64decode(value.removeprefix("Authorization: Basic ")) == f"oauth2:{TOKEN}".encode()
+    assert (
+        base64.b64decode(value.removeprefix("Authorization: Basic ")) == f"oauth2:{TOKEN}".encode()
+    )
     assert TOKEN not in repr(auth) and TOKEN not in str(auth)
     assert value not in repr(auth)
 
