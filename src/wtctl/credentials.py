@@ -12,6 +12,7 @@ Failure messages name the host and a failure category, never the credential help
 from __future__ import annotations
 
 import base64
+import dataclasses
 import enum
 import os
 import re
@@ -291,7 +292,7 @@ class NetworkAuth:
         for secret in sorted(secrets, key=len, reverse=True):
             out = out.replace(secret.encode(), b"***")
             err = err.replace(secret.encode(), b"***")
-        return GitResult(result.returncode, out, err, result.timed_out)
+        return dataclasses.replace(result, stdout=out, stderr=err)
 
 
 def prepare_network_auth(

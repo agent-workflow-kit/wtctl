@@ -710,3 +710,16 @@ def test_valid_token_is_returned_although_a_descendant_holds_the_pipe() -> None:
 def test_token_command_result_stdout_is_not_compared() -> None:
     a, b = TokenCommandResult(0, b"one"), TokenCommandResult(0, b"two")
     assert a == b
+
+
+def test_scrub_keeps_every_field_of_the_result() -> None:
+    auth = prepare_network_auth(
+        cfg_with(token_env="T"),
+        "https://forge.example/x",
+        environ={**ENV, "T": TOKEN},
+        gateway=Gateway(),
+        warn=lambda m: None,
+    )
+    raw = GitResult(7, f"o {TOKEN}".encode(), b"e", timed_out=True, output_limit=True)
+    clean = auth.scrub(raw)
+    assert clean == GitResult(7, b"o ***", b"e", timed_out=True, output_limit=True)

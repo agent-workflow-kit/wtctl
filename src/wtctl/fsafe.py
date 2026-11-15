@@ -690,6 +690,14 @@ class Remaining:
     errno: int | None = None
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def escape_for_details(text: str) -> str:
+    """Replace control characters (newline included) by ``\\xNN`` for output fields."""
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
 REMAINING_CAP = 100  # docs/interface.md: details.remaining holds at most 100 entries
 
 
@@ -707,13 +715,18 @@ class DeleteResult:
 
     def add(self, item: Remaining) -> None:
         self.remaining_total += 1
-        # todo(#14): escape newline names in details.remaining (raw names are kept here)
         if len(self.remaining) < REMAINING_CAP:
             self.remaining.append(item)
 
     @property
     def complete(self) -> bool:
         return self.remaining_total == 0
+
+    def remaining_paths(self, root: str) -> list[str]:
+        """The entries left as absolute paths for ``details.remaining``: control characters
+        (a newline included) are escaped, as the ``abs_path`` schema forbids a newline."""
+        base = root.rstrip("/")
+        return [escape_for_details("/".join([base, *r.path])) for r in self.remaining]
 
 
 Hook = Callable[[str, tuple[str, ...]], None]
@@ -1093,6 +1106,7 @@ __all__ = [
     "create_new_file",
     "delete_tree",
     "describe_mount",
+    "escape_for_details",
     "ensure_dir",
     "identity_of",
     "is_dotgit",

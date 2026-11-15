@@ -200,6 +200,16 @@ Pitfalls (spike H):
 - **Ceiling directories.** Every command wtctl runs outside a repository (`index-pack` here, `init`, `clone`) sets `GIT_CEILING_DIRECTORIES` to the parent of its private cwd, so git never discovers an ancestor repository (SAFE2-4).
 - For SHA-256 repositories `index-pack` would need `--object-format`; they are unsupported in v1 (D48).
 
+Implementation notes (`src/wtctl/packs.py`):
+
+- `rev-list --stdin` takes `^<id>` for the excluded side and dies on a `--not` line ("options not supported in --stdin mode"); `pack-objects --revs` takes `--not`. The range file and the root-tree file are written by git to files of `P` (`gateway.run_git` `stdout_path`, `stdin_path`, `max_stdout_bytes`), and the tree wants reach `fetch` through `--stdin` (git 2.34 has it; an argv list of thousands of trees would hit the argument limit). Every line of those files is checked to be one 40-hex id before use.
+- `fetch.negotiationAlgorithm=noop` rides on the tree fetch through `Git.build(overrides=...)`, which accepts only that key.
+- A start commit the mirror's branches do not hold is first fetched by id (`fetch ... origin <sha>`, commits only, through the same token gate); if the mirror still lacks it, `fetch_failed`.
+- Boundary commits of the range (ancestors of a present tip) get no tree fetch: in the promisor mirror `pack-objects` tolerates their missing trees, and the pack then merely carries objects the clone might have. The completeness check (step 7) is what guarantees the result.
+- The clone's common dir is opened and compared with `common_id` before any git command reads the clone, and again at install; a mismatch is `create_failed` with `cause: anchor_changed` and the schema's anchor table. Both temporary files are written (and fsynced) before the first link, so a full disk or a write error leaves nothing visible; a failure between the two links removes the pack this call created.
+- Limits: the pack file (8 GiB, `max_pack_bytes`), object lists (1 GiB, 2 million commits), 1000 present tips, `clone_timeout` for the local pack commands.
+- `fill_local_throwaway` initializes the throwaway itself (`init --template=`, refusing a non-empty directory or a symlink), after the pack exists, so a failed `rev-list` leaves no directory; the caller removes the directory after any later failure. Current behaviour, to be reconciled by issue #21: the fill initializes the directory itself and does not write `info/attributes` (`* -filter`) or `core.logAllRefUpdates=false`, which [Throwaway create order](interface.md#throwaway-create-order) step 7 assigns to the caller before the fill; #21 also owns anchoring the throwaway directory's identity between the init and the `read-tree`. A full-history copy (depth 0) of a shallow source repository fails early with `create_failed` ("source repository is shallow"); depth 1 works.
+
 **Throwaway from the local clone** (`--source local`, or `auto` when the clone has the commit; D54, spike H2). Every command against the clone runs with protocols `none`; the throwaway `T` is fresh and wtctl-owned.
 
 ```text

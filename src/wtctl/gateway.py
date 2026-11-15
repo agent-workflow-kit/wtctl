@@ -14,6 +14,7 @@ import os
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ class GitResult:
     stdout: bytes
     stderr: bytes
     timed_out: bool = False
+    output_limit: bool = False  # killed (or finished) past ``max_stdout_bytes``
 
     @property
     def out(self) -> str:
@@ -81,6 +83,42 @@ def _drain(proc: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
         return out, err
 
 
+# How often a run with an output-size limit looks at the output file (seconds).
+OUTPUT_POLL = 0.1
+
+
+def _open_output(path: str) -> int:
+    """A new file for git's stdout: exclusive, no-follow, private."""
+    return os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+        0o600,
+    )
+
+
+def _open_input(path: str) -> int:
+    """A regular file for git's stdin: no-follow, never a FIFO or device."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path}: not a regular file")
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _feed(fd: int, data: bytes) -> None:
+    """Write ``data`` to a child's stdin pipe and close it (a child that exits early or is
+    killed just ends the write)."""
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
+
+
 def run_git(
     argv: list[str],
     *,
@@ -88,6 +126,9 @@ def run_git(
     cwd: str,
     stdin: bytes | None = None,
     timeout: float | None = None,
+    stdin_path: str | None = None,
+    stdout_path: str | None = None,
+    max_stdout_bytes: int | None = None,
 ) -> GitResult:
     """Run git with exactly ``env`` (nothing is inherited) in its own process group.
 
@@ -95,20 +136,65 @@ def run_git(
     group is killed through the leader's pid captured at launch, never by pattern.
     ``timed_out`` is set only when git itself was still running at expiry; a git that already
     exited (its pipes held open by a descendant) is returned with its own exit status.
+
+    ``stdin_path`` / ``stdout_path`` connect git's stdin / stdout to a file instead of memory (a
+    pack, an object list); the output file must not exist. With ``max_stdout_bytes`` the group is
+    killed once the output file is larger than that, and ``output_limit`` is set. ``stdout`` is
+    empty when a file is used.
     """
-    # TODO(#14): stdout is buffered in memory; pack-objects --stdout needs stdout_path or an fd.
-    proc = subprocess.Popen(
-        argv,
-        env=dict(env),
-        cwd=cwd,
-        stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    pgid = proc.pid
+    if stdin is not None and stdin_path is not None:
+        raise ValueError("stdin and stdin_path are exclusive")
+    if max_stdout_bytes is not None and stdout_path is None:
+        raise ValueError("max_stdout_bytes needs stdout_path")
+    in_fd = out_fd = in_wfd = -1
     try:
-        out, err = proc.communicate(stdin, timeout=timeout)
+        if stdin_path is not None:
+            in_fd = _open_input(stdin_path)
+        elif stdin is not None:
+            # fed by a writer thread (below) so that the input is delivered whole and the pipe
+            # closed however the polling loop runs
+            in_fd, in_wfd = os.pipe()
+        if stdout_path is not None:
+            out_fd = _open_output(stdout_path)
+        proc = subprocess.Popen(
+            argv,
+            env=dict(env),
+            cwd=cwd,
+            stdin=in_fd if in_fd >= 0 else subprocess.DEVNULL,
+            stdout=out_fd if out_fd >= 0 else subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except BaseException:
+        for fd in (in_fd, in_wfd, out_fd):
+            if fd >= 0:
+                os.close(fd)
+        raise
+    # The child has its own copies; the parent keeps out_fd only to measure the output.
+    if in_fd >= 0:
+        os.close(in_fd)
+    if in_wfd >= 0 and stdin is not None:
+        threading.Thread(target=_feed, args=(in_wfd, stdin), daemon=True).start()
+    pgid = proc.pid
+    deadline = None if timeout is None else time.monotonic() + timeout
+    over = False
+    try:
+        while True:
+            if max_stdout_bytes is None:
+                step = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+            else:
+                step = OUTPUT_POLL
+                if deadline is not None:
+                    step = min(step, max(deadline - time.monotonic(), 0.0))
+            try:
+                out, err = proc.communicate(timeout=step)
+                break
+            except subprocess.TimeoutExpired:
+                if max_stdout_bytes is not None and os.fstat(out_fd).st_size > max_stdout_bytes:
+                    over = True
+                    raise
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise
     except subprocess.TimeoutExpired:
         was_running = proc.poll() is None
         if was_running:
@@ -121,8 +207,19 @@ def run_git(
                 pass
         out, err = _drain(proc)
         proc.wait()
-        return GitResult(proc.returncode, out, err, timed_out=was_running)
-    return GitResult(proc.returncode, out, err)
+        return GitResult(
+            proc.returncode,
+            out or b"",
+            err or b"",
+            timed_out=was_running and not over,
+            output_limit=over,
+        )
+    finally:
+        if out_fd >= 0:
+            if max_stdout_bytes is not None and not over:
+                over = os.fstat(out_fd).st_size > max_stdout_bytes
+            os.close(out_fd)
+    return GitResult(proc.returncode, out or b"", err or b"", output_limit=over)
 
 
 @dataclass(frozen=True)

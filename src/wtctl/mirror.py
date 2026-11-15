@@ -14,9 +14,8 @@ planted ``http.proxy``, ``url.*.insteadOf``, include or filter in it cannot surv
 TODO(#10): the mirror directory and its config are opened and replaced with plain no-follow opens
 (``locate.open_dir_nofollow``, ``O_NOFOLLOW`` file opens); fsafe's anchored primitives (which also
 refuse mount points) replace them when #10 lands.
-TODO(#14): the base-commit transfer (tree fetch, ``pack-objects --stdout``, install into the clone)
-is built on :meth:`Mirror.ensure` and :meth:`Mirror.refresh` and needs a stdout file option in
-``gateway.run_git`` (stdout is buffered in memory).
+The base-commit transfer built on :meth:`Mirror.ensure` and :meth:`Mirror.refresh` lives in
+``wtctl.packs``.
 """
 
 from __future__ import annotations
