@@ -8,6 +8,7 @@ the ones a command uses, and tests pass fakes.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import datetime as dt
 import os
@@ -214,6 +215,15 @@ def run_git(
             timed_out=was_running and not over,
             output_limit=over,
         )
+    except BaseException:
+        # An interrupt (or any other exception) while waiting: the child must not outlive us.
+        # The leader is unreaped here, so its pid is certainly this group's id.
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGKILL)
+        _drain(proc)
+        proc.wait()
+        raise
     finally:
         if out_fd >= 0:
             if max_stdout_bytes is not None and not over:
@@ -236,11 +246,11 @@ class TokenCommandResult:
     failure: str | None = None
 
 
-def _kill_token_group(proc: subprocess.Popen[bytes]) -> None:
-    """SIGKILL the group this call created. The leader is unreaped (no ``poll``/``wait`` yet),
-    so its pid still names that group even if the leader is a zombie."""
+def _kill_group(pgid: int) -> None:
+    """SIGKILL the process group ``pgid`` (a pid captured at launch from a group leader we
+    created and have not reaped, so the pid still names that group even for a zombie leader)."""
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
 
@@ -311,7 +321,7 @@ def run_token_command(
             failure = "timeout"
     if failure is not None and proc.returncode is None:
         # Only while the leader is unreaped does its pid certainly still name our group.
-        _kill_token_group(proc)
+        _kill_group(proc.pid)
     try:
         proc.wait(timeout=KILL_GRACE)
     except subprocess.TimeoutExpired:
@@ -750,13 +760,6 @@ def _leader_exited(proc: subprocess.Popen[bytes]) -> bool:
         except ChildProcessError:
             return True
     return proc.poll() is not None
-
-
-def _kill_group(pgid: int) -> None:
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 _COLLECT_SECONDS = 0.2

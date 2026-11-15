@@ -328,3 +328,25 @@ def test_run_git_stdin_of_a_child_that_reads_late_without_an_output_file(tmp_pat
         timeout=10,
     )
     assert r.returncode == 0 and r.stdout.strip() == b"1000000"
+
+
+def test_run_git_kills_and_reaps_the_child_on_an_interrupt(tmp_path: Path) -> None:
+    import signal
+
+    pidfile = tmp_path / "pid"
+    script = f"echo $$ > {pidfile}; exec sleep 60"
+
+    def interrupt(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    old = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 1.0)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            gateway.run_git(["/bin/sh", "-c", script], env=ENV, cwd=str(tmp_path), timeout=30)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    pid = int(pidfile.read_text())
+    with pytest.raises(ProcessLookupError):  # dead and reaped: no zombie, no sleeping child
+        os.kill(pid, 0)
