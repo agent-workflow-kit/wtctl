@@ -170,7 +170,7 @@ def _value(sc: _Scan) -> bytes:
     out = bytearray()
     quote = False
     comment = False
-    space = 0
+    space = bytearray()  # pending unquoted whitespace, kept byte-exact (tabs stay tabs)
     while True:
         c = sc.get()
         if c == 10:
@@ -182,14 +182,14 @@ def _value(sc: _Scan) -> bytes:
             continue
         if c in _SPACE and not quote:
             if out:
-                space += 1
+                space.append(c)
             continue
         if not quote and c in (0x23, 0x3B):
             comment = True
             continue
         if space:
-            out.extend(b" " * space)
-            space = 0
+            out.extend(space)
+            space.clear()
         if c == 0x5C:
             c = sc.get()
             if c == 10:

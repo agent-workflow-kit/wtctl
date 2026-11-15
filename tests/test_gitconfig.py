@@ -26,6 +26,17 @@ def git_list(tmp: Path, home: Path, data: bytes) -> list[tuple[str, str | None]]
     return out
 
 
+def _norm(value: str | None) -> str | None:
+    # git changed between versions (2.34 -> 2.56) from turning an unquoted internal tab run into
+    # spaces to keeping the bytes. wtctl keeps the bytes (finer-grained than old git, equal to
+    # new git), so differential comparisons normalise tabs on both sides.
+    return None if value is None else value.replace("\t", " ")
+
+
+def _normed(rows: list[tuple[str, str | None]] | None) -> list[tuple[str, str | None]] | None:
+    return None if rows is None else [(k, _norm(v)) for k, v in rows]
+
+
 def ours(data: bytes) -> list[tuple[str, str | None]]:
     return [
         (e.key, None if e.value is None else e.value.decode("utf-8", "surrogateescape"))
@@ -76,7 +87,7 @@ BENIGN = [
 def test_benign_inputs_match_git(tmp_path: Path, private_home: Path, data: bytes) -> None:
     want = git_list(tmp_path, private_home, data)
     assert want is not None, "corpus entry must be accepted by git"
-    assert ours(data) == want
+    assert _normed(ours(data)) == _normed(want)
 
 
 HOSTILE = [
@@ -112,7 +123,13 @@ def test_hostile_inputs_are_rejected_when_git_rejects_them(
     except ConfigSyntaxError:
         return  # being stricter than git is always fine
     assert git is not None, f"git rejects {data!r} but wtctl accepted {got!r}"
-    assert got == git
+    assert _normed(got) == _normed(git)
+
+
+def test_unquoted_internal_whitespace_bytes_are_preserved() -> None:
+    tab = ours(b"[a]\n\tk = x\t\ty\n")
+    assert tab == [("a.k", "x\t\ty")]
+    assert ours(b"[a]\n\tk = x\ty\n") != ours(b"[a]\n\tk = x y\n")
 
 
 def test_nul_is_always_refused() -> None:
@@ -138,7 +155,7 @@ def test_fuzz_never_accepts_what_git_rejects_and_never_disagrees(
             stricter += git is not None
             continue
         assert git is not None, f"git rejects {data!r}; wtctl returned {got!r}"
-        assert got == git, data
+        assert _normed(got) == _normed(git), data
     assert stricter < 200  # sanity: the parser is not rejecting nearly everything
 
 
