@@ -172,7 +172,7 @@ def test_a_failing_rerun_exits_12_keeps_the_record_active_and_the_old_sets(
     assert err["details"]["record"]["state"] == "active"
     assert err["details"]["record"]["bootstrap"]["state"] == "failed"
     assert w.records()[0]["state"] == "active"
-    assert w.count("bootstrap_runs") == 2  # both runs are kept
+    assert len(w.rows("SELECT DISTINCT run FROM bootstrap_runs")) == 2  # both runs are kept
 
 
 def test_dry_run_changes_nothing_and_runs_nothing(w: CW, capsys) -> None:  # noqa: ANN001
@@ -223,3 +223,58 @@ def test_tracked_changes_are_reported(w: CW, capsys) -> None:  # noqa: ANN001
 def test_selecting_by_path_works(w: CW, capsys) -> None:  # noqa: ANN001
     rec = made(w, capsys)
     good(rerun(w, capsys, rec["path"]))
+
+
+def test_bootstrap_waits_for_the_creators_lease_on_a_creating_record(w: CW, capsys) -> None:  # noqa: ANN001
+    rec = made(w, capsys)
+    set_row(w, rec["id"], state="creating")
+    st = State(w.db, __import__("wtctl.gateway", fromlist=["Gateway"]).Gateway())
+    lease = st.lease(record_lease(rec["id"]), wait=0)
+    try:
+        assert err_of(rerun(w, capsys, rec["id"]), 12)["code"] == "busy"
+    finally:
+        lease.release()
+        st.close()
+
+
+def test_bootstrap_on_a_creating_record_without_a_creator_is_unlinked(w: CW, capsys) -> None:  # noqa: ANN001
+    rec = made(w, capsys)
+    set_row(w, rec["id"], state="creating")
+    assert err_of(rerun(w, capsys, rec["id"]), 20)["reason"] == "unlinked"
+
+
+def test_a_throwaway_is_refused_before_any_lease_wait(w: CW, capsys) -> None:  # noqa: ANN001
+    st = State(w.db, __import__("wtctl.gateway", fromlist=["Gateway"]).Gateway())
+    rid = st.allocate_id()
+    st.insert_record({"id": rid, "object_type": "throwaway", "state": "creating", "repo": REPO,
+                      "path": str(w.tmp / "t2"), "name": "t2"})  # fmt: skip
+    lease = st.lease(record_lease(rid), wait=0)
+    try:
+        err_of(rerun(w, capsys, rid), 2)
+    finally:
+        lease.release()
+        st.close()
+
+
+def test_a_lost_lease_during_the_steps_is_busy_and_records_nothing(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    from wtctl.errors import WtctlError
+    from wtctl.state import Lease
+
+    rec = made(w, capsys)
+    w.repo_cfg["bootstrap"] = {"steps": [pystep("import time; time.sleep(60)")]}
+
+    def lost(self: Lease) -> None:
+        self.lost = True
+        raise WtctlError("busy", "lease was lost to another process")
+
+    monkeypatch.setattr(Lease, "renew", lost)
+    t0 = time.monotonic()
+    err = err_of(rerun(w, capsys, rec["id"]), 12)
+    assert err["code"] == "busy" and time.monotonic() - t0 < 30
+    assert w.count("bootstrap_runs") == 0

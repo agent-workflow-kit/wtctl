@@ -22,10 +22,14 @@ from .create import record_object
 BOOTSTRAPPABLE = "active"
 
 
-def _check(record: Record) -> None:
-    """The record-state rules (docs/interface.md, Commands by record state)."""
+def _check_type(record: Record) -> None:
     if record["object_type"] != "worktree":
         raise UsageError(f"{record['id']} is a throwaway; bootstrap is for worktrees")
+
+
+def _check(record: Record) -> None:
+    """The record-state rules (docs/interface.md, Commands by record state)."""
+    _check_type(record)
     if record["state"] != BOOTSTRAPPABLE:
         raise WtctlError(
             "refused",
@@ -43,7 +47,12 @@ def run(ctx: Context) -> Result:
     a, config, state = ctx.args, ctx.config, ctx.state
     git = open_git(config, ctx.gateway)  # git_too_old (exit 12)
     record = state.resolve(a.target)
-    _check(record)
+    if record["state"] == "creating" and not ctx.dry_run:
+        # a live creator holds the record lease: wait for it (then busy) before refusing; the
+        # state is checked again under the lease
+        _check_type(record)
+    else:
+        _check(record)
     if ctx.dry_run:
         return _dry(ctx, record)
     with state.lease(record_lease(record["id"]), wait=config.lease_wait_s) as lease:
@@ -68,8 +77,12 @@ def run(ctx: Context) -> Result:
                 run_the_steps=True,
                 rerun=True,
                 warn=warnings.append,
-                on_tick=lease.renew,
+                on_tick=bootstrapper.lease_ticker(lease),
             )
+            if lease.lost:
+                raise WtctlError(
+                    "busy", f"the lease on {record['id']} was lost during bootstrap; nothing stored"
+                )
             record = state.record_bootstrap(
                 record["id"],
                 expected=BOOTSTRAPPABLE,

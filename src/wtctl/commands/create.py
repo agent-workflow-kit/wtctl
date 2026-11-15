@@ -894,8 +894,12 @@ class Creator:
                 run_the_steps=run_the_steps,
                 rerun=False,
                 warn=self.warnings.append,
-                on_tick=rlease.renew,
+                on_tick=bootstrapper.lease_ticker(rlease),
             )
+            if rlease.lost:
+                raise WtctlError(
+                    "busy", f"the lease on {record['id']} was lost during bootstrap; nothing stored"
+                )
             self.state.record_bootstrap(
                 record["id"],
                 expected="creating",

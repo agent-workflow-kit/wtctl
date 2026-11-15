@@ -222,3 +222,28 @@ def test_a_failure_at_any_step_keeps_the_worktree_and_what_was_made(r: Repo, fai
     out, _ = go(r, steps=steps)
     assert (out.state == "failed") and len(out.steps) == failing + 1
     assert r.wt.is_dir() and set(paths(out)) == {f"s{i}" for i in range(failing + 1)}
+
+
+def test_the_nested_scan_limit_is_shared_across_directories(r: Repo) -> None:
+    from wtctl import bootstrapper as b
+
+    for d in ("a", "b", "c"):
+        for i in range(3):
+            r.write(f"{d}/f{i}")
+    warns: list[str] = []
+    with r.open() as wt:
+        found = b.find_nested(wt, ["a", "b", "c"], limit=5, warn=warns.append)
+    assert found == []
+    assert any("scan" in w for w in warns)  # 3 + 3 + 3 entries > 5 in total
+
+
+def test_the_shared_nested_budget_still_finds_what_fits(r: Repo) -> None:
+    from wtctl import bootstrapper as b
+
+    r.write("a/f0")
+    (r.wt / "a" / "x" / ".git").mkdir(parents=True)
+    r.write("b/f0")
+    warns: list[str] = []
+    with r.open() as wt:
+        found = b.find_nested(wt, ["a", "b"], limit=50, warn=warns.append)
+    assert found == ["a/x/.git"] and warns == []

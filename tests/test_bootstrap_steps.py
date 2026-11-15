@@ -44,10 +44,11 @@ def py(code: str, **kw) -> NS:  # noqa: ANN003
 def run(r: Repo, steps: list[NS], env: dict[str, str] | None = None, **kw):  # noqa: ANN003, ANN201
     base = env if env is not None else {"PATH": os.environ["PATH"]}
     warns: list[str] = []
+    names = kw.pop("mask", ())
+    caller = kw.pop("caller", base)
+    values = sorted(b.mask_values(kw.pop("config", cfg((), names)), caller, base))
     with r.open() as wt:
-        out = b.run_steps(
-            steps, env=base, cwd=wt.cwd, mask=kw.pop("mask", ()), warn=warns.append, **kw
-        )
+        out = b.run_steps(steps, env=base, cwd=wt.cwd, mask=values, warn=warns.append, **kw)
     return out, warns
 
 
@@ -229,6 +230,112 @@ def test_token_values_are_masked_even_when_passed_and_not_listed() -> None:
     assert "tok-123" in values and "a" not in values
 
 
+def test_mask_values_reads_the_caller_environ_and_the_step_env() -> None:
+    config = cfg(("GH_TOKEN",), mask=("SEC",))
+    caller = {"GH_TOKEN": "caller-token", "SEC": "caller-sec"}
+    step_env = {"GH_TOKEN": "cfg-token", "SEC": "cfg-sec", "OTHER": "o"}
+    assert b.mask_values(config, caller, step_env) == {
+        "caller-token", "caller-sec", "cfg-token", "cfg-sec"
+    }  # fmt: skip
+
+
+def test_a_token_env_value_in_the_caller_environ_is_masked_via_pass_env(r: Repo) -> None:
+    config = cfg(("GH_TOKEN",))
+    caller = {"PATH": os.environ["PATH"], "GH_TOKEN": "tok-pass-123"}
+    env = b.step_env(
+        config,
+        caller,
+        settings(pass_env=["GH_TOKEN"]),
+        record_id="wt-aaaaaaaa",
+        path="/w",
+        repo="r",
+    )
+    (steps, _), _ = run(
+        r,
+        [py("import os; print('t=' + os.environ['GH_TOKEN'])")],
+        env=env,
+        caller=caller,
+        config=config,
+    )
+    assert "tok-pass-123" not in steps[0]["output_tail"] and "t=***" in steps[0]["output_tail"]
+
+
+def test_a_token_env_value_set_by_bootstrap_env_is_masked(r: Repo) -> None:
+    config = cfg(("GH_TOKEN",))
+    caller = {"PATH": os.environ["PATH"], "GH_TOKEN": "caller-tok-1"}
+    env = b.step_env(
+        config,
+        caller,
+        settings(env={"GH_TOKEN": "cfg-tok-2"}),
+        record_id="wt-aaaaaaaa",
+        path="/w",
+        repo="r",
+    )
+    code = "import os; print(os.environ['GH_TOKEN'])"
+    (steps, _), _ = run(
+        r,
+        [py(code), py("print('caller-tok-1')")],
+        env=env,
+        caller=caller,
+        config=config,
+    )
+    assert [s["output_tail"] for s in steps] == ["***\n", "***\n"]
+
+
+def test_a_token_straddling_the_cut_stays_masked_when_from_the_caller(r: Repo) -> None:
+    secret = "TOKVALUE9" * 5
+    caller = {"PATH": os.environ["PATH"], "GH_TOKEN": secret}
+    env = b.step_env(
+        cfg(("GH_TOKEN",)),
+        caller,
+        settings(pass_env=["GH_TOKEN"]),
+        record_id="wt-aaaaaaaa",
+        path="/w",
+        repo="r",
+    )
+    code = "import os; print('z' * (4096 - 20) + os.environ['GH_TOKEN'] + 'tail')"
+    (steps, _), _ = run(r, [py(code)], env=env, caller=caller, config=cfg(("GH_TOKEN",)))
+    tail = steps[0]["output_tail"]
+    assert "TOKVAL" not in tail and "KVALUE9" not in tail and len(tail.encode()) <= 4096
+
+
+# -- R1: an emptied PATH -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["bin:./x", ".:rel", "", ":"])
+def test_a_path_with_no_absolute_entry_is_removed_from_the_step_env(value: str) -> None:
+    for how in ("environ", "bootstrap_env"):
+        env = b.step_env(
+            cfg(),
+            {"PATH": value} if how == "environ" else {},
+            settings(env={"PATH": value} if how == "bootstrap_env" else None),
+            record_id="wt-aaaaaaaa",
+            path="/w",
+            repo="r",
+        )
+        assert "PATH" not in env
+
+
+@pytest.mark.parametrize("sh", [False, True])
+@pytest.mark.parametrize("value", ["bin:./x", ".:rel"])
+def test_a_repo_executable_named_like_the_command_does_not_run_without_a_path(
+    r: Repo, sh: bool, value: str
+) -> None:
+    exe = r.write("mytool", "#!/bin/sh\necho PWNED > pwned\n")
+    exe.chmod(0o755)
+    env = b.step_env(
+        cfg(),
+        {"PATH": value},
+        settings(),
+        record_id="wt-aaaaaaaa",
+        path=str(r.wt),
+        repo="r",
+    )
+    (steps, failed), _ = run(r, [step(["mytool"], sh=sh)], env=env)
+    assert failed and steps[0]["exit"] != 0
+    assert not (r.wt / "pwned").exists()
+
+
 # -- timeout and process groups --------------------------------------------------------------
 
 
@@ -281,3 +388,35 @@ def test_the_runner_gets_term_grace_and_merged_output(r: Repo) -> None:
     assert seen["term_grace"] == b.TERM_GRACE and seen["merge_stderr"] is True
     assert seen["timeout"] == 77 and seen["cwd"]
     assert signal  # keep the import used
+
+
+# -- R8: a lost lease ----------------------------------------------------------------------
+
+
+class FakeLease:
+    def __init__(self) -> None:
+        self.lost = False
+
+    def renew(self) -> None:
+        from wtctl.errors import WtctlError
+
+        self.lost = True
+        raise WtctlError("busy", "lease was lost to another process")
+
+
+def test_lease_ticker_reports_a_lost_lease_and_steps_stop(r: Repo) -> None:
+    lease = FakeLease()
+    t0 = time.monotonic()
+    (steps, failed), _ = run(r, [py("import time; time.sleep(60)")], on_tick=b.lease_ticker(lease))
+    assert lease.lost and failed and steps[0]["exit"] is None
+    assert time.monotonic() - t0 < 20
+
+
+def test_lease_ticker_is_quiet_while_the_lease_is_held() -> None:
+    class Held:
+        lost = False
+
+        def renew(self) -> None:
+            pass
+
+    assert b.lease_ticker(Held())() is False

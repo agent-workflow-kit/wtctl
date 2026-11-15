@@ -38,6 +38,7 @@ HASH_TOTAL_CAP = 1024 * 1024 * 1024  # bytes hashed per snapshot
 ENV_FILE_MAX_BYTES = 1024 * 1024  # an env file larger than this is not copied
 ENV_FILE_MAX_COUNT = 1000
 ENV_WALK_LIMIT = 200_000  # directory entries the copy_env source walk reads
+ENV_WALK_DEPTH = 255  # directory levels the copy_env source walk enters
 _CHUNK = 1 << 16
 
 Warn = Callable[[str], None]
@@ -308,53 +309,86 @@ def _list_dir(dirfd: int, budget: list[int]) -> tuple[list[str], list[str]]:
 
 def _match(
     anchor: fsafe.Anchor,
-    dirfd: int,
-    rel: tuple[str, ...],
+    root_fd: int,
     comps: Sequence[str],
     out: set[tuple[str, ...]],
     budget: list[int],
     warn: Warn,
 ) -> None:
-    """Collect the relative paths of non-directory entries matching ``comps`` below ``dirfd``."""
-    comp, rest = comps[0], comps[1:]
+    """Collect the relative paths of non-directory entries matching ``comps`` below ``root_fd``.
 
-    def descend(name: str, sub: Sequence[str]) -> None:
-        if fsafe.is_dotgit(name):
-            return
+    Iterative (an explicit stack of ``(directory, remaining components)``; a directory is opened
+    through its chain from the root when its turn comes), so a hostile deep tree cannot exhaust
+    the interpreter stack. Directories deeper than ``ENV_WALK_DEPTH`` are not entered.
+    """
+    stack: list[tuple[tuple[str, ...], tuple[str, ...]]] = [((), tuple(comps))]
+    too_deep = False
+    while stack:
+        rel, cs = stack.pop()
+        if len(rel) > ENV_WALK_DEPTH:
+            if not too_deep:
+                too_deep = True
+                warn(
+                    f"copy_env: not entering directories deeper than {ENV_WALK_DEPTH} levels; "
+                    "files below are not copied"
+                )
+            continue
+        owned = bool(rel)
         try:
-            child = fsafe.open_dir(anchor, dirfd, name)
+            dirfd = (
+                fsafe.open_chain(anchor, root_fd, rel, start_path=anchor.path) if owned else root_fd
+            )
         except fsafe.FsafeError as exc:
             if exc.kind != "missing":
-                warn(f"copy_env: not entering {_esc('/'.join((*rel, name)))}: {exc.kind}")
-            return
+                warn(f"copy_env: not entering {_esc('/'.join(rel))}: {exc.kind}")
+            continue
         try:
-            _match(anchor, child, (*rel, name), sub, out, budget, warn)
+            _match_dir(anchor, dirfd, rel, cs, out, budget, stack)
         finally:
-            os.close(child)
+            if owned:
+                os.close(dirfd)
 
+
+def _match_dir(
+    anchor: fsafe.Anchor,
+    dirfd: int,
+    rel: tuple[str, ...],
+    comps: tuple[str, ...],
+    out: set[tuple[str, ...]],
+    budget: list[int],
+    stack: list[tuple[tuple[str, ...], tuple[str, ...]]],
+) -> None:
+    """One directory of the walk: add the matches here, push the directories to visit."""
+    comp, rest = comps[0], comps[1:]
     if comp == "**":
         if rest:
-            _match(anchor, dirfd, rel, rest, out, budget, warn)
+            stack.append((rel, rest))
         dirs, others = _list_dir(dirfd, budget)
         if not rest:
             out.update((*rel, n) for n in others if not fsafe.is_dotgit(n))
-        for name in dirs:
-            descend(name, comps)
+        stack.extend(((*rel, n), comps) for n in reversed(dirs) if not fsafe.is_dotgit(n))
         return
     if _GLOB_CHARS & set(comp):
         dirs, others = _list_dir(dirfd, budget)
-        names = [n for n in sorted([*dirs, *others]) if fnmatch.fnmatchcase(n, comp)]
         subdirs = set(dirs)
-    else:
-        names, subdirs = [comp], {comp}
-    for name in names:
-        if fsafe.is_dotgit(name):
-            continue
-        if rest:
-            if name in subdirs:
-                descend(name, rest)
-        else:
-            out.add((*rel, name))
+        for name in sorted([*dirs, *others]):
+            if not fnmatch.fnmatchcase(name, comp) or fsafe.is_dotgit(name):
+                continue
+            if not rest:
+                out.add((*rel, name))
+            elif name in subdirs:
+                stack.append(((*rel, name), rest))
+        return
+    if fsafe.is_dotgit(comp):
+        return
+    if rest:
+        stack.append(((*rel, comp), rest))
+        return
+    try:
+        anchor.fs.lstat_at(dirfd, comp)
+    except OSError:
+        return  # a literal name that does not exist is no match (and no warning)
+    out.add((*rel, comp))
 
 
 def _read_source(anchor: fsafe.Anchor, root_fd: int, rel: tuple[str, ...]) -> bytes:
@@ -398,6 +432,13 @@ def _write_dest(wt: Worktree, rel: tuple[str, ...], data: bytes) -> None:
             while view:
                 view = view[os.write(out, view) :]
             os.fsync(out)
+        except OSError as exc:
+            # the name is ours and unrecorded: do not leave a partial file behind
+            try:
+                os.unlink(rel[-1], dir_fd=fd)
+            except OSError:
+                exc.strerror = f"{exc.strerror}; the partial file could not be removed"
+            raise
         finally:
             os.close(out)
     finally:
@@ -460,9 +501,10 @@ def copy_env_files(
         matches: set[tuple[str, ...]] = set()
         budget = [ENV_WALK_LIMIT]
         try:
+            # TODO(#10): run the copy_env source walk in fsafe_child with the 60 s deadline (add ops to fsafe_child.OPS)  # noqa: E501
             for comps in plans:
-                _match(src, src.fd, (), comps, matches, budget, warn)
-        except (fsafe.FsafeError, OSError) as exc:
+                _match(src, src.fd, comps, matches, budget, warn)
+        except (fsafe.FsafeError, OSError, RecursionError) as exc:
             warn(f"copy_env: the source walk stopped early ({getattr(exc, 'kind', 'io')})")
         folded = {t.casefold() for t in tracked}
         copied: list[Copied] = []
@@ -481,6 +523,8 @@ def copy_env_files(
             try:
                 data = _read_source(src, src.fd, rel)
             except fsafe.FsafeError as exc:
+                if exc.kind == "missing":
+                    continue  # raced away between the walk and the read: silently skipped
                 why = {"hardlink": "it is a hard link", "symlink": "it is a symlink"}.get(
                     exc.kind, exc.message if exc.kind == "limit" else exc.kind
                 )
@@ -492,6 +536,8 @@ def copy_env_files(
             try:
                 _write_dest(wt, rel, data)
             except fsafe.FsafeError as exc:
+                if exc.kind == "missing":
+                    continue  # raced away: not a match any more
                 why = "it already exists" if exc.kind == "exists" else f"destination {exc.kind}"
                 warn(f"copy_env: {shown!r} not copied: {why}")
                 continue
@@ -533,7 +579,11 @@ def step_env(
     env.update(settings.bootstrap.env)
     env.update(WTCTL_ID=record_id, WTCTL_PATH=path, WTCTL_REPO=repo)
     if "PATH" in env:
-        env["PATH"] = _safe_path(env["PATH"])
+        safe = _safe_path(env["PATH"])
+        if safe:
+            env["PATH"] = safe
+        else:  # no absolute entry left: the key goes, so no default can mean "here"
+            del env["PATH"]
     return env
 
 
@@ -545,14 +595,33 @@ def mask_names(config: Any) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def mask_values(config: Any, env: Mapping[str, str]) -> set[str]:
-    return {env[n] for n in mask_names(config) if env.get(n)}
+def mask_values(config: Any, *environs: Mapping[str, str]) -> set[str]:
+    """The values to mask: those of every ``mask_names`` variable in each of ``environs``.
+
+    Callers pass the caller's own environment (a ``token_env`` variable is dropped from the step
+    environment, so only the caller's holds it) and the step environment (a value that reached the
+    step through ``bootstrap.env`` or ``pass_env``)."""
+    return {e[n] for e in environs for n in mask_names(config) if e.get(n)}
 
 
 def _mask(data: bytes, values: Sequence[str]) -> bytes:
     for v in sorted({v.encode("utf-8", "replace") for v in values if v}, key=len, reverse=True):
         data = data.replace(v, b"***")
     return data
+
+
+def lease_ticker(lease: Any) -> Callable[[], bool]:
+    """The ``on_tick`` of a bootstrap run: renew ``lease`` and return True once it is lost, which
+    stops the running step. Any other failure to renew is retried at the next tick."""
+
+    def tick() -> bool:
+        try:
+            lease.renew()
+        except Exception:  # noqa: BLE001 - a lost lease shows in ``lease.lost``
+            pass
+        return bool(lease.lost)
+
+    return tick
 
 
 def run_steps(
@@ -563,15 +632,16 @@ def run_steps(
     mask: Sequence[str],
     warn: Warn,
     runner: Callable[..., gateway.StepResult] = gateway.run_step,
-    on_tick: Callable[[], None] | None = None,
+    on_tick: Callable[[], bool | None] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Run ``steps`` in order; stop at the first failure. Returns ``(results, failed)``.
 
     Each result is a ``bootstrap_step`` object: the configured argv, the exit status (None when
     the step was killed, timed out or could not start), the duration and the last 4096 bytes of
-    the combined output with the values of the ``mask`` variables (read from ``env``) masked.
+    the combined output with the ``mask`` values masked (``mask_values`` computes them).
+    ``on_tick`` returning True stops the running step (a lost lease).
     """
-    values = [env[n] for n in mask if env.get(n)]
+    values = list(mask)
     results: list[dict[str, Any]] = []
     for step in steps:
         argv = list(step.argv)
@@ -615,6 +685,7 @@ def find_nested(wt: Worktree, dirs: Sequence[str], *, limit: int, warn: Warn) ->
     into a ``.git``. A walk that reaches ``limit`` entries stops with a warning (fail safe: what
     it did not list is not exempt)."""
     found: list[str] = []
+    left = limit  # one budget for all the directories
     for rel in dirs:
         parts = tuple(rel.split("/"))
         try:
@@ -622,19 +693,25 @@ def find_nested(wt: Worktree, dirs: Sequence[str], *, limit: int, warn: Warn) ->
         except fsafe.FsafeError:
             continue
         root_path = wt.anchor.path.rstrip("/") + "/" + rel
+        read = [0]
         try:
+            # TODO(#10): run the nested scan in fsafe_child with the 60 s deadline (add ops to fsafe_child.OPS)  # noqa: E501
             for e in fsafe.walk_tree(
                 wt.anchor,
                 fd,
-                limit=limit,
+                limit=left,
                 descend=lambda ent: ent.path[-1] != ".git",
                 root_path=root_path,
+                progress=read,
             ):
                 if e.path[-1] == ".git" and e.kind in ("file", "dir"):
                     text = _text("/".join((*parts, *e.path)))
                     if text is not None:
                         found.append(text)
+            left -= read[0]
         except fsafe.FsafeError as exc:
+            if exc.kind == "limit":
+                left = 0
             warn(
                 f"nested-repository scan of {_esc(rel)!r} stopped ({exc.kind}); "
                 "entries it did not list are not exempt"
@@ -675,7 +752,7 @@ def run_bootstrap(
     rerun: bool,
     warn: Warn,
     runner: Callable[..., gateway.StepResult] = gateway.run_step,
-    on_tick: Callable[[], None] | None = None,
+    on_tick: Callable[[], bool | None] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Outcome:
     """Bootstrap steps 1 to 5 on the worktree of ``record``.
@@ -684,9 +761,10 @@ def run_bootstrap(
     entries and the env files this run itself copied (a re-run never adopts other untracked
     files, which an agent may have written).
     """
+    caller = os.environ if environ is None else environ
     env = step_env(
         config,
-        os.environ if environ is None else environ,
+        caller,
         settings,
         record_id=record["id"],
         path=record["path"],
@@ -715,7 +793,7 @@ def run_bootstrap(
                 settings.bootstrap.steps,
                 env=env,
                 cwd=wt.cwd,
-                mask=mask_names(config),
+                mask=sorted(mask_values(config, caller, env)),
                 warn=warn,
                 runner=runner,
                 on_tick=on_tick,

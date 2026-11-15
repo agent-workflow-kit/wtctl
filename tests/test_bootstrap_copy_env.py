@@ -244,3 +244,61 @@ def test_a_source_root_with_the_recorded_identity_copies(r: Repo) -> None:
         r, [".env"], common_dir=str(r.main / ".git"), common_id=f"{st.st_dev}:{st.st_ino}"
     )
     assert [c.path for c in got] == [".env"]
+
+
+# -- R6: hostile depth ------------------------------------------------------------------------
+
+
+def test_a_very_deep_tree_does_not_crash_the_walk(r: Repo) -> None:
+    fd = os.open(r.main, os.O_RDONLY)
+    try:
+        for _ in range(800):
+            os.mkdir("d", dir_fd=fd)
+            nfd = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        with os.fdopen(os.open(".env", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd), "w") as f:
+            f.write("deep=1\n")
+    finally:
+        os.close(fd)
+    got, warns = copy(r, ["**/.env"])  # must not raise RecursionError
+    assert all(isinstance(w, str) for w in warns)
+    assert got == [] or len(got) == 1
+    assert got or warns  # copied, or stopped with a warning
+
+
+# -- R7: no spurious warnings -----------------------------------------------------------------
+
+
+def test_a_literal_pattern_for_a_missing_file_is_silent(r: Repo) -> None:
+    r.write(".env", "a", root=r.main)
+    got, warns = copy(r, [".env", ".env.local"])
+    assert [c.path for c in got] == [".env"] and warns == []
+
+
+def test_double_star_over_many_empty_dirs_is_silent(r: Repo) -> None:
+    for i in range(2000):
+        (r.main / "dirs" / f"d{i}").mkdir(parents=True)
+    r.write("dirs/d7/.env", "x", root=r.main)
+    got, warns = copy(r, ["**/.env"])
+    assert [c.path for c in got] == ["dirs/d7/.env"] and warns == []
+
+
+# -- R9: a failed write leaves nothing --------------------------------------------------------
+
+
+def test_a_write_failure_removes_the_partial_file_and_warns(
+    r: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno
+
+    r.write(".env", "SECRET=1\n", root=r.main)
+
+    def boom(fd: int, data: object) -> int:
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "write", boom)
+        got, warns = copy(r, [".env"])
+    assert got == [] and not (r.wt / ".env").exists()
+    assert any(".env" in w and "not copied" in w for w in warns)

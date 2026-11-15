@@ -409,7 +409,7 @@
         "output_tail": {
           "type": "string",
           "x-untrusted": true,
-          "description": "Untrusted: the last 4096 bytes of the step's combined output, mask_env values masked; project code wrote it."
+          "description": "Untrusted: the last 4096 bytes of the step's combined output, mask_env values and every hosts.*.token_env value masked; project code wrote it."
         }
       },
       "additionalProperties": false,

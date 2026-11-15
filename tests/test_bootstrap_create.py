@@ -45,6 +45,10 @@ def paths(w: CW, rid: str) -> dict[str, tuple[str, str | None]]:
     return {r["path"]: (r["kind"], r["digest"]) for r in rows}
 
 
+def ok_record_path(w: CW, rid: str) -> str:
+    return w.rows("SELECT path FROM records WHERE id = ?", rid)[0]["path"]
+
+
 def test_steps_run_and_the_created_set_is_recorded(w: CW, capsys) -> None:  # noqa: ANN001
     w.repo_cfg["bootstrap"] = {
         "steps": [
@@ -101,7 +105,7 @@ def test_steps_do_not_see_token_variables_but_see_pass_env(
     assert "WT_TEST_TOKEN" not in env and "sekrit" not in json.dumps(env)
     assert env["WT_TEST_PLAIN"] == "plain" and env["FROM_CFG"] == "1"
     assert env["WTCTL_REPO"] == REPO and env["WTCTL_ID"].startswith("wt-")
-    assert env["WTCTL_PATH"] == os.getcwd() or Path(env["WTCTL_PATH"]).is_dir()
+    assert env["WTCTL_PATH"] == ok_record_path(w, env["WTCTL_ID"])
     w.top["hosts"] = {"example.test": {"token_env": "WT_TEST_TOKEN"}}
     w.repo_cfg["bootstrap"]["pass_env"] = ["WT_TEST_TOKEN"]
     out.unlink()
@@ -242,3 +246,40 @@ def test_reused_and_dry_run_outputs_still_validate(w: CW, capsys) -> None:  # no
     assert again["record"]["bootstrap"]["state"] == "ok"
     dry = ok(w.create(capsys, "--dry-run"))
     assert dry["dry_run"] is True and dry["bootstrap"]["state"] == "none"
+
+
+def test_a_token_env_value_is_masked_in_the_output_tail(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WT_TEST_TOKEN", "sekrit-token-value")
+    w.top["hosts"] = {"example.test": {"token_env": "WT_TEST_TOKEN"}}
+    w.repo_cfg["bootstrap"] = {
+        "steps": [pystep("import os; print('v=' + os.environ['WT_TEST_TOKEN'])")],
+        "pass_env": ["WT_TEST_TOKEN"],
+    }
+    data = ok(w.create(capsys))
+    tail = data["bootstrap"]["steps"][0]["output_tail"]
+    assert "sekrit-token-value" not in tail and tail == "v=***\n"
+
+
+def test_a_lost_lease_during_create_bootstrap_fails_busy_and_keeps_the_worktree(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wtctl.errors import WtctlError
+    from wtctl.state import Lease
+
+    w.repo_cfg["bootstrap"] = {"steps": [pystep("import time; time.sleep(60)")]}
+
+    def lost(self: Lease) -> None:
+        self.lost = True
+        raise WtctlError("busy", "lease was lost to another process")
+
+    monkeypatch.setattr(Lease, "renew", lost)
+    r = w.create(capsys)
+    assert r.code == 12, (r.out, r.err)
+    assert w.count("bootstrap_runs") == 0
+    assert w.records()[0]["state"] == "creating"

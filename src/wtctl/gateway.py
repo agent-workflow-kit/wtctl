@@ -722,6 +722,17 @@ _COLLECT_SECONDS = 0.2
 _COLLECT_BYTES = 1 << 20
 
 
+def _group_empty(pgid: int) -> bool:
+    """True when no process is left in group ``pgid`` (the leader has been reaped)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
 def _term_group(pgid: int) -> None:
     """SIGTERM the process group ``pgid`` (same ownership rules as ``_kill_group``)."""
     try:
@@ -746,7 +757,7 @@ def run_step(
     tail: bool = False,
     drain_grace: float = 1.0,
     on_start: Callable[[int], None] | None = None,
-    on_tick: Callable[[], None] | None = None,
+    on_tick: Callable[[], bool | None] | None = None,
     term_grace: float | None = None,
     merge_stderr: bool = False,
 ) -> StepResult:
@@ -758,11 +769,13 @@ def run_step(
     ``tail=True``); the rest is read and discarded so the child never blocks on a full pipe.
     ``on_start`` receives the leader pid (= process group id) right after launch, for callers
     that record it. ``on_tick`` is called about once a second while waiting (lease renewal);
-    its exceptions are ignored. A failure to start is a result, not an exception.
+    its exceptions are ignored, and a return value of True ends the step (the group gets
+    SIGKILL at once). A failure to start is a result, not an exception.
 
     At the timeout the group gets SIGKILL at once. With ``term_grace`` (seconds) it gets SIGTERM
-    first and, when the leader has exited or the grace has passed, SIGKILL: either way the whole
-    group is killed, stragglers that ignored SIGTERM included. ``merge_stderr`` sends stderr into
+    first and then the whole grace to leave: the step ends when the group is empty (the leader and
+    everything it started have exited), and at the end of the grace the group gets SIGKILL,
+    stragglers that ignored SIGTERM included. ``merge_stderr`` sends stderr into
     the stdout pipe (one interleaved stream; ``stderr`` of the result stays empty).
     """
     t0 = time.monotonic()
@@ -817,15 +830,25 @@ def run_step(
             if on_tick is not None and now - last_tick >= 1.0:
                 last_tick = now
                 try:
-                    on_tick()
+                    stop = on_tick() is True
                 except Exception:  # noqa: BLE001 - a heartbeat must not abort the step
-                    pass
+                    stop = False
+                if stop:  # the caller lost what it ticks for (a lease): end the step
+                    _kill_group(pid)
+                    break
             if exited_at is None and _leader_exited(proc):
                 exited_at = now
             if kill_at is not None:
-                # SIGTERM was sent: wait for the leader, then SIGKILL the whole group
-                if exited_at is not None or now >= kill_at:
+                # SIGTERM was sent: the group keeps the grace. Once the leader is gone and
+                # reaped (a zombie leader would keep the group "alive" for ever; a live member
+                # keeps the process-group id from being reused) the group is done when
+                # killpg(.., 0) finds nobody; at the end of the grace the rest gets SIGKILL.
+                if exited_at is not None:
+                    proc.poll()
+                if now >= kill_at:
                     _kill_group(pid)
+                    break
+                if proc.returncode is not None and _group_empty(pid):
                     break
             elif exited_at is not None and not sel.get_map():
                 break

@@ -557,6 +557,7 @@ def walk_tree(
     descend: Callable[[Entry], bool] | None = None,
     dirs_only: bool = False,
     root_path: str | None = None,
+    progress: list[int] | None = None,
 ) -> Iterator[Entry]:
     """Depth-first, pre-order walk below ``root_fd`` without following links or crossing mounts.
 
@@ -570,6 +571,8 @@ def walk_tree(
     ``mounts_below`` by path, without opening them.
     A file that is a bind-mount over another file on the same device is only detected when it is
     opened (``open_file``), since a walk does not open regular files.
+    ``progress`` (a one-element list), when given, holds the number of entries read so far, so a
+    caller can share one ``limit`` across several walks.
     """
     if root_path is None and anchor.mounts_below:
         raise FsafeError("bad_request", "root_path is required: the anchor has mounts below it")
@@ -592,6 +595,8 @@ def walk_tree(
                     except OSError:
                         continue
                 read += 1
+                if progress is not None:
+                    progress[0] = read
                 if limit is not None and read > limit:
                     raise FsafeError("limit", f"more than {limit} entries")
                 names.append(e.name)

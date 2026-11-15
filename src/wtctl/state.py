@@ -41,6 +41,8 @@ BOOTSTRAP_STATES = ("none", "ok", "failed", "interrupted")
 # prefix (everything below it); ignored_file: exempt by exact path.
 BOOTSTRAP_PATH_KINDS = ("untracked", "ignored_file", "ignored_dir")
 
+_RUN_MARKER = -1  # the ``step`` of the row that numbers a bootstrap run (no argv)
+
 GLOBAL_LEASE = "global"
 LEASE_TTL = 600.0  # 10 minutes, renewed while held (docs/design.md, Concurrency)
 _POLL = 0.1
@@ -659,6 +661,13 @@ class State:
                     for i, st in enumerate(steps)
                 ],
             )
+            # A marker row (step -1) carries the run number, so a run without steps still
+            # supersedes the steps of the previous run.
+            c.execute(
+                'INSERT INTO bootstrap_runs(record_id, run, step, argv_json, "exit", '
+                "duration_ms, output_tail, started) VALUES (?, ?, ?, '[]', NULL, NULL, NULL, ?)",
+                (record_id, run, _RUN_MARKER, now),
+            )
             c.executemany(
                 "INSERT OR REPLACE INTO bootstrap_paths(record_id, path, kind, digest) "
                 "VALUES (?, ?, ?, ?)",
@@ -710,7 +719,7 @@ class State:
         if last is not None:
             for r in self._conn.execute(
                 'SELECT argv_json, "exit", duration_ms, output_tail FROM bootstrap_runs '
-                "WHERE record_id = ? AND run = ? ORDER BY step",
+                "WHERE record_id = ? AND run = ? AND step >= 0 ORDER BY step",
                 (record_id, last),
             ):
                 steps.append(

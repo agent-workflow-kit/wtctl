@@ -116,3 +116,16 @@ def test_the_sets_go_with_the_record(st: State) -> None:
 def test_set_bootstrap_state_alone(st: State) -> None:
     st.set_bootstrap_state(RID, "interrupted", expected="creating")
     assert st.bootstrap_summary(RID)["state"] == "interrupted"
+
+
+def test_a_stepless_run_clears_the_steps_of_the_previous_run(st: State) -> None:
+    st.record_bootstrap(
+        RID, expected="creating", state="failed", steps=[step(["x"], 1)], paths=[], nested=[]
+    )
+    assert len(st.bootstrap_summary(RID)["steps"]) == 1
+    st.record_bootstrap(RID, expected="creating", state="ok", steps=[], paths=[], nested=[])
+    assert st.bootstrap_summary(RID)["steps"] == []
+    st.record_bootstrap(
+        RID, expected="creating", state="ok", steps=[step(["y"])], paths=[], nested=[]
+    )
+    assert [s["argv"] for s in st.bootstrap_summary(RID)["steps"]] == [["y"]]
