@@ -30,11 +30,11 @@ MINIMAL: dict[str, list[str]] = {
     "forget": ["forget", SID],
     "locate": ["locate", "example.com/o/r"],
     "clone": ["clone", "example.com/o/r"],
+    "export": ["export"],
     "label_add": ["label", "add", SID, "k=v"],
     "label_remove": ["label", "remove", SID, "k=v"],
     "reconcile": ["reconcile"],
     "prune": ["prune", "--throwaways"],
-    "export": ["export"],
     "cron_install": ["cron", "install"],
     "cron_uninstall": ["cron", "uninstall"],
 }
@@ -83,6 +83,8 @@ def _implemented(key: str) -> bool:
 def test_unimplemented_commands_exit_1_internal(
     capsys: pytest.CaptureFixture[str], key: str
 ) -> None:
+    if importlib.util.find_spec(f"wtctl.commands.{key}") is not None:
+        pytest.skip("implemented")
     r = run_cli(capsys, "--json", "--actor", "human:alice", *MINIMAL[key])
     assert r.code == 1
     obj = r.json()
