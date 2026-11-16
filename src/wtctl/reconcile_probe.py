@@ -55,7 +55,8 @@ def entry_args(state: Any, rec: dict[str, Any]) -> dict[str, Any]:
     args.pop("root_identity", None)
     if not rec.get("owned"):
         # an adopted record has no recorded root: its parent counts as the place only if it is
-        # not a mount point (a replaced or unmounted parent would look like a missing directory)
+        # not currently a mount root. An unmounted mount point looks like a plain directory and
+        # is not detected (the cost is a wrong `gone` tombstone; nothing is deleted).
         args["same_device_parent"] = True
     return args
 
@@ -63,8 +64,8 @@ def entry_args(state: Any, rec: dict[str, Any]) -> dict[str, Any]:
 def probe_entry(state: Any, rec: dict[str, Any], budget: fsafe_child.Budget) -> DirProbe:
     """``absent`` only when the last component, or a component of the chain above it, is missing
     below an anchor that opened and matched its recorded identity (an adopted record's parent must
-    also not be a mount point); any other failure (a link, an identity mismatch, an unopenable
-    root) is ``unknown``."""
+    also not currently be a mount root); any other failure (a link, an identity mismatch, an
+    unopenable root) is ``unknown``."""
     try:
         args = entry_args(state, rec)
     except fsafe.FsafeError as exc:

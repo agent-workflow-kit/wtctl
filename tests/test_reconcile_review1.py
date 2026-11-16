@@ -21,6 +21,7 @@ from wtctl import fsafe_child, reconcile_admin, reconcile_probe, removal_delete,
 from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway
 from wtctl.hardgit import Git
+from wtctl.reconciler import Reconciler
 from wtctl.state import State
 
 LONG_AGO = "2000-01-01T00:00:00.000Z"
@@ -124,7 +125,8 @@ def test_a_missing_root_is_unlinked_not_missing(w: RC) -> None:
     assert w.kinds(data) == ["unlinked"] and w.row(rec["id"])["state"] == "unlinked"
 
 
-# -- R15: an adopted record's parent must not be a mount point --
+# -- R15: an adopted record whose parent is a mount root is unlinked (an unmounted mount point
+# looks like a plain directory and is not detected) --
 
 
 def adopt(w: RC) -> tuple[str, Path]:
@@ -136,12 +138,12 @@ def adopt(w: RC) -> tuple[str, Path]:
 
 
 @pytest.mark.usefixtures("inproc")
-def test_an_adopted_record_under_a_mount_point_is_unlinked_not_missing(
+def test_an_adopted_record_whose_parent_is_a_mount_root_is_unlinked_not_missing(
     w: RC, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rid, other = adopt(w)
     shutil.rmtree(other)
-    monkeypatch.setattr(fsafe_child, "_parent_dev", lambda fd: -1)  # the parent is a mount's root
+    monkeypatch.setattr(fsafe_child, "_parent_dev", lambda fd: -1)  # fakes a mount root
     data = w.reconciled()
     assert w.kinds(data) == ["unlinked"] and w.row(rid)["state"] == "unlinked"
     assert data["changes"][0]["action"] == "mark_unlinked"
@@ -442,6 +444,42 @@ def test_a_reclaim_refused_for_its_baseline_leaves_the_record_as_it_was(w: RC) -
     row = w.row(rec["id"])
     assert row["state"] == "creating" and row["admin_dir"] is None and row["dir_id"] is None
     assert row["head_at_create"] is None and row["reflog_start_ts"] is None
+
+
+@pytest.mark.usefixtures("inproc")
+def test_a_lost_reclaim_race_resets_every_value_this_call_wrote(
+    w: RC, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = w.wt()
+    crash_after_add(w, rec)
+    monkeypatch.setattr(Reconciler, "move", lambda *a, **k: False)
+    w.reconciled()
+    row = w.row(rec["id"])
+    assert row["state"] == "creating" and row["admin_dir"] is None and row["dir_id"] is None
+    assert row["head_at_create"] is None
+
+
+@pytest.mark.usefixtures("inproc")
+def test_a_lost_reclaim_race_never_wipes_a_concurrent_adopters_values(
+    w: RC, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = w.wt()
+    crash_after_add(w, rec)
+
+    def adopter_wins(self: Reconciler, *a: Any, **k: Any) -> bool:
+        w.update(
+            "UPDATE records SET admin_dir='/other/admin', dir_id='9:9', head_at_create='abc'"
+            " WHERE id=?",
+            rec["id"],
+        )
+        return False
+
+    monkeypatch.setattr(Reconciler, "move", adopter_wins)
+    w.reconciled()
+    row = w.row(rec["id"])
+    assert (row["admin_dir"], row["dir_id"], row["head_at_create"]) == (
+        "/other/admin", "9:9", "abc",
+    )  # fmt: skip
 
 
 def test_a_reclaim_empties_the_bootstrap_sets(w: RC) -> None:

@@ -338,11 +338,8 @@ class Reconciler:
         )  # fmt: skip
         if done:
             self.report("adopted_after_crash", id=rec["id"], path=rec["path"])
-        else:  # lost a race: no half-adopted record is left behind
-            with contextlib.suppress(WtctlError):
-                self.state.transition(
-                    rec["id"], "creating", "creating", admin_dir=None, dir_id=None
-                )
+        else:  # lost a race: reset what this call wrote, and only that (never an adopter's)
+            self.state.unclaim_creating(rec["id"], admin_dir=admin, dir_id=links.dir_id)
         return done
 
     # -- worktree records -----------------------------------------------------------------------

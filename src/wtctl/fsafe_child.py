@@ -362,7 +362,7 @@ def op_entry_state(args: dict[str, object]) -> dict[str, object]:
         except FileNotFoundError:
             if args.get("same_device_parent") and _parent_dev(parent) != os.fstat(parent).st_dev:
                 raise fsafe.FsafeError(
-                    "mount_point", "the directory's parent is a mount point or was replaced"
+                    "mount_point", "the directory's parent is a mount root or was replaced"
                 ) from None
             return {"state": "absent"}
         except OSError as exc:

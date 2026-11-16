@@ -898,6 +898,19 @@ class State:
             for table in ("bootstrap_paths", "bootstrap_nested"):
                 c.execute(f"DELETE FROM {table} WHERE record_id = ?", (record_id,))
 
+    def unclaim_creating(self, record_id: str, *, admin_dir: str, dir_id: str | None) -> bool:
+        """Undo a reclaim's claim on a ``creating`` record, only if the record still holds the
+        ``admin_dir`` and ``dir_id`` that call wrote (compare-and-set), so a concurrent adopter's
+        values are never wiped. Returns whether it reset anything."""
+        with self._txn() as c:
+            cur = c.execute(
+                "UPDATE records SET admin_dir = NULL, dir_id = NULL, head_at_create = NULL, "
+                "updated = ? WHERE id = ? AND state = 'creating' AND admin_dir = ? "
+                "AND dir_id IS ?",
+                (self._now(), record_id, admin_dir, dir_id),
+            )
+            return cur.rowcount > 0
+
     def expired_tombstones(self, cutoff: str) -> list[Record]:
         """Tombstones whose ``removed_at`` is strictly before ``cutoff`` (a state timestamp)."""
         rows = self._conn.execute(
