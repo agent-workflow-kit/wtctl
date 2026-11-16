@@ -465,7 +465,20 @@ def op_admin_inspect(args: dict[str, object]) -> dict[str, object]:
     name = args.get("name")
     if not isinstance(name, str):
         raise fsafe.FsafeError("bad_request", "name must be a string")
-    anchor, parent, _ = _open_root(args, parent=True)
+    try:
+        anchor, parent, _ = _open_root(args, parent=True)
+    except fsafe.FsafeError as exc:
+        if exc.kind != "missing":
+            raise
+        spec = args["anchor"]
+        assert isinstance(spec, dict)
+        # a missing `worktrees` directory below an anchor that opens and matches is an absent entry
+        fsafe.open_anchor(
+            str(spec["path"]),
+            expected=_identity(spec.get("identity")),
+            precheck=bool(spec.get("precheck", True)),
+        ).close()
+        return {"state": "absent"}
     try:
         try:
             anchor.fs.lstat_at(parent, name)
