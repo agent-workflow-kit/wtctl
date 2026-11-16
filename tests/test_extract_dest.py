@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from tests.extractlib import XW, tree
-from wtctl import extraction
+from wtctl import extraction, fsafe
 
 pytestmark = pytest.mark.usefixtures("inproc")
 
@@ -581,3 +581,52 @@ def test_dotgit_of_a_clean_throwaway_can_never_be_written(w: XW) -> None:
         ".git/config": "git_component",
     }
     assert tree(git) == before
+
+
+# -- mount points ------------------------------------------------------------------------------
+
+
+class MountFs(fsafe.Fs):
+    """Pretends every directory named ``mnt`` below ``under`` is the root of another mount."""
+
+    def __init__(self, under: str) -> None:
+        self.under = under
+
+    def mount_id(self, fd: int) -> int | None:
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        return 99 if path.endswith("/mnt") and self.under in path else 1
+
+
+@pytest.fixture
+def mounts(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    if not os.path.isdir("/proc/self/fd"):
+        pytest.skip("needs /proc")
+    under = "/throwaway/" if "source" in request.node.name else "/dest/"
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", MountFs(under))
+
+
+def test_destination_component_that_is_a_mount_point_is_a_conflict(w: XW, mounts: None) -> None:
+    s = w.src()
+    w.put(s, "mnt/f", b"1")
+    w.put(s, "ok", b"2")
+    dest = w.plain_dest()
+    (dest / "mnt").mkdir()
+    assert w.invalid(s, dest, ["mnt/f", "ok"]) == {"mnt/f": "dest_conflict"}
+    assert tree(dest) == {"mnt": "dir"}
+
+
+def test_deletion_below_a_destination_mount_point_is_a_conflict(w: XW, mounts: None) -> None:
+    s = w.src()
+    dest = w.plain_dest()
+    (dest / "mnt").mkdir()
+    (dest / "mnt" / "f").write_text("keep")
+    assert w.invalid(s, dest, None, ["mnt/f"]) == {"mnt/f": "dest_conflict"}
+    assert (dest / "mnt" / "f").read_text() == "keep"
+
+
+def test_source_path_crossing_a_mount_point_is_not_found(w: XW, mounts: None) -> None:
+    s = w.src()
+    w.put(s, "mnt/f", b"secret")
+    dest = w.plain_dest()
+    assert w.invalid(s, dest, ["mnt/f"]) == {"mnt/f": "not_found"}
+    assert tree(dest) == {}
