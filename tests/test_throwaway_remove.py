@@ -22,9 +22,7 @@ from wtctl.gateway import ProcessInfo
 
 @pytest.fixture
 def w(tmp_path: Path, private_home: Path) -> TW:
-    t = TW(tmp_path, private_home).build()
-    t.scanner = FakeScanner()
-    return t
+    return TW(tmp_path, private_home).build()
 
 
 def mk(w: TW, *argv: str) -> dict[str, Any]:
@@ -178,14 +176,15 @@ def test_an_unavailable_scanner_refuses_with_no_processes(w: TW) -> None:
 
 
 def test_a_real_process_with_its_cwd_inside_refuses_and_then_lets_go(w: TW) -> None:
-    w.scanner = None  # the real /proc scanner
+    w.real_scanner = True
     rec = mk(w)
     p = Path(rec["path"])
     (p / "sub").mkdir()
     # started by a shell that exits, so it is not a child of this process (wtctl's own children
     # are excluded from the check)
     out = subprocess.run(
-        ["sh", "-c", 'cd "$0" && { sleep 60 >/dev/null 2>&1 </dev/null & echo $!; }', str(p / "sub")],
+        ["sh", "-c", 'cd "$0" && { sleep 60 >/dev/null 2>&1 </dev/null & echo $!; }',
+         str(p / "sub")],
         capture_output=True, text=True, check=True, timeout=30,
     )  # fmt: skip
     pid = int(out.stdout.strip())

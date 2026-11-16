@@ -83,7 +83,8 @@ def test_the_users_global_git_config_is_never_read(w: TW, tmp_path: Path) -> Non
     (tpl / "hooks" / "post-checkout").write_text(f"#!/bin/sh\ntouch {hit}\n")
     (tpl / "hooks" / "post-checkout").chmod(0o755)
     (w.home / ".gitconfig").write_text(
-        f"[init]\n\ttemplateDir = {tpl}\n[core]\n\thooksPath = {tpl}/hooks\n\tfsmonitor = touch {hit}\n"
+        f"[init]\n\ttemplateDir = {tpl}\n[core]\n\thooksPath = {tpl}/hooks\n"
+        f"\tfsmonitor = touch {hit}\n"
         f'[filter "evil"]\n\tsmudge = touch {hit}\n\tclean = touch {hit}\n'
     )
     (w.work / ".gitattributes").write_text("*.txt filter=evil\n")

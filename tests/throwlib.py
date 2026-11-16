@@ -24,8 +24,16 @@ from wtctl.gateway import Gateway
 class TW(CW):
     """``CW`` with throwaway helpers. The remote is ``self.remote``, the clone ``self.clone``."""
 
-    scanner: FakeScanner | None = None
     git_runner: Any = None
+    real_scanner = False  # True: the real /proc scanner instead of ``self.scanner``
+
+    def __init__(self, tmp: Path, home: Path) -> None:
+        super().__init__(tmp, home)
+        self.scanner = FakeScanner()
+
+    def build(self) -> TW:
+        super().build()
+        return self
 
     # -- running ----------------------------------------------------------------------------
 
@@ -33,7 +41,7 @@ class TW(CW):
         """Any command in-process, with the fake scanner when the test set one."""
         actor = ["--actor", "human:tester" if human else "auto:tester"]
         extra: dict[str, Any] = {}
-        if self.scanner is not None:
+        if not self.real_scanner:
             extra["scanner"] = self.scanner
         if self.git_runner is not None:
             extra["git_runner"] = self.git_runner

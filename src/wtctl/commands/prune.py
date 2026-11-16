@@ -93,7 +93,12 @@ class Pruner:
         if self.ctx.dry_run:
             self.dry(rec)
             return
-        lease = self.state.try_lease(record_lease(rid))
+        try:
+            lease = self.state.try_lease(record_lease(rid))
+        except WtctlError as exc:  # held by this very process (tests, a hook running wtctl)
+            if exc.code != "busy":
+                raise
+            lease = None
         if lease is None:
             self.skipped.append(_skip(rid, "busy"))
             return
@@ -116,13 +121,19 @@ class Pruner:
         if check["status"] == "fail":
             self.skipped.append(_skip(rec["id"], "in_use", check["details"]))
         elif check["status"] != "pass":
-            self.skipped.append(_skip(rec["id"], "in_use"))  # unavailable scanner: not removable
+            self.skipped.append(_skip(rec["id"], "failed"))  # no scanner: not removable
         else:
             self.removed.append(rec["id"])
 
     def map_error(self, rid: str, exc: WtctlError) -> dict[str, Any]:
         if exc.code == "refused" and exc.fields.get("reason") == "in_use":
-            return _skip(rid, "in_use", exc.fields.get("processes") or [])
+            processes = exc.fields.get("processes") or []
+            if processes:
+                return _skip(rid, "in_use", processes)
+            # no process scanner: nothing to list, and the schema's `in_use` always lists some.
+            # The record is untouched and the next run tries again.
+            self.warnings.append(f"{rid}: {exc.message}")
+            return _skip(rid, "failed")
         if exc.code == "vetoed":
             return _skip(rid, "vetoed")
         if exc.code == "escalated":
@@ -140,12 +151,13 @@ class Pruner:
         if self.ctx.dry_run:
             return self.result(self.work(age), already_running=False)
         try:
-            with self.state.lease(GLOBAL_LEASE, wait=self.config.lease_wait_s):
-                return self.result(self.work(age), already_running=False)
+            lease = self.state.lease(GLOBAL_LEASE, wait=self.config.lease_wait_s)
         except WtctlError as exc:
             if exc.code != "busy":
                 raise
-        return self.result(None, already_running=True)
+            return self.result(None, already_running=True)
+        with lease:
+            return self.result(self.work(age), already_running=False)
 
     def work(self, age: int | None) -> int:
         todo = self.candidates(age)
