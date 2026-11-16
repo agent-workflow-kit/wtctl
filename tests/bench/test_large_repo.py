@@ -1,0 +1,244 @@
+"""Large-repository timings (issue #28). Marked ``bench``: deselected by default, never run in CI.
+
+    BENCH_DIR=/some/big/disk/.bench uv run pytest -m bench tests/bench -s
+
+Needs about 5 GB free under ``BENCH_DIR`` (default: ``.bench`` at the repository root, which is
+gitignored). Generated data is removed afterwards unless ``BENCH_KEEP=1``. Knobs: ``BENCH_REPEATS``
+(default 3), ``BENCH_IGNORED_FILES`` (default 150000), ``BENCH_STRESS`` (default 1: the
+nested-scan scaling run with empty files up to past ``remove.nested_scan_limit``).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import time
+from pathlib import Path
+
+import pytest
+
+from tests.bench import fixture as fx
+from tests.bench.world import REPO, Results, Timed, World, machine_info
+
+pytestmark = pytest.mark.bench
+
+ROOT = Path(__file__).resolve().parents[2]
+STALE_AT = 2000
+ADVANCE = 1000
+MIB = 1024 * 1024
+
+
+def bench_dir() -> Path:
+    path = Path(os.environ.get("BENCH_DIR", ROOT / ".bench")).resolve()
+    if Path("/tmp") in (path, *path.parents):
+        pytest.fail(f"BENCH_DIR {path} is under /tmp; use a dedicated directory on a large disk")
+    return path
+
+
+def ok(run: Timed, *codes: int) -> Timed:
+    assert run.code in (codes or (0,)), (run.argv, run.code, run.out[-800:], run.err[-800:])
+    return run
+
+
+def record_of(run: Timed) -> dict[str, str]:
+    return run.json()["record"]
+
+
+def test_large_repository_timings() -> None:
+    base = bench_dir()
+    if base.exists():
+        shutil.rmtree(base)
+    base.mkdir(parents=True)
+    free_gib = shutil.disk_usage(base).free / 1024**3
+    if free_gib < 15:
+        pytest.skip(f"only {free_gib:.0f} GiB free under {base}")
+    repeats = int(os.environ.get("BENCH_REPEATS", "3"))
+    ignored_files = int(os.environ.get("BENCH_IGNORED_FILES", "150000"))
+    res = Results()
+    try:
+        _scenario(base, res, repeats, ignored_files)
+    finally:
+        info = machine_info(base)
+        (base / "results.json").write_text(
+            json.dumps({"machine": info, "rows": res.rows()}, indent=2)
+        )
+        print("\n" + json.dumps(info, indent=2) + "\n" + res.markdown())
+        if os.environ.get("BENCH_KEEP") != "1":
+            shutil.rmtree(base / "wt", ignore_errors=True)
+            shutil.rmtree(base / "clone", ignore_errors=True)
+            shutil.rmtree(base / "remote.git", ignore_errors=True)
+            shutil.rmtree(base / "small", ignore_errors=True)
+
+
+def _scenario(base: Path, res: Results, repeats: int, ignored_files: int) -> None:
+    d = fx.MONOREPO
+    w = World(base, d)
+    w.top["extract"] = {"max_file_bytes": 16 * MIB}
+    w.build(stale_at=STALE_AT)
+    print("fixture build (s):", {k: round(v, 1) for k, v in w.timeline.items()}, flush=True)
+    w.git("config", "user.email", "bench@example.invalid")
+    w.git("config", "user.name", "Bench")
+
+    # Reference: what plain git costs for the same transfer (the floor for a mirror refresh).
+    t = time.monotonic()
+    w._git(base, "clone", "-q", "--bare", f"file://{w.remote}", str(base / "ref.git"))
+    res.add("reference: plain `git clone --bare` of the remote", _plain(time.monotonic() - t))
+    shutil.rmtree(base / "ref.git")
+
+    # Cold create: first mirror refresh, pack transfer of the clone's 18,000 missing commits,
+    # checkout.
+    cold = res.add(
+        "create --no-bootstrap, cold (first mirror refresh, 18k-commit pack transfer)",
+        ok(w.run("create", "--repo", REPO, "--no-bootstrap")),
+    )
+    first = record_of(cold)
+    assert w.git("rev-parse", first["base_sha"]) == first["base_sha"]
+    res.add("remove, clean tree", ok(w.run("remove", first["id"], "--yes")))
+
+    # The remote moves on: later mirror refresh and a small pack transfer.
+    fx.advance_main(w.remote, w.ghome, d, d.commits, ADVANCE)
+    st0 = ok(w.run("create", "--repo", REPO, "--no-bootstrap"))
+    res.add(f"create --no-bootstrap, warm (refresh after {ADVANCE} new commits)", st0)
+    second = record_of(st0)
+    res.add("status, clean tree, mirror already fresh", ok(w.run("status", second["id"])))
+    fx.advance_main(w.remote, w.ghome, d, d.commits + ADVANCE, ADVANCE)
+    res.add(
+        f"status, clean tree, refreshing {ADVANCE} new commits first",
+        ok(w.run("status", second["id"])),
+    )
+    ok(w.run("remove", second["id"], "--yes"))
+
+    # Repeated: full create (bootstrap snapshots, copy_env, baseline), then the checks and remove.
+    for n in range(repeats):
+        c = ok(w.run("create", "--repo", REPO, "--copy-env"))
+        res.add("create (bootstrap snapshots + copy_env + baseline), warm", c)
+        rec = record_of(c)
+        rid, wt = rec["id"], Path(rec["path"])
+        warn = [x for x in c.json()["warnings"] if "limit" in x or "early" in x]
+        if warn:
+            res.notes["create (bootstrap snapshots + copy_env + baseline), warm"] = "; ".join(warn)
+        t = time.monotonic()
+        fx.populate_ignored(wt, ignored_files // 100, 100)
+        print(f"populate {ignored_files} ignored files: {time.monotonic() - t:.1f}s", flush=True)
+        res.add("status (+ node_modules ignored files)", ok(w.run("status", rid)))
+        res.add("remove --dry-run", ok(w.run("remove", rid, "--dry-run")))
+        res.add("baseline check", ok(w.run("baseline", "check", rid)))
+        boot = ok(w.run("bootstrap", rid, "--copy-env"))
+        res.add("bootstrap --copy-env (re-run; snapshots + env walk)", boot)
+        if any("walk stopped early" in x for x in boot.json()["warnings"]):
+            res.notes["bootstrap --copy-env (re-run; snapshots + env walk)"] = (
+                "copy_env walk stopped early (limit)"
+            )
+        # A pushed branch tip: the remove then checks reachability against ~800 mirror refs.
+        (wt / "bench-note.txt").write_text(f"{n}\n")
+        w._git(wt, "add", "bench-note.txt")
+        w._git(wt, "commit", "-q", "-m", f"bench {n}")
+        w._git(wt, "push", "-q", str(w.remote), f"HEAD:refs/heads/{rec['branch']}")
+        res.add(
+            "remove --yes (350k-entry tree, pushed branch tip)", ok(w.run("remove", rid, "--yes"))
+        )
+
+    _throwaways(w, res, repeats)
+    _many_records(base, res)
+    if os.environ.get("BENCH_STRESS", "1") == "1":
+        _stress(w, res, ignored_files)
+    res.add("reconcile (big clone, no live records)", ok(w.run("reconcile")))
+
+
+def _plain(wall: float) -> Timed:
+    return Timed(["git"], 0, wall, 0, "", "")
+
+
+def _throwaways(w: World, res: Results, repeats: int) -> None:
+    ref = w.git("rev-parse", "refs/remotes/origin/main")
+    want = w.base / "extract-list"
+    want.write_text("\0".join(f"assets/blob{k}.bin" for k in range(w.dims.large_blobs)))
+    dest = w.base / "extracted"
+    dest.mkdir()
+    for source in ("remote", "local"):
+        for _ in range(repeats):
+            c = ok(
+                w.run("create", "--throwaway", "--repo", REPO, "--ref", ref, "--source", source)
+                if source == "local"
+                else w.run(
+                    "create",
+                    "--throwaway",
+                    "--repo",
+                    REPO,
+                    "--ref",
+                    ref,
+                    "--source",
+                    source,
+                    "--depth",
+                    "50",
+                )
+            )
+            label = "remote, depth 50" if source == "remote" else "local source (full history)"
+            res.add(f"create --throwaway, {label}", c)
+            rid = record_of(c)["id"]
+            if source == "remote":
+                res.add(
+                    "extract 3 x 16 MiB files from a throwaway",
+                    ok(w.run("extract", rid, "--files-from", str(want), "--dest", str(dest))),
+                )
+                shutil.rmtree(dest)
+                dest.mkdir()
+            res.add(f"remove throwaway ({label})", ok(w.run("remove", rid, "--yes")))
+
+
+def _many_records(base: Path, res: Results) -> None:
+    """``list``/``prune``/``reconcile`` over many records and a huge ``worktrees/`` directory."""
+    small = base / "small"
+    sw = World(small, fx.Dims(2, 2, 2, 5, 60, 2, 5, 3, 1, 1024))
+    sw.build(stale_at=60, copy_env_files=0)
+    sw.top["lease_wait"] = "30s"
+    sha = sw.git("rev-parse", "HEAD")
+    many = int(os.environ.get("BENCH_RECORDS", "300"))
+    for _ in range(many):
+        ok(sw.run("create", "--throwaway", "--repo", REPO, "--ref", sha, "--source", "local"))
+    r = res.add(f"list ({many} throwaway records)", ok(sw.run("list")))
+    assert len(r.json()["records"]) == many
+    res.add(f"list --all ({many} records)", ok(sw.run("list", "--all")))
+    res.add(f"reconcile ({many} live throwaways)", ok(sw.run("reconcile")))
+    time.sleep(2)
+    res.add(
+        f"prune --throwaways ({many}, serial)",
+        ok(sw.run("prune", "--throwaways", "--older-than", "1s")),
+    )
+    admin = sw.clone / ".git" / "worktrees"
+    admin.mkdir(exist_ok=True)
+    for count in (4_000, 6_000):
+        for k in range(count):
+            e = admin / f"fake{k:05d}"
+            e.mkdir(exist_ok=True)
+            (e / "gitdir").write_text(f"/nonexistent/bench/{k}/.git\n")
+        res.add(
+            f"reconcile (clone with {count} fake admin entries)", sw.run("reconcile", "--dry-run")
+        )
+    shutil.rmtree(small)
+
+
+def _stress(w: World, res: Results, ignored_files: int) -> None:
+    """Scale the nested scan toward and past ``remove.nested_scan_limit`` (2,000,000 entries)."""
+    c = ok(w.run("create", "--repo", REPO, "--no-bootstrap"))
+    rec = record_of(c)
+    rid, wt = rec["id"], Path(rec["path"])
+    entries = 215_000
+    for target in (1_000_000, 2_200_000):
+        need = target - entries
+        per_dir = 1000
+        start = entries
+        t = time.monotonic()
+        for k in range(start, target, per_dir):
+            leaf = wt / "node_modules" / f"s{k // per_dir:05d}"
+            leaf.mkdir(parents=True, exist_ok=True)
+            for f in range(per_dir):
+                os.close(os.open(leaf / f"e{f:04d}", os.O_CREAT | os.O_WRONLY))
+        entries = target
+        print(f"stress populate to {target}: {time.monotonic() - t:.1f}s (+{need})", flush=True)
+        label = f"~{target / 1e6:.1f}M entries"
+        run = res.add(f"status, {label}", w.run("status", rid))
+        res.notes[f"status, {label}"] = f"exit {run.code}"
+        res.add(f"remove --dry-run, {label}", w.run("remove", rid, "--dry-run"))
+    res.add("remove --yes --force, ~2.2M entries", w.run("remove", rid, "--yes", "--force"))
