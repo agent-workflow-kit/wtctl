@@ -56,8 +56,14 @@ def walk_args(state: Any, record: dict[str, Any], **extra: object) -> dict[str, 
     }
 
 
-def run(op: str, args: dict[str, Any], budget: fsafe_child.Budget | None = None) -> Any:
-    """Run ``op`` under the walk deadline (``RUNNER`` replaces the child in tests)."""
+def run(
+    op: str,
+    args: dict[str, Any],
+    budget: fsafe_child.Budget | None = None,
+    timeout: float = fsafe_child.WALK_DEADLINE,
+) -> Any:
+    """Run ``op`` under the walk deadline, or ``timeout`` (``RUNNER`` replaces the child in
+    tests)."""
     if RUNNER is not None:
         return RUNNER(op, args)
-    return fsafe_child.run_op(op, args, budget=budget)
+    return fsafe_child.run_op(op, args, budget=budget, timeout=timeout)

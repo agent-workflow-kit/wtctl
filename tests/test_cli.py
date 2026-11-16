@@ -275,11 +275,12 @@ def test_human_only_flag_beats_human_only_command_gate(
 
 
 def test_human_only_flags_pass_with_human_actor(capsys: pytest.CaptureFixture[str]) -> None:
+    # past the flag gate: the handler runs and finds no such record
     r = run_cli(capsys, "--json", "--actor", "human:a", "remove", SID, "--force")
-    assert r.code == 1
-    assert r.json()["error"]["code"] == "internal"
+    assert r.code == 10
+    assert r.json()["error"]["code"] == "not_found"
     r = run_cli(capsys, "--json", "remove", SID, "--force", tty=True)
-    assert r.code == 1
+    assert r.code == 10
 
 
 # --- handlers, results and errors -------------------------------------------------------------

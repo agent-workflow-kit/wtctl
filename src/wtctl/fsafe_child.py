@@ -98,8 +98,12 @@ def op_walk(args: dict[str, object]) -> dict[str, object]:
         raise fsafe.FsafeError("bad_request", "limit must be an integer")
     stop_at_git = bool(args.get("stop_at_git", False))
     dirs_only = bool(args.get("dirs_only", False))
+    list_limit = args.get("list_limit", 0)  # entries returned by path (the confirmation shows them)
+    if not isinstance(list_limit, int):
+        raise fsafe.FsafeError("bad_request", "list_limit must be an integer")
     anchor, root, root_path = _open_root(args, parent=False)
     count = 0
+    listed: list[list[str]] = []
     mounts: list[list[str]] = []
     special: list[list[object]] = []
     unreadable: list[list[object]] = []  # entries the walk could not read: an incomplete walk
@@ -113,6 +117,8 @@ def op_walk(args: dict[str, object]) -> dict[str, object]:
             anchor, root, limit=limit, descend=descend, dirs_only=dirs_only, root_path=root_path
         ):
             count += 1
+            if len(listed) < list_limit:
+                listed.append(list(e.path))
             if fsafe.is_dotgit(e.path[-1]):
                 dotgit.append(list(e.path))
             if e.kind == "mount":
@@ -130,6 +136,7 @@ def op_walk(args: dict[str, object]) -> dict[str, object]:
         "special": special,
         "unreadable": unreadable,
         "dotgit": dotgit,
+        "entries": listed,
     }
 
 
@@ -138,17 +145,133 @@ def op_delete_tree(args: dict[str, object]) -> dict[str, object]:
     name = args.get("name")
     if not isinstance(name, str):
         raise fsafe.FsafeError("bad_request", "name must be a string")
+    last = args.get("last")
+    if last is not None and not isinstance(last, str):
+        raise fsafe.FsafeError("bad_request", "last must be a string")
     root_identity = _identity(args.get("root_identity"))
     anchor, parent, parent_path = _open_root(args, parent=True)
     try:
         res = fsafe.delete_tree(
-            anchor, parent, name, expected=root_identity, parent_path=parent_path
+            anchor, parent, name, expected=root_identity, parent_path=parent_path, last=last
         )
     finally:
         os.close(parent)
         anchor.close()
     return {
         "removed": res.removed,
+        "remaining_total": res.remaining_total,
+        "remaining": [
+            {"path": list(r.path), "reason": r.reason, "errno": r.errno} for r in res.remaining
+        ],
+    }
+
+
+ADMIN_READ = 4096  # bytes of an admin entry's ``gitdir`` file kept
+
+
+def _admin_entry(
+    anchor: fsafe.Anchor, parent: int, name: str
+) -> tuple[fsafe.Identity, bool, str | None] | None:
+    """``(identity, locked, gitdir text)`` of the admin entry ``name``, opened no-follow from the
+    ``worktrees`` directory fd and verified against the anchor's device and mount; None when it
+    does not exist."""
+    try:
+        anchor.fs.lstat_at(parent, name)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise fsafe.FsafeError("io", f"{name}: {exc.strerror}", errno_=exc.errno) from exc
+    fd = fsafe.open_dir(anchor, parent, name)
+    try:
+        ident = fsafe.identity_of(fd, anchor.fs)
+        try:
+            anchor.fs.lstat_at(fd, "locked")
+            locked = True
+        except FileNotFoundError:
+            locked = False
+        gitdir: str | None = None
+        try:
+            gfd = fsafe.open_file(anchor, fd, "gitdir")
+        except fsafe.FsafeError:
+            gfd = -1
+        if gfd >= 0:
+            try:
+                gitdir = os.read(gfd, ADMIN_READ).decode("utf-8", "surrogateescape")
+            finally:
+                os.close(gfd)
+        return ident, locked, gitdir
+    finally:
+        os.close(fd)
+
+
+def _gitdir_value(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return text[:-1] if text.endswith("\n") else text
+
+
+def op_admin_check(args: dict[str, object]) -> dict[str, object]:
+    """The state of the admin entry ``name`` below the ``worktrees`` directory (the chain), opened
+    from the common dir's recorded identity. Reports ``absent`` or ``present`` with the entry's
+    identity, whether it has a ``locked`` entry and the value of its ``gitdir`` file."""
+    name = args.get("name")
+    if not isinstance(name, str):
+        raise fsafe.FsafeError("bad_request", "name must be a string")
+    spec = args.get("anchor")
+    if not isinstance(spec, dict):
+        raise fsafe.FsafeError("bad_request", "anchor must be an object")
+    try:
+        anchor, parent, _ = _open_root(args, parent=True)
+    except fsafe.FsafeError as exc:
+        if exc.kind != "missing":
+            raise
+        # an anchor that is gone is a mismatch (the open below raises); a missing `worktrees`
+        # directory below a good anchor is an absent entry
+        fsafe.open_anchor(
+            str(spec["path"]),
+            expected=_identity(spec.get("identity")),
+            precheck=bool(spec.get("precheck", True)),
+        ).close()
+        return {"state": "absent"}
+    try:
+        found = _admin_entry(anchor, parent, name)
+    finally:
+        os.close(parent)
+        anchor.close()
+    if found is None:
+        return {"state": "absent"}
+    ident, locked, gitdir = found
+    return {
+        "state": "present",
+        "identity": [ident.dev, ident.ino],
+        "locked": locked,
+        "gitdir": _gitdir_value(gitdir),
+    }
+
+
+def op_delete_admin(args: dict[str, object]) -> dict[str, object]:
+    """Delete the admin entry ``name`` of the ``worktrees`` directory (the chain) fd-based, but
+    only if its ``gitdir`` file names ``expect_gitdir``. Returns ``{"state": "absent" |
+    "foreign" | "deleted" | "partial", "remaining": [...]}``: a ``foreign`` entry (it names
+    another path) is left alone."""
+    name = args.get("name")
+    expect = args.get("expect_gitdir")
+    if not isinstance(name, str) or not isinstance(expect, str):
+        raise fsafe.FsafeError("bad_request", "name and expect_gitdir must be strings")
+    anchor, parent, parent_path = _open_root(args, parent=True)
+    try:
+        found = _admin_entry(anchor, parent, name)
+        if found is None:
+            return {"state": "absent", "remaining": [], "remaining_total": 0}
+        ident, _, gitdir = found
+        if _gitdir_value(gitdir) != expect:
+            return {"state": "foreign", "remaining": [], "remaining_total": 0}
+        res = fsafe.delete_tree(anchor, parent, name, expected=ident, parent_path=parent_path)
+    finally:
+        os.close(parent)
+        anchor.close()
+    return {
+        "state": "deleted" if res.complete else "partial",
         "remaining_total": res.remaining_total,
         "remaining": [
             {"path": list(r.path), "reason": r.reason, "errno": r.errno} for r in res.remaining
@@ -270,6 +393,8 @@ def op_baseline_claude(args: dict[str, object]) -> dict[str, object]:
 OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "walk": op_walk,
     "delete_tree": op_delete_tree,
+    "admin_check": op_admin_check,
+    "delete_admin": op_delete_admin,
     "dir_ids": op_dir_ids,
     "nested_scan": op_nested_scan,
     "baseline_git": op_baseline_git,

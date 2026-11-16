@@ -8,8 +8,8 @@ current identities are returned and the caller shows and re-records them. Everyt
 
 The cross-check ``git rev-parse --git-common-dir`` (hardened, explicit ``--git-dir``) is not run
 here: ``baseline check``, ``baseline accept`` and a bootstrap re-run verify the files only.
-``wtctl.removal_integrity.integrity_check`` adds it for ``status`` and ``remove``
-(TODO(#20): the baseline commands and a bootstrap re-run may call it too).
+``wtctl.removal_integrity.integrity_check`` adds it for ``status`` and ``remove``; the
+baseline commands and a bootstrap re-run read files only, by design.
 """
 
 from __future__ import annotations

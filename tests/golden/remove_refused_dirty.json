@@ -1,0 +1,65 @@
+{
+ "error": {
+  "code": "refused",
+  "message": "<id> has changes that would be lost",
+  "reason": "dirty",
+  "checks": {
+   "integrity": {
+    "status": "pass",
+    "details": []
+   },
+   "locked": {
+    "status": "pass",
+    "details": []
+   },
+   "baseline": {
+    "status": "pass",
+    "details": []
+   },
+   "in_use": {
+    "status": "pass",
+    "details": []
+   },
+   "held": {
+    "status": "pass",
+    "details": []
+   },
+   "fetch": {
+    "status": "pass",
+    "details": []
+   },
+   "tracked": {
+    "status": "pass",
+    "details": []
+   },
+   "untracked": {
+    "status": "fail",
+    "details": [
+     {
+      "path": "notes.txt"
+     }
+    ]
+   },
+   "ignored": {
+    "status": "pass",
+    "details": []
+   },
+   "nested_repos": {
+    "status": "pass",
+    "details": []
+   },
+   "stash": {
+    "status": "pass",
+    "details": []
+   },
+   "unpushed_head": {
+    "status": "pass",
+    "details": []
+   },
+   "unpushed_branches": {
+    "status": "pass",
+    "details": []
+   }
+  }
+ }
+}

@@ -828,6 +828,7 @@ def delete_tree(
     expected: Identity | None = None,
     owner_uid: int | None = None,
     parent_path: str | None = None,
+    last: str | None = None,
 ) -> DeleteResult:
     """Delete directory ``name`` of ``parent_fd`` and everything below it, fd-based.
 
@@ -838,6 +839,11 @@ def delete_tree(
     from ``expected`` (the recorded ``dir_id``), raises before anything is deleted or chmodded.
     ``parent_path`` (the absolute path of ``parent_fd``) enables skipping the anchor's recorded
     ``mounts_below`` by path, without opening them.
+
+    ``last`` names an entry of the root directory that is deleted after every other entry and
+    only if all of them went (``remove`` keeps a worktree's ``.git`` pointer until then, so a
+    half-deleted worktree still names its admin entry); it is otherwise left and reported
+    (reason ``kept``).
 
     ``hook(stage, path)`` is a test seam called after an entry was classified (``classified``)
     and after a directory was opened (``opened``).
@@ -882,11 +888,18 @@ def delete_tree(
     except BaseException:
         os.close(root)
         raise
+    if last is not None and last in names:
+        names.remove(last)
+        names.insert(0, last)  # entries are taken from the end of the list
     stack = [_Frame(root, names, name, parent_fd)]
     try:
         while stack:
             f = stack[-1]
             if f.names:
+                if len(stack) == 1 and last is not None and f.dirty and f.names == [last]:
+                    result.add(Remaining((last,), "kept"))
+                    f.names.clear()
+                    continue
                 _delete_entry(anchor, stack, f.names.pop(), result, owner, hook, is_mount)
                 continue
             stack.pop()

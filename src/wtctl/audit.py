@@ -542,6 +542,32 @@ class Journal:
             )
         return PreparedAudit(record, line)
 
+    def check_writable(self) -> None:
+        """Open ``audit.jsonl`` as :meth:`commit_audit` would (creating it) and run the checks a
+        write makes, without writing. A command that deletes something calls it next to
+        :meth:`prepare_audit`, before the change, so an unusable audit file refuses first.
+        Raises ``JournalIOError``."""
+        try:
+            dfd = self._open_dir()
+        except OSError as exc:
+            raise _io(f"cannot use {self.directory}: {exc.strerror}") from exc
+        try:
+            flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+            try:
+                fd = os.open(self.audit_path.name, flags | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+            except OSError as exc:
+                raise _io(
+                    f"cannot open {self.audit_path} (a symlink is refused): {exc.strerror}"
+                ) from exc
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
+                    raise _io(f"{self.audit_path} is not a plain regular file owned by this user")
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dfd)
+
     def commit_audit(self, prepared: PreparedAudit) -> dict[str, Any]:
         """Append a prepared audit record (fsynced) and return it."""
         self._append(self.audit_path, prepared.line, durable=True)
