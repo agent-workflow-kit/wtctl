@@ -245,6 +245,27 @@ def normalize_url(url: str) -> str | None:
     return f"{parsed.hostport}/{parsed.path}"
 
 
+def ssh_user_refused(url: str) -> bool:
+    """Whether ``url`` does not normalize only because of its SSH user part: it has a user part
+    (everything before the last ``@`` of the authority, or of the scp-like host part) and the
+    URL parses once that part is dropped. Used to say "not a plain user name" instead of a
+    misleading "does not point at host/o/r"; nothing of the URL is returned."""
+    if not isinstance(url, str) or normalize_url(url) is not None:
+        return False
+    m = _SCHEME_RE.fullmatch(url)
+    if m is not None:
+        if m.group(1).lower() != "ssh":
+            return False
+        authority, slash, path = m.group(2).partition("/")
+        if "@" not in authority:
+            return False
+        return normalize_url(f"ssh://{authority.rpartition('@')[2]}{slash}{path}") is not None
+    head, colon, path = url.partition(":")
+    if not colon or "/" in head or "@" not in head:
+        return False
+    return normalize_url(f"{head.rpartition('@')[2]}{colon}{path}") is not None
+
+
 def _lower_host(url: str) -> str:
     """Lowercase the scheme and host part only (path case is significant)."""
     if not isinstance(url, str) or len(url) > MAX_URL or not url.isascii():
@@ -364,6 +385,12 @@ def matches_repo(url: str, repo_id: str, *, clone_url: str | None = None) -> boo
 def render_clone_url(repo_id: str, *, template: str) -> str:
     """``hosts.<host>.clone_url`` rendered for ``repo_id``; it must normalize back to the id."""
     url = template.replace("{host}", repo_host(repo_id)).replace("{path}", repo_path(repo_id))
+    if ssh_user_refused(url):
+        raise WtctlError(
+            "remote_mismatch",
+            f"the clone URL template of host {repo_host(repo_id)} has an SSH user that is not a "
+            "plain user name (1-32 of A-Za-z0-9._-, not starting with - or .)",
+        )
     if normalize_url(url) != repo_id:
         raise WtctlError(
             "remote_mismatch",

@@ -319,6 +319,8 @@ def test_fetch_target(url: str, scheme: str, hostport: str | None) -> None:
         "ssh://a@b@forge.example/o/r",
         "ssh://user:hunter2@forge.example/o/r",  # a password is never passed on
         "@forge.example:o/r",
+        "git:pw@forge.example:o/r",  # a password in the scp-like form is never passed on
+        "git:x@y@forge.example:o/r",
         "ssh://@forge.example/o/r",
         "ssh://.dot@forge.example/o/r",
         "u%41@forge.example:o/r",

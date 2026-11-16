@@ -328,6 +328,8 @@ def verify_clone(
     except UnicodeDecodeError:
         raise NotAClone(f"remote {remote!r} has a URL that is not UTF-8") from None
     if not urls.matches_repo(raw, repo_id, clone_url=clone_url):
+        if urls.ssh_user_refused(raw):
+            raise NotAClone(f"remote {remote!r} has an SSH user that is not a plain user name")
         raise NotAClone(f"remote {remote!r} does not point at {repo_id}")
     stripped = urls.fetch_url(raw)
     if not urls.matches_repo(stripped, repo_id, clone_url=clone_url):
@@ -627,6 +629,10 @@ class Resolver:
             return local  # a plain path, never a file:// URL (hardened git rule)
         stripped = urls.fetch_url(raw)
         if urls.normalize_url(stripped) is None:
+            if urls.ssh_user_refused(raw):
+                raise WtctlError(
+                    "remote_mismatch", f"{what} has an SSH user that is not a plain user name"
+                )
             raise WtctlError("remote_mismatch", f"{what} is not an https, ssh or local path URL")
         return stripped
 

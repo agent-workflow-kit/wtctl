@@ -65,7 +65,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - forged history (spike E1a–f): replace refs, grafts, commit-graph, same-sha object substitution — all reported unpushed.
 - allowed filters: only drivers with a global `process`; planted repository values do not override; missing global definition stays blanked with a warning.
 - fetch outcome classification (spike F4): lock contention retried; 401/auth substrings → `auth_required`; exit 0 with `error:` → `fetch_failed` (`prune_incomplete`); timeouts → `cause: timeout`.
-- urls: normalization table (HTTPS, SSH, scp-like, ports, userinfo stripped, GitLab `.git`), repo id grammar rejects `.`/`..` segments, `remote_mismatch`.
+- urls: normalization table (HTTPS, SSH, scp-like, ports, https userinfo stripped, ssh user kept, GitLab `.git`), repo id grammar rejects `.`/`..` segments, `remote_mismatch`.
 - locate: config entry, configured-but-missing (exit 10), recorded clone, discovery (depth, symlinks not followed, cache re-verification, ambiguity 21), auto-clone and `clone` into a temp dir + rename under a per-repo lease, `clone_failed`/`auth_required`, SHA-256 repositories refused.
 - credentials: `token_env` then `token_command` (argv, timeout, never logged), URL-scoped header, `http.followRedirects=false`, SSH `BatchMode`.
 - mirror: creation and config (only wtctl's keys; rewritten when it differs), path keyed by a hash of the clone's common dir, treeless refresh, default branch from `ls-remote --symref` run in the mirror, pushed check (exists + ancestor + re-hash, protocols `none`, missing → unpushed), immunity to planted clone config.

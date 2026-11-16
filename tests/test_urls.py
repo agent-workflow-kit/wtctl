@@ -510,6 +510,31 @@ def test_render_clone_url_keeps_a_template_user() -> None:
         urls.render_clone_url(REPO, template="-oProxyCommand=x@{host}:{path}.git")
 
 
+def test_render_clone_url_names_a_refused_ssh_user() -> None:
+    with pytest.raises(WtctlError) as exc:
+        urls.render_clone_url(REPO, template="-oProxyCommand=x@{host}:{path}.git")
+    assert "SSH user" in exc.value.message and "ProxyCommand" not in exc.value.message
+    with pytest.raises(WtctlError) as exc:
+        urls.render_clone_url(REPO, template="https://evil.test/{path}.git")
+    assert "SSH user" not in exc.value.message
+
+
+@pytest.mark.parametrize(
+    ("url", "refused"),
+    [
+        ("-oProxyCommand=x@github.com:org/repo", True),
+        ("ssh://a@b@github.com/org/repo", True),
+        ("ssh://user:pw@github.com/org/repo", False),  # a password is dropped, not refused
+        ("git@github.com:org/repo", False),
+        ("-oProxyCommand=x@github.com", False),  # no path: not a user problem
+        ("https://u@github.com/org/repo", False),
+        ("/srv/git/r.git", False),
+    ],
+)
+def test_ssh_user_refused(url: str, refused: bool) -> None:
+    assert urls.ssh_user_refused(url) is refused
+
+
 @pytest.mark.parametrize(
     ("user", "ok"),
     [

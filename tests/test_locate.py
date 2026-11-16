@@ -189,6 +189,28 @@ def test_config_clone_with_a_wrong_remote_is_remote_mismatch(
     validate("wtctl/cli/error.json", r.json())
 
 
+def test_a_refused_ssh_user_is_named_not_a_wrong_repo(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine", "-oProxyCommand=x@example.test:org/repo")
+    w.repos[REPO] = {"clone": str(clone)}
+    r = w.cli(capsys, "locate", REPO)
+    err = r.json()["error"]
+    assert (r.code, err["code"]) == (12, "remote_mismatch")
+    assert "SSH user" in err["message"] and "does not point" not in err["message"]
+    assert "ProxyCommand" not in r.out + r.err
+
+
+def test_a_refused_ssh_user_in_clone_url_is_named(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    w.repos[REPO] = {"clone_url": "-oProxyCommand=x@example.test:org/repo"}
+    r = w.cli(capsys, "clone", REPO)
+    err = r.json()["error"]
+    assert (r.code, err["code"]) == (12, "remote_mismatch")
+    assert "SSH user" in err["message"] and "ProxyCommand" not in r.out + r.err
+
+
 def test_config_clone_without_a_remote_says_no_remote(
     w: World, capsys: pytest.CaptureFixture[str]
 ) -> None:

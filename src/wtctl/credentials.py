@@ -131,7 +131,9 @@ def fetch_target(url: str) -> FetchTarget:
     if not _URL_CHARS.fullmatch(url) or "\\" in url:
         raise ValueError("unsupported fetch URL (whitespace, control or non-ASCII character)")
     if "://" not in url:
-        _check_ssh_user(url.partition(":")[0])
+        # scp-like ``[user@]host:path``: the authority is everything before the first "/", so a
+        # password (``user:pw@host:o/r``) or a second "@" lands in the user part and is refused
+        _check_ssh_user(url.partition("/")[0])
         return FetchTarget("ssh", None)  # scp-like ``[user@]host:path``
     scheme, _, rest = url.partition("://")
     if scheme == "ssh":
