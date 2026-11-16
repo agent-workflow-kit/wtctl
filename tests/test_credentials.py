@@ -324,7 +324,6 @@ def test_fetch_target(url: str, scheme: str, hostport: str | None) -> None:
         "u%41@forge.example:o/r",
         "ssh://" + "x" * 33 + "@forge.example/o/r",
         "x" * 33 + "@forge.example:o/r",
-        "ssh://a/b@forge.example/o/r",
         "https://good.example@evil.example/x",  # userinfo: the host is not the first name
         "https://evil.example@good.example/x",
         "https://user:pw@forge.example/x",

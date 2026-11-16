@@ -1741,14 +1741,15 @@ def test_dry_run_clone_reports_the_user_bearing_url(w: World) -> None:
     assert res.fetch_url == "git@example.test:org/repo.git"
 
 
-def test_the_clone_config_keeps_the_ssh_user_after_a_cloned_local_source(
+def test_a_real_clone_whose_remote_carries_user_and_password_is_reported_user_only(
     w: World, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A fake ssh transport is not available; a local bare remote proves the round trip of the
-    # verified URL: a clone whose remote carries the user is verified, stored and reported with it.
+    # No real ssh runs here (hardened git forces its own ssh command); a real clone of a local
+    # bare remote whose URL is then pointed at an ssh URL proves the verify/store/report path.
     bare = w.bare()
-    clone = w.tmp / "wt" / "clones" / "example.test" / "org" / "repo"
+    clone = w.tmp / "mine"
     g(["clone", "-q", str(bare), str(clone)], w.tmp, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
     g(["config", "remote.origin.url", "ssh://git:pw@example.test/org/repo.git"], clone, w.home)
     r = w.cli(capsys, "locate", REPO)
     assert r.code == 0, r.out

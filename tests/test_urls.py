@@ -410,7 +410,7 @@ def test_the_template_error_never_echoes_the_template() -> None:
     assert "hunter2" not in exc.value.message and "evil.test" not in exc.value.message
 
 
-# -- the SSH user in the fetch URL (#63) ------------------------------------------------------------
+# -- the SSH user in the fetch URL (#63) -------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -503,7 +503,8 @@ def test_the_user_is_not_part_of_the_identity() -> None:
 
 def test_render_clone_url_keeps_a_template_user() -> None:
     assert (
-        urls.render_clone_url(REPO, template="git@{host}:{path}.git") == "git@github.com:org/repo.git"
+        urls.render_clone_url(REPO, template="git@{host}:{path}.git")
+        == "git@github.com:org/repo.git"
     )
     with pytest.raises(WtctlError):
         urls.render_clone_url(REPO, template="-oProxyCommand=x@{host}:{path}.git")

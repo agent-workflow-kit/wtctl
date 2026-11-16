@@ -101,7 +101,7 @@ def test_the_mirror_config_keeps_the_ssh_user(tmp_path: Path, private_home: Path
 
 def test_the_mirror_wants_a_config_with_the_ssh_user(w: World) -> None:
     m = w.mirror(url="git@h.example:o/r.git")
-    assert b"url = \"git@h.example:o/r.git\"" in m._wanted_config()
+    assert b'url = "git@h.example:o/r.git"' in m._wanted_config()
 
 
 @pytest.mark.parametrize(

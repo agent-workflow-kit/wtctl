@@ -22,7 +22,7 @@
     },
     "fetch_url": {
       "type": "string",
-      "description": "The clone fetch URL (interface: Clone resolution): the URL of repos.<id>.remote, userinfo stripped, normalized to the repo id, unchanged by ls-remote --get-url; stored with the clone and verified on every resolution. Push target of the clean checkout."
+      "description": "The clone fetch URL (interface: Clone resolution): the URL of repos.<id>.remote, fetch form (https userinfo stripped, a plain ssh user kept, any password dropped), normalized to the repo id, unchanged by ls-remote --get-url; stored with the clone and verified on every resolution. Push target of the clean checkout."
     },
     "default_branch": {
       "type": [
