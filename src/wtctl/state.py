@@ -18,7 +18,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -604,10 +604,20 @@ class State:
     ) -> Record:
         """Compare-and-set: move a live record from one of ``expected`` states to ``new``.
 
-        ``updates`` sets further columns in the same statement. A lost race raises ``busy``
-        (exit 12), or ``not_found`` (exit 10, with ``details``) when the record became a
-        tombstone or does not exist; nothing is changed then.
+        ``updates`` sets further columns in the same statement. ``baseline_items`` among them
+        (dicts with ``cls path key type sha256 anchor_id``) is not a column: it replaces the
+        record's baseline rows in the same transaction, so the rows and ``baseline_digest`` never
+        disagree. Two more non-columns share that transaction (``baseline accept`` writes the
+        record, its anchor and its clone's identity together or not at all): ``rerecord_anchor``
+        (``(path, dev_ino)``, as :meth:`rerecord_anchor`) and ``rebind_clone`` (``(repo,
+        common_dir, common_id)``: that repo's ``clones`` row gets the new ``common_id`` only when
+        its ``common_dir`` is the given one, so another clone's row is never touched). A lost
+        race raises ``busy`` (exit 12), or ``not_found`` (exit 10, with ``details``) when the
+        record became a tombstone or does not exist; nothing is changed.
         """
+        baseline_items: Sequence[Mapping[str, Any]] | None = updates.pop("baseline_items", None)
+        anchor: tuple[str, str] | None = updates.pop("rerecord_anchor", None)
+        clone: tuple[str, str, str] | None = updates.pop("rebind_clone", None)
         exp = [expected] if isinstance(expected, str) else list(expected)
         for s in exp:
             _check_state(s)
@@ -645,9 +655,49 @@ class State:
                     f"record {record_id} is {row[0]}, not {'/'.join(exp)}: "
                     "another command changed it first",
                 )
+            if baseline_items is not None:
+                self._write_baseline(c, record_id, baseline_items)
+            if anchor is not None:
+                self._write_anchor(c, *anchor)
+            if clone is not None:
+                self._rebind_clone(c, *clone)
         got = self.get_record(record_id)
         assert got is not None
         return got
+
+    # -- baseline (docs/interface.md, Baseline) --------------------------------------------
+
+    @staticmethod
+    def _write_baseline(
+        c: sqlite3.Connection, record_id: str, items: Sequence[Mapping[str, Any]]
+    ) -> None:
+        c.execute("DELETE FROM baseline_items WHERE record_id = ?", (record_id,))
+        c.executemany(
+            'INSERT INTO baseline_items(record_id, path, "key", kind, class, digest, anchor_id) '
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (record_id, i["path"], i["key"], i["type"], i["cls"], i["sha256"], i["anchor_id"])
+                for i in items
+            ],
+        )
+
+    def baseline_items(self, record_id: str) -> list[dict[str, Any]]:
+        """The recorded baseline rows as ``cls path key type sha256 anchor_id`` dicts."""
+        return [
+            {
+                "cls": r[0],
+                "path": r[1],
+                "key": r[2],
+                "type": r[3],
+                "sha256": r[4],
+                "anchor_id": r[5],
+            }
+            for r in self._conn.execute(
+                'SELECT class, path, "key", kind, digest, anchor_id FROM baseline_items '
+                'WHERE record_id = ? ORDER BY class, path, "key"',
+                (record_id,),
+            )
+        ]
 
     # -- bootstrap (docs/interface.md, Bootstrap) ------------------------------------------
 
@@ -859,6 +909,29 @@ class State:
             )
             row = c.execute("SELECT dev_ino FROM anchors WHERE path = ?", (path,)).fetchone()
         return str(row[0])
+
+    def rerecord_anchor(self, path: str, dev_ino: str) -> None:
+        """Replace an anchor's recorded identity: only a human ``baseline accept`` calls this."""
+        with self._txn() as c:
+            self._write_anchor(c, path, dev_ino)
+
+    def _write_anchor(self, c: sqlite3.Connection, path: str, dev_ino: str) -> None:
+        if not re.fullmatch(r"[0-9]+:[0-9]+", dev_ino):
+            raise ValueError(f"invalid anchor identity {dev_ino!r}")
+        c.execute(
+            "INSERT INTO anchors(path, dev_ino, recorded_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET dev_ino = excluded.dev_ino, "
+            "recorded_at = excluded.recorded_at",
+            (path, dev_ino, self._now()),
+        )
+
+    def _rebind_clone(
+        self, c: sqlite3.Connection, repo: str, common_dir: str, common_id: str
+    ) -> None:
+        c.execute(
+            "UPDATE clones SET common_id = ?, verified_at = ? WHERE repo = ? AND common_dir = ?",
+            (common_id, self._now(), repo, common_dir),
+        )
 
     # -- addressing -----------------------------------------------------------------------
 

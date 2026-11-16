@@ -156,9 +156,25 @@ def op_delete_tree(args: dict[str, object]) -> dict[str, object]:
     }
 
 
+def op_baseline_git(args: dict[str, object]) -> dict[str, object]:
+    """The ``git``-class repo-config baseline items (``wtctl.repobaseline``)."""
+    from wtctl import repobaseline
+
+    return repobaseline.op_baseline_git(args)
+
+
+def op_baseline_claude(args: dict[str, object]) -> dict[str, object]:
+    """The ``claude``-class repo-config baseline items (``wtctl.repobaseline``)."""
+    from wtctl import repobaseline
+
+    return repobaseline.op_baseline_claude(args)
+
+
 OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "walk": op_walk,
     "delete_tree": op_delete_tree,
+    "baseline_git": op_baseline_git,
+    "baseline_claude": op_baseline_claude,
 }
 
 

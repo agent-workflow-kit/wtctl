@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -118,9 +119,15 @@ def _extract(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-size", type=int, metavar="BYTES")
 
 
+def _digest_arg(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError("--expect-digest must be 64 lowercase hex digits")
+    return value
+
+
 def _baseline_accept(p: argparse.ArgumentParser) -> None:
     _target(p)
-    p.add_argument("--expect-digest", metavar="D")
+    p.add_argument("--expect-digest", metavar="D", type=_digest_arg)
 
 
 def _adopt(p: argparse.ArgumentParser) -> None:

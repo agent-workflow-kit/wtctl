@@ -6,7 +6,6 @@ failures. Nothing else needs editing to add one (see ``wtctl.registry.load_handl
 Handlers still to come:
 
 - TODO(#11): locate, clone
-- TODO(#17): baseline_check, baseline_accept
 - TODO(#18): adopt, forget
 - TODO(#19): status
 - TODO(#20): remove

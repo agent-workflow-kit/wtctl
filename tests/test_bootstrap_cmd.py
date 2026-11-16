@@ -39,9 +39,7 @@ def rerun(w: CW, capsys, rid: str, *argv: str, human: bool = True):  # noqa: ANN
 def good(r) -> dict:  # noqa: ANN001
     assert r.code == 0, (r.out, r.err)
     doc = r.json()
-    rec = dict(doc["record"])
-    rec["baseline_digest"] = rec["baseline_digest"] or "0" * 64  # TODO(#17)
-    validate("wtctl/cli/bootstrap.json", {**doc, "record": rec})
+    validate("wtctl/cli/bootstrap.json", doc)
     return doc
 
 

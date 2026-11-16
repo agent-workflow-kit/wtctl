@@ -1,7 +1,6 @@
 """``wtctl create``: a worktree (docs/interface.md, Create order).
 
 TODO(#21): ``create --throwaway`` (the throwaway create order) lives in its own issue.
-TODO(#17): the baseline (create order step 15) is a seam: ``baseline_digest`` stays null.
 TODO(#5): log ``create``, ``fetch``, ``hook`` and ``refused`` events (create is logged, not
 audited).
 """
@@ -15,7 +14,7 @@ import sqlite3
 import stat
 from typing import Any
 
-from .. import bootstrapper, fsafe, hooks, naming, worktrees
+from .. import baselinesvc, bootstrapper, fsafe, hooks, naming, repobaseline, worktrees
 from .. import labels as labelmod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
@@ -24,7 +23,16 @@ from ..hardgit import Git
 from ..locate import Resolver, describe_mount, identity_str
 from ..mirror import Mirror, Tips
 from ..packs import clone_has_commit, transfer_base
-from ..state import Conflict, Lease, Record, State, check_holder, clone_lease, state_path
+from ..state import (
+    Conflict,
+    Lease,
+    Record,
+    State,
+    check_holder,
+    clone_lease,
+    record_lease,
+    state_path,
+)
 from ..worktrees import SHA, AddSpec
 
 NAME_RE = naming.NAME_RE
@@ -136,6 +144,15 @@ class Reused(Exception):
         self.record = record
 
 
+class _WaitForCreator(Exception):
+    """A live creator holds the lease of a ``creating`` record this holder's retry collides with:
+    unwind (releasing the per-clone lease), wait for the record's lease, then plan again."""
+
+    def __init__(self, record_id: str) -> None:
+        super().__init__(record_id)
+        self.record_id = record_id
+
+
 def _within(path: str, parent: str) -> bool:
     return path == parent or path.startswith(parent.rstrip("/") + "/")
 
@@ -149,6 +166,7 @@ class Creator:
         self.dry = ctx.dry_run
         self.warnings: list[str] = []
         self.settings = self.config.repo(opts.repo)
+        self._waited: set[str] = set()  # creating records whose creator was already waited for
 
     # -- entry ---------------------------------------------------------------------------
 
@@ -165,13 +183,27 @@ class Creator:
         self.res = res
         self.warnings += res.warnings
         self.wgit = self._git_with_filters()
+        while True:
+            try:
+                with self.state.lease(
+                    clone_lease(res.clone_path), wait=self.config.lease_wait_s
+                ) as lease:
+                    return self._locked(resolver, lease)
+            except Reused as r:
+                return self._result_reused(r.record)
+            except _WaitForCreator as w:
+                self._wait_for_creator(w.record_id)  # without the per-clone lease; then replan
+
+    def _wait_for_creator(self, record_id: str) -> None:
+        """Wait for a creator's record lease to be released. A timeout is not an error here: the
+        record is looked at again and, if it is not ``active``, the documented refusal follows."""
+        self._waited.add(record_id)
         try:
-            with self.state.lease(
-                clone_lease(res.clone_path), wait=self.config.lease_wait_s
-            ) as lease:
-                return self._locked(resolver, lease)
-        except Reused as r:
-            return self._result_reused(r.record)
+            with self.state.lease(record_lease(record_id), wait=self.config.lease_wait_s):
+                pass
+        except WtctlError as exc:
+            if exc.code != "busy":
+                raise
 
     def _git_with_filters(self) -> Git:
         return with_filters(
@@ -269,9 +301,15 @@ class Creator:
 
     def _maybe_reuse(self, rec: Record | None) -> None:
         """The retry rule: an active record that lists this holder is returned unchanged."""
-        if rec is not None and self.o.holder and rec["state"] == "active":
-            if self.o.holder in rec["holders"]:
-                raise Reused(self.state.get_record(rec["id"]) or rec)
+        if rec is None or not self.o.holder or self.o.holder not in rec["holders"]:
+            return
+        if rec["state"] == "creating" and not self.dry and rec["id"] not in self._waited:
+            # a live creator holds the record's lease for the whole `creating` window (the
+            # baseline step makes it long enough for a concurrent retry): leave, without the
+            # per-clone lease, wait for it, and plan again. Not in a dry run (it takes no lease).
+            raise _WaitForCreator(rec["id"])
+        if rec["state"] == "active":
+            raise Reused(self.state.get_record(rec["id"]) or rec)
 
     def _worktree_base_dir(self) -> str:
         return os.path.realpath(self.settings.worktree_root)
@@ -918,6 +956,32 @@ class Creator:
             raise kept from exc
         return outcome
 
+    def _baseline(self, record: Record, plan: Plan) -> repobaseline.Baseline:
+        """Create order step 15: the repo-config baseline, after bootstrap. One that could not be
+        computed in full (a bound or a deadline) is not recorded: the worktree exists, so the
+        record stays `creating` for a human, like any failure after git created the worktree."""
+        current = self.state.get_record(record["id"])
+        assert current is not None
+        try:
+            baseline = baselinesvc.record_current(self.config, current)
+        except BaseException as exc:
+            kept = self._kept(exc, record, plan)
+            if kept is exc:
+                raise
+            raise kept from exc
+        if baseline.has_detail():
+            bad = [i.path for i in baseline.items if i.detail][:5]
+            raise self._kept(
+                WtctlError(
+                    "create_failed",
+                    "the repo-config baseline could not be computed in full "
+                    f"(see remove.nested_scan_limit): {', '.join(bad)}",
+                ),
+                record,
+                plan,
+            )
+        return baseline
+
     def _finish(self, record: Record, plan: Plan, decision_ids: list[str], rlease: Lease) -> Result:
         o = self.o
         run_the_steps = bool(
@@ -926,9 +990,15 @@ class Creator:
         outcome: bootstrapper.Outcome | None = None
         if o.copy_env or run_the_steps:
             outcome = self._bootstrap(record, plan, rlease, run_the_steps)
-        # TODO(#17): record the baseline here (after bootstrap).
+        baseline = self._baseline(record, plan)
         try:
-            active = self.state.transition(record["id"], "creating", "active")
+            active = self.state.transition(
+                record["id"],
+                "creating",
+                "active",
+                baseline_digest=baseline.digest,
+                baseline_items=baselinesvc.item_rows(baseline),
+            )
         except WtctlError as exc:
             if exc.code != "busy":
                 raise

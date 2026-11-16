@@ -18,15 +18,8 @@ def w(tmp_path: Path, private_home: Path) -> CW:
 
 
 def schema_check(data: dict) -> None:
-    """Validate against schemas/cli/create.json.
-
-    TODO(#17): an active worktree needs a baseline digest, which only #17 records; until then
-    the check stands a placeholder in for the one field this issue cannot know.
-    """
-    rec = dict(data["record"])
-    if rec["state"] == "active" and rec["baseline_digest"] is None:
-        rec["baseline_digest"] = "0" * 64
-    validate("wtctl/cli/create.json", {**data, "record": rec})
+    """Validate against schemas/cli/create.json."""
+    validate("wtctl/cli/create.json", data)
 
 
 def ok(r) -> dict:  # noqa: ANN001
@@ -540,8 +533,6 @@ def test_post_create_runs_after_activation(w: CW, capsys) -> None:  # noqa: ANN0
     w.top["hooks"] = {"post-create": [{"cmd": hook}]}
     data = ok(w.create(capsys))
     payload = json.loads(out.read_text())
-    if payload["record"]["baseline_digest"] is None:  # TODO(#17)
-        payload["record"]["baseline_digest"] = "0" * 64
     validate("wtctl/hooks/post-create.json", payload)
     assert payload["record"]["id"] == data["record"]["id"]
     assert seen.read_text().strip() == "active"
