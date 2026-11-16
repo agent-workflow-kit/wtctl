@@ -161,6 +161,14 @@ def _trace(exc: BaseException) -> str:
 
 
 def _emit_result(result: Result, ctx: Context) -> None:
+    if result.stream is not None:
+        try:
+            result.stderr = result.stream(ctx.json, lambda text: _write(sys.stdout, text))
+        finally:
+            # A stream that fails midway may already have set its note (e.g. a skipped count).
+            if result.stderr and not ctx.quiet:
+                _write(sys.stderr, escape_text_lines(result.stderr.rstrip("\n")) + "\n")
+        return
     if ctx.json:
         _write(sys.stdout, render_json(result.data) + "\n")
     elif result.human:
