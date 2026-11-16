@@ -884,6 +884,41 @@ class State:
             cur = c.execute("DELETE FROM records WHERE id = ? AND state = ?", (record_id, expected))
             return cur.rowcount == 1
 
+    def clear_bootstrap_sets(self, record_id: str, *, expected: str) -> None:
+        """Empty the bootstrap-created sets of a record still in state ``expected`` (a
+        reclaimed create: nothing a half-finished bootstrap made is exempt from the checks)."""
+        _check_state(expected)
+        with self._txn() as c:
+            row = c.execute("SELECT state FROM records WHERE id = ?", (record_id,)).fetchone()
+            if row is None or row[0] != expected:
+                raise WtctlError("busy", f"record {record_id} is not {expected}")
+            for table in ("bootstrap_paths", "bootstrap_nested"):
+                c.execute(f"DELETE FROM {table} WHERE record_id = ?", (record_id,))
+
+    def expired_tombstones(self, cutoff: str) -> list[Record]:
+        """Tombstones whose ``removed_at`` is strictly before ``cutoff`` (a state timestamp)."""
+        rows = self._conn.execute(
+            f"SELECT * FROM records WHERE state IN {_TOMB} AND removed_at IS NOT NULL "
+            "AND removed_at < ? ORDER BY removed_at, id",
+            (cutoff,),
+        ).fetchall()
+        return [self._build(r) for r in rows]
+
+    def delete_tombstone(self, record_id: str, *, cutoff: str) -> bool:
+        """Delete a tombstone older than ``cutoff`` with its children; its id stays burned."""
+        with self._txn() as c:
+            cur = c.execute(
+                f"DELETE FROM records WHERE id = ? AND state IN {_TOMB} "
+                "AND removed_at IS NOT NULL AND removed_at < ?",
+                (record_id, cutoff),
+            )
+            return cur.rowcount == 1
+
+    def mirror_paths(self) -> set[str]:
+        """Every ``mirror_path`` some clone row names."""
+        rows = self._conn.execute("SELECT mirror_path FROM clones WHERE mirror_path IS NOT NULL")
+        return {r[0] for r in rows}
+
     def live_records_for_repo(self, repo: str) -> list[Record]:
         """Live records of one repo id, oldest first."""
         return [r for r in self.records() if r["repo"] == repo]

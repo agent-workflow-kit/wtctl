@@ -418,6 +418,204 @@ def op_extract_read(args: dict[str, object]) -> dict[str, object]:
     return extraction.read_op(args)
 
 
+def _read_small(anchor: fsafe.Anchor, dir_fd: int, name: str, limit: int = ADMIN_READ) -> str | None:
+    """A small regular file of ``dir_fd`` (no-follow), or None when it is absent or not one."""
+    try:
+        fd = fsafe.open_file(anchor, dir_fd, name)
+    except fsafe.FsafeError:
+        return None
+    try:
+        return os.read(fd, limit).decode("utf-8", "surrogateescape")
+    finally:
+        os.close(fd)
+
+
+def _strip_nl(text: str | None) -> str | None:
+    return _gitdir_value(text)
+
+
+def _refs_hold_files(anchor: fsafe.Anchor, entry_fd: int) -> bool:
+    """Whether ``refs/`` of an admin entry holds anything but directories (per-worktree refs).
+    Anything unreadable, over the limit or not a plain directory counts as holding some."""
+    try:
+        anchor.fs.lstat_at(entry_fd, "refs")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        rfd = fsafe.open_dir(anchor, entry_fd, "refs")
+    except fsafe.FsafeError:
+        return True
+    try:
+        for e in fsafe.walk_tree(anchor, rfd, limit=10_000):
+            if e.kind != "dir":
+                return True
+    except fsafe.FsafeError:
+        return True
+    finally:
+        os.close(rfd)
+    return False
+
+
+def op_admin_inspect(args: dict[str, object]) -> dict[str, object]:
+    """What reconcile must know of the admin entry ``name`` before deleting it: whether it has a
+    ``locked`` entry, a ``modules`` entry or files below ``refs``, and the text of ``gitdir`` and
+    ``commondir``. Opened from the recorded common dir, no-follow, owned by the invoking user."""
+    name = args.get("name")
+    if not isinstance(name, str):
+        raise fsafe.FsafeError("bad_request", "name must be a string")
+    anchor, parent, _ = _open_root(args, parent=True)
+    try:
+        try:
+            anchor.fs.lstat_at(parent, name)
+        except FileNotFoundError:
+            return {"state": "absent"}
+        fd = fsafe.open_dir(anchor, parent, name, owner_uid=os.geteuid())
+        try:
+            def exists(entry: str) -> bool:
+                try:
+                    anchor.fs.lstat_at(fd, entry)
+                except FileNotFoundError:
+                    return False
+                return True
+
+            return {
+                "state": "present",
+                "locked": exists("locked"),
+                "has_modules": exists("modules"),
+                "refs_files": _refs_hold_files(anchor, fd),
+                "gitdir": _strip_nl(_read_small(anchor, fd, "gitdir")),
+                "commondir": _strip_nl(_read_small(anchor, fd, "commondir")),
+            }
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent)
+        anchor.close()
+
+
+SCAN_ENTRIES = 5000
+
+
+def op_admin_scan(args: dict[str, object]) -> dict[str, object]:
+    """The ``gitdir`` text of every entry of the ``worktrees`` directory (the chain), bounded."""
+    try:
+        anchor, parent, _ = _open_root(args, parent=False)
+    except fsafe.FsafeError as exc:
+        if exc.kind != "missing":
+            raise
+        spec = args["anchor"]
+        assert isinstance(spec, dict)
+        fsafe.open_anchor(
+            str(spec["path"]),
+            expected=_identity(spec.get("identity")),
+            precheck=bool(spec.get("precheck", True)),
+        ).close()
+        return {"entries": [], "complete": True}
+    entries: list[list[str | None]] = []
+    complete = True
+    try:
+        with os.scandir(parent) as it:
+            for e in it:
+                if len(entries) >= SCAN_ENTRIES:
+                    complete = False
+                    break
+                text: str | None = None
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        efd = fsafe.open_dir(anchor, parent, e.name)
+                        try:
+                            text = _strip_nl(_read_small(anchor, efd, "gitdir"))
+                        finally:
+                            os.close(efd)
+                except (fsafe.FsafeError, OSError):
+                    complete = False
+                entries.append([e.name, text])
+    finally:
+        os.close(parent)
+        anchor.close()
+    return {"entries": entries, "complete": complete}
+
+
+def op_repair_pointers(args: dict[str, object]) -> dict[str, object]:
+    """Rewrite the two pointers of a worktree: ``<path>/.git`` and ``<admin>/gitdir``.
+
+    ``anchor``/``chain``/``root_identity`` reach the worktree directory (its recorded ``dir_id``);
+    ``common`` (path, identity) and ``admin`` (the entry name) reach the admin entry through a
+    no-follow chain owned by the invoking user. ``<path>/.git`` must be missing or a regular file
+    naming exactly ``admin_dir``; anything else is refused and nothing is written. With
+    ``write`` false nothing is written either (a dry run). Both files are replaced atomically
+    relative to their directory fds and nothing is ever written anywhere else.
+    """
+    name, path, admin_dir = args.get("admin"), args.get("path"), args.get("admin_dir")
+    common = args.get("common")
+    if not (
+        isinstance(name, str)
+        and isinstance(path, str)
+        and isinstance(admin_dir, str)
+        and isinstance(common, dict)
+    ):
+        raise fsafe.FsafeError("bad_request", "admin, path, admin_dir and common are required")
+    uid = os.geteuid()
+    want_dotgit = f"gitdir: {admin_dir}\n".encode()
+    want_gitdir = f"{path}/.git\n".encode()
+    wanchor, wfd, _ = _open_root(args, parent=False)
+    try:
+        canchor = fsafe.open_anchor(
+            str(common["path"]), expected=_identity(common.get("identity")), precheck=True
+        )
+        try:
+            afd = fsafe.open_chain(
+                canchor, canchor.fd, ["worktrees", name], owner_uid=uid, start_path=canchor.path
+            )
+            try:
+                return _repair(wanchor, wfd, canchor, afd, want_dotgit, want_gitdir,
+                               admin_dir, bool(args.get("write", True)))  # fmt: skip
+            finally:
+                os.close(afd)
+        finally:
+            canchor.close()
+    finally:
+        os.close(wfd)
+        wanchor.close()
+
+
+def _repair(
+    wanchor: fsafe.Anchor,
+    wfd: int,
+    canchor: fsafe.Anchor,
+    afd: int,
+    want_dotgit: bytes,
+    want_gitdir: bytes,
+    admin_dir: str,
+    write: bool,
+) -> dict[str, object]:
+    try:
+        st = wanchor.fs.lstat_at(wfd, ".git")
+    except FileNotFoundError:
+        have_dotgit: bytes | None = None
+    else:
+        if fsafe.kind_of_mode(st.mode) != "file":
+            raise fsafe.FsafeError("not_regular", ".git is not a regular file", path=".git")
+        text = _read_small(wanchor, wfd, ".git")
+        if text is None or _strip_nl(text) != f"gitdir: {admin_dir}":
+            raise fsafe.FsafeError("identity", ".git names another git directory", path=".git")
+        have_dotgit = text.encode("utf-8", "surrogateescape")
+    have_gitdir = _read_small(canchor, afd, "gitdir")
+    wrote: list[str] = []
+    if have_dotgit != want_dotgit:
+        if write:
+            fsafe.write_file_atomic(wfd, ".git", want_dotgit)
+        wrote.append(".git")
+    if have_gitdir is None or have_gitdir.encode("utf-8", "surrogateescape") != want_gitdir:
+        if write:
+            fsafe.write_file_atomic(afd, "gitdir", want_gitdir)
+        wrote.append("gitdir")
+    return {"state": "written" if write else "would_write", "wrote": wrote}
+
+
+
 OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "extract_read": op_extract_read,
     "walk": op_walk,
@@ -425,6 +623,9 @@ OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "admin_check": op_admin_check,
     "delete_admin": op_delete_admin,
     "entry_state": op_entry_state,
+    "admin_inspect": op_admin_inspect,
+    "admin_scan": op_admin_scan,
+    "repair_pointers": op_repair_pointers,
     "dir_ids": op_dir_ids,
     "nested_scan": op_nested_scan,
     "baseline_git": op_baseline_git,
