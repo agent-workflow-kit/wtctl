@@ -279,6 +279,28 @@ def op_delete_admin(args: dict[str, object]) -> dict[str, object]:
     }
 
 
+def op_entry_state(args: dict[str, object]) -> dict[str, object]:
+    """Whether ``name`` exists below the chain, opened from the anchor's recorded identity:
+    ``{"state": "absent"}`` or ``{"state": "present", "kind": ...}`` (never followed, never
+    opened). A missing or changed anchor or chain is the usual error, not "absent"."""
+    name = args.get("name")
+    if not isinstance(name, str):
+        raise fsafe.FsafeError("bad_request", "name must be a string")
+    fsafe.check_component(name)
+    anchor, parent, _ = _open_root(args, parent=True)
+    try:
+        try:
+            st = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"state": "absent"}
+        except OSError as exc:
+            raise fsafe.FsafeError("io", f"{name}: {exc.strerror}") from exc
+    finally:
+        os.close(parent)
+        anchor.close()
+    return {"state": "present", "kind": fsafe.kind_of_mode(st.st_mode)}
+
+
 def op_dir_ids(args: dict[str, object]) -> dict[str, object]:
     """``(st_dev, st_ino)`` of the walk root and every directory below it, as a flat list
     ``[dev, ino, dev, ino, ...]`` (the in-use detection matches process cwds against them).
@@ -395,6 +417,7 @@ OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "delete_tree": op_delete_tree,
     "admin_check": op_admin_check,
     "delete_admin": op_delete_admin,
+    "entry_state": op_entry_state,
     "dir_ids": op_dir_ids,
     "nested_scan": op_nested_scan,
     "baseline_git": op_baseline_git,

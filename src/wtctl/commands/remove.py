@@ -1,17 +1,17 @@
 """``wtctl remove <id|path>`` (docs/interface.md, remove).
 
 ``--dry-run`` prints the ``status`` object plus ``dry_run: true`` and exits 0 whatever it found.
-A worktree is removed by ``wtctl.remover`` (Remove order, Partial records).
-
-TODO(#21): removing a throwaway (Throwaway removal) is its own issue.
+A worktree is removed by ``wtctl.remover`` (Remove order, Partial records), a throwaway by
+``wtctl.throwaway_remove`` (Throwaway removal).
 """
 
 from __future__ import annotations
 
 from .. import remover
 from ..context import Context, Result
-from ..errors import UsageError, WtctlError
+from ..errors import UsageError
 from ..state import check_holder
+from ..throwaway_remove import RemoveOptions, ThrowawayRemover
 from . import status
 
 
@@ -28,5 +28,6 @@ def run(ctx: Context) -> Result:
     if record["object_type"] == "throwaway":
         if a.merged_head or a.holder or a.force or a.keep_branch:
             raise UsageError("--merged-head, --holder, --force and --keep-branch are for worktrees")
-        raise WtctlError("internal", "removing a throwaway is not implemented yet (see #21)")
+        throwaway = RemoveOptions(opts.hook_flags, opts.override_escalation)
+        return ThrowawayRemover(ctx, record["id"], throwaway).run()
     return remover.Remover(ctx, opts, record["id"]).run()

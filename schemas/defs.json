@@ -285,9 +285,10 @@
             "common_dir",
             "worktree_dir",
             "worktree_root",
+            "throwaway_root",
             "hooks_path"
           ],
-          "description": "common_dir: the clone's common dir (common_id, also in the clone's row); worktree_dir: the worktree directory (dir_id); worktree_root: an owned worktree's root (base_dir, its identity in the anchors table); hooks_path: a core.hooksPath directory outside the common dir (the identity stored in its baseline item)."
+          "description": "common_dir: the clone's common dir (common_id, also in the clone's row); worktree_dir: the worktree directory (dir_id); worktree_root: an owned worktree's root (base_dir, its identity in the anchors table); throwaway_root: the throwaway root (create --throwaway, its identity in the anchors table); hooks_path: a core.hooksPath directory outside the common dir (the identity stored in its baseline item)."
         },
         "path": {
           "$ref": "#/$defs/abs_path"

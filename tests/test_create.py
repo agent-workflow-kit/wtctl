@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.createlib import CW, REPO, script
+from tests.createlib import CW, script
 from tests.schemacheck import validate
 from tests.vectorlib import plain_git
 
@@ -626,11 +626,6 @@ def test_bad_hook_flag(w: CW, capsys) -> None:  # noqa: ANN001
 def test_bad_repo_id(w: CW, capsys) -> None:  # noqa: ANN001
     r = w.cli(capsys, "create", "--repo", "../x")
     assert r.code == 2
-
-
-def test_throwaway_is_not_implemented_here(w: CW, capsys) -> None:  # noqa: ANN001
-    r = w.cli(capsys, "create", "--throwaway", "--repo", REPO, "--ref", "a" * 40)
-    assert r.code == 1 and "#21" in r.json()["error"]["message"]
 
 
 def test_unknown_repo_is_not_found(w: CW, capsys) -> None:  # noqa: ANN001

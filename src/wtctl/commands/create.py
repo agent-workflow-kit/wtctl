@@ -1,6 +1,6 @@
 """``wtctl create``: a worktree (docs/interface.md, Create order).
 
-TODO(#21): ``create --throwaway`` (the throwaway create order) lives in its own issue.
+``create --throwaway`` is ``wtctl.throwaway`` (Throwaway create order).
 TODO(#5): log ``create``, ``fetch``, ``hook`` and ``refused`` events (create is logged, not
 audited).
 """
@@ -1098,7 +1098,9 @@ class Creator:
 
 def run(ctx: Context) -> Result:
     if ctx.args.throwaway:
-        raise WtctlError("internal", "`wtctl create --throwaway` is not implemented yet (see #21)")
+        from .. import throwaway  # noqa: PLC0415 - throwaway imports record helpers from here
+
+        return throwaway.run(ctx)
     opts = parse_options(ctx)
     return Creator(ctx, opts).run()
 

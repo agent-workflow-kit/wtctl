@@ -755,11 +755,38 @@ def thrown(w: World) -> Path:
     return w.tmp / "throw"
 
 
+def noop() -> None:
+    return None
+
+
+def prepare(w: World) -> Path:
+    """What the throwaway create order does before the fill: a private directory and
+    ``init --template=`` (the fill itself no longer initializes anything)."""
+    t = thrown(w)
+    if not t.exists():
+        t.mkdir(mode=0o700)
+        r = plain_git(["init", "-q", "--template=", "--", str(t)], cwd=w.tmp, home=w.home)
+        assert r.returncode == 0, r.stderr
+    return t
+
+
+def unfilled(w: World) -> bool:
+    """Nothing was checked out: the prepared directory still holds only its repository."""
+    t = thrown(w)
+    return os.listdir(t) == [".git"] and not (t / ".git" / "index").exists()
+
+
 def fill(w: World, repo: Path, sha: str, **kw) -> Path:  # noqa: ANN003
     git = Git(w.gateway, GIT, str(w.home))
-    t = thrown(w)
+    t = prepare(w)
     packs.fill_local_throwaway(
-        git, w.cfg, clone_dir=str(repo / ".git"), throwaway=str(t), sha=sha, **kw
+        git,
+        w.cfg,
+        clone_dir=str(repo / ".git"),
+        throwaway=str(t),
+        sha=sha,
+        verify=kw.pop("verify", noop),
+        **kw,
     )
     return t
 
@@ -796,7 +823,7 @@ def test_local_other_depths_are_a_usage_error(w: World, depth: int) -> None:
     repo, shas = local_repo(w)
     with pytest.raises(ValueError):
         fill(w, repo, shas[0], depth=depth)
-    assert not thrown(w).exists()
+    assert unfilled(w)
 
 
 def test_local_truncated_list_is_never_packed(w: World) -> None:
@@ -813,7 +840,7 @@ def test_local_truncated_list_is_never_packed(w: World) -> None:
         fill(w2, repo, shas[2])
     assert e.value.code == "create_failed"
     assert not any("pack-objects" in c[0] for c in rec.calls)
-    assert not thrown(w).exists() and tmp_entries() == []
+    assert unfilled(w) and tmp_entries() == []
 
 
 def test_local_runs_every_clone_command_with_protocols_none(w: World) -> None:
@@ -846,24 +873,30 @@ def test_local_planted_promisor_leaves_no_marker(w: World) -> None:
     assert not (markers / "hit").exists()
 
 
-def test_local_refuses_a_non_empty_throwaway_directory(w: World) -> None:
+def test_local_verify_runs_before_every_write_and_stops_the_fill(w: World) -> None:
     repo, shas = local_repo(w)
-    t = thrown(w)
-    t.mkdir()
-    (t / "keep").write_text("x")
-    with pytest.raises(WtctlError):
-        fill(w, repo, shas[0])
-    assert (t / "keep").read_text() == "x"
+    for stop_at in (1, 2, 3, 4, 5):
+        calls: list[int] = []
 
+        def verify(stop_at: int = stop_at, calls: list[int] = calls) -> None:
+            calls.append(1)
+            if len(calls) == stop_at:
+                raise WtctlError("create_failed", "the directory was replaced")
 
-def test_local_refuses_a_symlink_as_the_throwaway(w: World) -> None:
-    repo, shas = local_repo(w)
-    real = w.tmp / "real"
-    real.mkdir()
-    thrown(w).symlink_to(real)
-    with pytest.raises(WtctlError):
-        fill(w, repo, shas[0])
-    assert os.listdir(real) == []
+        t = thrown(w)
+        if t.exists():
+            shutil.rmtree(t)
+        with pytest.raises(WtctlError, match="replaced"):
+            fill(w, repo, shas[2], depth=1, verify=verify)
+        assert len(calls) == stop_at and (t / "f2.txt").exists() is (stop_at == 5)
+    ok: list[int] = []
+    shutil.rmtree(thrown(w))
+    fill(w, repo, shas[2], depth=1, verify=lambda: ok.append(1))
+    # before the shallow file, the index, the head ref, the work tree, and at the end
+    assert len(ok) == 5
+    shutil.rmtree(thrown(w))
+    fill(w, repo, shas[2], verify=lambda: ok.append(1))
+    assert len(ok) == 10
 
 
 @pytest.mark.parametrize("sha", ["", "abc", "--x", "1" * 40])
@@ -871,7 +904,7 @@ def test_local_bad_or_unknown_commit(w: World, sha: str) -> None:
     repo, _ = local_repo(w)
     with pytest.raises((ValueError, WtctlError)):
         fill(w, repo, sha)
-    assert not thrown(w).exists()
+    assert unfilled(w)
 
 
 def test_local_blob_is_not_a_commit(w: World) -> None:
@@ -1264,16 +1297,53 @@ def test_local_full_history_of_a_shallow_source_is_refused_early(w: World) -> No
     rec = Recorder()
     w2 = World(w.tmp, w.home, gateway=rec.gateway())
     git = Git(w2.gateway, GIT, str(w.home))
+    prepare(w)
     with pytest.raises(WtctlError, match="shallow") as e:
         packs.fill_local_throwaway(
-            git, w.cfg, clone_dir=str(shallow / ".git"), throwaway=str(thrown(w)), sha=tip
+            git,
+            w.cfg,
+            clone_dir=str(shallow / ".git"),
+            throwaway=str(thrown(w)),
+            sha=tip,
+            verify=noop,
         )
     assert e.value.code == "create_failed"
-    assert not any("pack-objects" in c[0] for c in rec.calls) and not thrown(w).exists()
+    assert not any("pack-objects" in c[0] for c in rec.calls) and unfilled(w)
     packs.fill_local_throwaway(
-        git, w.cfg, clone_dir=str(shallow / ".git"), throwaway=str(thrown(w)), sha=tip, depth=1
+        git,
+        w.cfg,
+        clone_dir=str(shallow / ".git"),
+        throwaway=str(thrown(w)),
+        sha=tip,
+        depth=1,
+        verify=noop,
     )
     assert (thrown(w) / ".git/shallow").read_text() == tip + "\n"
+
+
+def test_the_local_fill_needs_a_prepared_real_directory(w: World) -> None:
+    repo, shas = local_repo(w)
+    git = Git(w.gateway, GIT, str(w.home))
+    t = prepare(w)
+    calls: list[str] = []
+
+    def attempt(target: Path) -> None:
+        packs.fill_local_throwaway(
+            git, w.cfg, clone_dir=str(repo / ".git"), throwaway=str(target), sha=shas[2],
+            verify=lambda: calls.append("verify"),
+        )  # fmt: skip
+
+    link = w.tmp / "link"
+    link.symlink_to(t)
+    for bad in (link, w.tmp / "missing"):
+        with pytest.raises(WtctlError) as e:
+            attempt(bad)
+        assert e.value.code == "create_failed"
+    (t / "stray").write_text("x")  # not empty apart from the repository
+    with pytest.raises(WtctlError) as e:
+        attempt(t)
+    assert e.value.code == "create_failed" and calls == []
+    assert not (t / ".git" / "index").exists()
 
 
 def test_local_pack_over_the_limit_is_refused(w: World) -> None:
@@ -1281,7 +1351,7 @@ def test_local_pack_over_the_limit_is_refused(w: World) -> None:
     with pytest.raises(WtctlError) as e:
         fill(w, repo, shas[2], max_pack_bytes=100)
     assert e.value.code == "create_failed"
-    assert not thrown(w).exists() and tmp_entries() == []
+    assert unfilled(w) and tmp_entries() == []
 
 
 def test_local_unknown_commit_runs_nothing_against_the_clone_but_the_probe(w: World) -> None:
@@ -1313,9 +1383,10 @@ def test_local_read_tree_honors_filters_only_when_asked(w: World, honor: bool) -
     rec = Recorder()
     gw = Gateway(git_runner=rec)
     git = Git(gw, GIT, str(w.home), packs_filters())
+    prepare(w)
     packs.fill_local_throwaway(
         git, w.cfg, clone_dir=str(repo / ".git"), throwaway=str(thrown(w)), sha=shas[2],
-        honor_filters=honor,
+        honor_filters=honor, verify=noop,
     )  # fmt: skip
     ((_, env, _),) = [c for c in rec.calls if "read-tree" in c[0]]
     assert (FILTER_DIR in env["PATH"].split(os.pathsep)) is honor
