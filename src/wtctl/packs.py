@@ -613,15 +613,16 @@ def is_shallow(git_dir: str) -> bool:
 
 def check_tree_size(git: Git, git_dir: str, *, timeout: float = 600) -> None:
     """Fail closed (``create_failed``, ``details.cause: tree_too_large``) when ``HEAD``'s tree in
-    ``git_dir`` has more than ``MAX_TREE_ENTRIES`` file entries or its blobs sum to more than
+    ``git_dir`` has more than ``MAX_TREE_ENTRIES`` entries (files and trees: ``-t`` makes every tree
+    visit an entry, so a DAG of empty trees is counted too) or its blobs sum to more than
     ``MAX_TREE_BYTES``, or when the listing itself exceeds ``MAX_TREE_LIST_BYTES``. The listing
-    (``ls-tree -r -l -z``) goes to a file and is read in chunks, so a hostile tree never sits in
+    (``ls-tree -r -t -l -z``) goes to a file and is read in chunks, so a hostile tree never sits in
     memory; it runs before ``read-tree`` writes anything into the work tree."""
     too_large = {"cause": "tree_too_large"}
     with private_dir() as p:
         listing = os.path.join(p, "tree")
         r = git.run(
-            ["ls-tree", "-r", "-l", "-z", "HEAD"], git_dir=git_dir, cwd=git_dir,
+            ["ls-tree", "-r", "-t", "-l", "-z", "HEAD"], git_dir=git_dir, cwd=git_dir,
             allow_shallow=True, stdout_path=listing, max_stdout_bytes=MAX_TREE_LIST_BYTES,
             timeout=timeout,
         )  # fmt: skip

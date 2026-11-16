@@ -387,9 +387,31 @@ def test_a_tree_dag_with_too_many_entries_is_refused_before_anything_is_written(
 ) -> None:
     from wtctl import packs
 
+    monkeypatch.setattr(packs, "MAX_TREE_ENTRIES", 150)
+    tree_too_large(w, plant_tree(w, lambda gd: bomb(gd, 6)), source)  # 64 files + 126 trees
+    ok = plant_tree(w, lambda gd: bomb(gd, 5))  # 32 files + 62 trees: within the bound
+    assert w.made("--source", source, ref=ok)["state"] == "active"
+
+
+def empty_bomb(git_dir: Path, depth: int) -> str:
+    """A tree DAG of empty trees: ``2 ** depth`` visits, yet no file entry at all."""
+    node = write_object(git_dir, "tree", tree_body([]))
+    for _ in range(depth):
+        node = write_object(
+            git_dir, "tree", tree_body([("40000", "a", node), ("40000", "b", node)])
+        )
+    return node
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_dag_of_empty_trees_counts_its_tree_entries(
+    w: TW, source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import packs
+
     monkeypatch.setattr(packs, "MAX_TREE_ENTRIES", 50)
-    tree_too_large(w, plant_tree(w, lambda gd: bomb(gd, 6)), source)  # 64 files
-    ok = plant_tree(w, lambda gd: bomb(gd, 5))  # 32 files: within the bound
+    tree_too_large(w, plant_tree(w, lambda gd: empty_bomb(gd, 6)), source)  # 126 tree entries
+    ok = plant_tree(w, lambda gd: empty_bomb(gd, 3))  # 14 tree entries: within the bound
     assert w.made("--source", source, ref=ok)["state"] == "active"
 
 
