@@ -72,7 +72,7 @@ def test_large_repository_timings() -> None:
 
 
 def phases() -> set[str]:
-    return set(os.environ.get("BENCH_PHASES", "main,throwaway,many,stress").split(","))
+    return set(os.environ.get("BENCH_PHASES", "main,throwaway,many,reconcile,stress").split(","))
 
 
 def outcome(run: Timed) -> str:
@@ -90,6 +90,16 @@ def outcome(run: Timed) -> str:
             kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
         return f"exit {run.code}; changes={len(j['changes'])}; reports={kinds or 'none'}"
     return f"exit {run.code}"
+
+
+def breakdown(run: Timed) -> str:
+    """Seconds per git subcommand of one run, largest first (the rest of the wall time is wtctl
+    itself: Python, its child walks and file-system work)."""
+    totals: dict[str, float] = {}
+    for sec, sub in run.git_calls:
+        totals[sub] = totals.get(sub, 0.0) + sec
+    top = sorted(totals.items(), key=lambda kv: -kv[1])[:6]
+    return "git: " + ", ".join(f"{k} {v:.1f}s" for k, v in top)
 
 
 def _scenario(base: Path, res: Results, repeats: int, ignored_files: int) -> None:
@@ -113,6 +123,8 @@ def _scenario(base: Path, res: Results, repeats: int, ignored_files: int) -> Non
         _throwaways(w, res, repeats)
     if "many" in phases():
         _many_records(base, res)
+    if "reconcile" in phases():
+        _reconcile_admin(base, res)
     if "stress" in phases():
         _stress(w, res)
     res.add("reconcile (big clone, no live records)", ok(w.run("reconcile")))
@@ -132,6 +144,7 @@ def _main(w: World, res: Results, d: fx.Dims, repeats: int, ignored_files: int) 
         "create --no-bootstrap, cold (first mirror refresh, 18k-commit pack transfer)",
         ok(w.run("create", "--repo", REPO, "--no-bootstrap")),
     )
+    res.notes[next(reversed(res.series))] = breakdown(cold)
     first = record_of(cold)
     assert w.git("rev-parse", first["base_sha"]) == first["base_sha"]
     res.add("remove, clean tree", ok(w.run("remove", first["id"], "--yes")))
@@ -140,6 +153,7 @@ def _main(w: World, res: Results, d: fx.Dims, repeats: int, ignored_files: int) 
     fx.advance_main(w.remote, w.ghome, d, d.commits, ADVANCE)
     st0 = ok(w.run("create", "--repo", REPO, "--no-bootstrap"))
     res.add(f"create --no-bootstrap, warm (refresh after {ADVANCE} new commits)", st0)
+    res.notes[f"create --no-bootstrap, warm (refresh after {ADVANCE} new commits)"] = breakdown(st0)
     second = record_of(st0)
     res.add("status, clean tree, mirror already fresh", ok(w.run("status", second["id"])))
     fx.advance_main(w.remote, w.ghome, d, d.commits + ADVANCE, ADVANCE)
@@ -153,6 +167,7 @@ def _main(w: World, res: Results, d: fx.Dims, repeats: int, ignored_files: int) 
     for n in range(repeats):
         c = ok(w.run("create", "--repo", REPO, "--copy-env"))
         res.add("create (bootstrap snapshots + copy_env + baseline), warm", c)
+        res.notes["create (bootstrap snapshots + copy_env + baseline), warm"] = breakdown(c)
         rec = record_of(c)
         rid, wt = rec["id"], Path(rec["path"])
         warn = [x for x in c.json()["warnings"] if "limit" in x or "early" in x]
@@ -244,6 +259,7 @@ def _throwaways(w: World, res: Results, repeats: int) -> None:
             )
             label = "remote, depth 50" if source == "remote" else "local source (full history)"
             res.add(f"create --throwaway, {label}", c)
+            res.notes[f"create --throwaway, {label}"] = breakdown(c)
             rid = record_of(c)["id"]
             if source == "remote":
                 res.add(
@@ -255,15 +271,18 @@ def _throwaways(w: World, res: Results, repeats: int) -> None:
             res.add(f"remove throwaway ({label})", ok(w.run("remove", rid, "--yes")))
 
 
-def _many_records(base: Path, res: Results) -> None:
-    """``list``/``prune``/``reconcile`` over many records and a huge ``worktrees/`` directory."""
-    small = base / "small"
-    sw = World(small, fx.Dims(2, 2, 2, 5, 60, 2, 5, 3, 1, 1024))
+def _small_world(base: Path) -> World:
+    sw = World(base / "small", fx.Dims(2, 2, 2, 5, 60, 2, 5, 3, 1, 1024))
     sw.build(stale_at=60, copy_env_files=0)
     sw.top["lease_wait"] = "30s"
+    return sw
+
+
+def _many_records(base: Path, res: Results) -> None:
+    """``list``/``prune``/``reconcile`` over many throwaway records."""
+    sw = _small_world(base)
     sha = sw.git("rev-parse", "HEAD")
     many = int(os.environ.get("BENCH_RECORDS", "300"))
-    ok(sw.run("create", "--repo", REPO, "--no-bootstrap"))  # makes the clone known to reconcile
     for _ in range(many):
         ok(sw.run("create", "--throwaway", "--repo", REPO, "--ref", sha, "--source", "local"))
     r = res.add(f"list ({many} throwaway records)", ok(sw.run("list")))
@@ -276,17 +295,31 @@ def _many_records(base: Path, res: Results) -> None:
         f"prune --throwaways ({many}, serial)",
         ok(sw.run("prune", "--throwaways", "--older-than", "1s")),
     )
+    shutil.rmtree(sw.base)
+
+
+def _reconcile_admin(base: Path, res: Results) -> None:
+    """The admin-entry deletion decision of ``reconcile`` for a record whose directory vanished,
+    in a clone whose ``worktrees/`` directory holds many entries (``op_admin_scan`` reads at most
+    5000)."""
+    sw = _small_world(base)
+    sw.top["reconcile"] = {"missing_grace": "1s"}
     admin = sw.clone / ".git" / "worktrees"
-    admin.mkdir(exist_ok=True)
-    for count in (4_000, 6_000):
-        for k in range(count):
+    have = 0
+    for count in (0, 4_000, 6_000):
+        for k in range(have, count):
             e = admin / f"fake{k:05d}"
-            e.mkdir(exist_ok=True)
+            e.mkdir(parents=True, exist_ok=True)
             (e / "gitdir").write_text(f"/nonexistent/bench/{k}/.git\n")
-        name = f"reconcile --dry-run (clone with {count} fake admin entries)"
-        run = res.add(name, sw.run("reconcile", "--dry-run"))
+        have = count
+        rec = record_of(ok(sw.run("create", "--repo", REPO, "--no-bootstrap")))
+        shutil.rmtree(rec["path"])
+        ok(sw.run("reconcile"))  # records it as missing
+        time.sleep(2)
+        name = f"reconcile, missing record past its grace ({count} other admin entries)"
+        run = res.add(name, ok(sw.run("reconcile")))
         res.notes[name] = outcome(run)
-    shutil.rmtree(small)
+    shutil.rmtree(sw.base)
 
 
 def _stress(w: World, res: Results) -> None:
