@@ -520,9 +520,20 @@ class State:
         *,
         labels: Iterable[str] = (),
         holders: Iterable[str] = (),
+        baseline_items: Sequence[Mapping[str, Any]] | None = None,
+        stash_ids: Iterable[str] = (),
     ) -> Record:
+        """Insert a record. ``baseline_items`` (as :meth:`transition` takes them) and ``stash_ids``
+        are written in the same transaction, so a record never exists without the rows its
+        ``baseline_digest`` and stash check rely on (``adopt``)."""
         with self._txn() as c:
             self._insert(c, fields, labels, holders)
+            if baseline_items is not None:
+                self._write_baseline(c, fields["id"], baseline_items)
+            c.executemany(
+                "INSERT INTO stash_ids(record_id, oid) VALUES (?, ?)",
+                [(fields["id"], o) for o in sorted(set(stash_ids))],
+            )
         got = self.get_record(fields["id"])
         assert got is not None
         return got
@@ -998,6 +1009,80 @@ class State:
         if row is None:
             raise WtctlError("not_found", f"no record for path {path}")
         return self._build(row)
+
+    # -- holders --------------------------------------------------------------------------
+
+    def _live_row(self, c: sqlite3.Connection, record_id: str) -> sqlite3.Row:
+        """The record's row; ``not_found`` (exit 10, with ``details`` for a tombstone) if it is
+        missing or final."""
+        row = c.execute(
+            "SELECT state, removed_at, owned, object_type FROM records WHERE id = ?", (record_id,)
+        ).fetchone()
+        if row is None or row["state"] in TOMBSTONE_STATES:
+            raise _not_found(record_id, row)
+        return row
+
+    def add_holder(self, record_id: str, holder: str, *, expected: str) -> Record:
+        """Add ``holder`` (a set: adding it twice is one holder) to a worktree record that is in
+        state ``expected``, in one transaction (a compare-and-set on the state: a lost race is
+        ``busy``, a tombstone ``not_found``)."""
+        _check_holder(holder)
+        _check_state(expected)
+        with self._txn() as c:
+            row = self._live_row(c, record_id)
+            if row["state"] != expected:
+                raise WtctlError(
+                    "busy",
+                    f"record {record_id} is {row['state']}, not {expected}: "
+                    "another command changed it first",
+                )
+            if row["object_type"] != "worktree":
+                raise ValueError("a throwaway has no holders")
+            cur = c.execute(
+                "INSERT OR IGNORE INTO holders(record_id, holder) VALUES (?, ?)",
+                (record_id, holder),
+            )
+            if cur.rowcount:
+                c.execute("UPDATE records SET updated = ? WHERE id = ?", (self._now(), record_id))
+        got = self.get_record(record_id)
+        assert got is not None
+        return got
+
+    def remove_holder(self, record_id: str, holder: str) -> tuple[Record, bool, bool]:
+        """Remove ``holder`` from a live worktree record: ``(record, removed, forgotten)``.
+
+        ``removed`` is whether it was a holder. When this call removed the last holder of an
+        adopted record (``owned`` false) the record becomes ``forgotten`` in the same transaction;
+        an owned record is never forgotten this way, and a call that removed nothing never
+        forgets anything (a holderless adopted record stays). A tombstone is ``not_found``.
+        """
+        _check_holder(holder)
+        with self._txn() as c:
+            row = self._live_row(c, record_id)
+            if row["object_type"] != "worktree":
+                raise ValueError("a throwaway has no holders")
+            cur = c.execute(
+                "DELETE FROM holders WHERE record_id = ? AND holder = ?", (record_id, holder)
+            )
+            removed = cur.rowcount == 1
+            forgotten = False
+            if removed:
+                now = self._now()
+                left = c.execute(
+                    "SELECT count(*) FROM holders WHERE record_id = ?", (record_id,)
+                ).fetchone()[0]
+                if left == 0 and not row["owned"]:
+                    c.execute(
+                        "UPDATE records SET state = 'forgotten', updated = ?, removed_at = ? "
+                        "WHERE id = ?",
+                        (now, now, record_id),
+                    )
+                    forgotten = True
+                else:
+                    c.execute("UPDATE records SET updated = ? WHERE id = ?", (now, record_id))
+        got = self.get_record(record_id)
+        assert got is not None
+        return got, removed, forgotten
 
     # -- labels ---------------------------------------------------------------------------
 

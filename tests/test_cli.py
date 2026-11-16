@@ -212,9 +212,10 @@ def test_human_only_commands_exit_13_without_human_actor(
         assert obj["error"]["code"] == "confirmation_required"
 
 
-# `bootstrap` (#16) and `baseline accept` (#17) are implemented: their own tests cover the handlers.
+# `bootstrap` (#16), `baseline accept` (#17) and `forget` (#18) are implemented: their own tests
+# cover the handlers.
 @pytest.mark.parametrize(
-    "argv", [c for c in HUMAN_ONLY_COMMANDS if c[0] not in ("bootstrap", "baseline")]
+    "argv", [c for c in HUMAN_ONLY_COMMANDS if c[0] not in ("bootstrap", "baseline", "forget")]
 )
 @pytest.mark.parametrize(
     ("extra", "tty"), [(["--actor", "human:bob"], False), ([], True)], ids=["flag", "tty"]
@@ -229,7 +230,7 @@ def test_human_only_commands_reach_the_handler_with_a_human(
 
 def test_forget_with_holder_is_not_human_only(capsys: pytest.CaptureFixture[str]) -> None:
     r = run_cli(capsys, "--json", "forget", SID, "--holder", "h1")
-    assert r.code == 1  # reached the handler as an automated actor
+    assert r.code == 10  # reached the handler as an automated actor (no such record)
 
 
 def test_require_human_helper(
