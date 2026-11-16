@@ -8,9 +8,16 @@ which is written from the table.
 Keeping the table and this module in step: ``DOC_CELLS`` repeats every cell of the markdown table
 verbatim (links and backticks stripped). ``test_the_doc_table_is_the_one_tested`` parses the table
 out of interface.md and fails on any difference in rows, columns or cell text, so editing the
-table without revisiting ``exp`` is a red test; ``test_every_cell_has_an_expectation`` fails when a
-state/column of the table has no expectation here. ``test_every_command_is_covered`` fails when a
-command is added to the registry without being classified below.
+table without revisiting ``exp`` is a red test (the paragraph above the table and the bullets
+below it are pinned the same way); ``test_every_cell_has_an_expectation`` fails when a state/column
+of the table has no expectation here, or when ``exp`` disagrees with the table's exit code (apart
+from the documented exit 2 and 13 exceptions). ``test_every_command_is_covered`` fails when a
+command is added to the registry without being classified below, or names a test that is missing.
+
+Out of scope here: the ``clone_missing`` cell "baseline accept re-attaches a moved clone" is
+covered by ``tests/test_reconcile_pointers.py``. Seeded throwaways in ``unlinked``, ``missing`` and
+``clone_missing`` are not in the matrix: reconcile sends a vanished throwaway to ``gone``, so those
+pairs are unreachable (the table says "never a throwaway state").
 
 States are seeded in ``state.db`` (the way the other state tests do) on top of a real worktree,
 adopted worktree or throwaway, because only the record's state matters to these commands; the
@@ -121,6 +128,49 @@ DOC_CELLS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# The paragraph above the table and the bullets under it, as rendered (same normalization).
+DOC_PRECEDING = (
+    "What each single-target command does with a record in each state (exit code and "
+    "outcome). A state-dependent condition exits 20 (or 10 for a tombstone), never 2; exit 2 "
+    "is reserved for usage, including a command applied to the wrong object type (except that"
+    " a non-human running bootstrap, baseline accept or forget without --holder exits 13 "
+    "first, at the actor gate, whatever the target): bootstrap, baseline check|accept, forget"
+    " and adopt (a path in the throwaway root) refuse throwaways, and extract refuses "
+    "worktrees, with exit 2 in every live state (a full id naming a tombstone exits 10 first,"
+    " since record resolution comes before the command's own checks)."
+)
+DOC_BULLETS = (
+    (
+        "**Tombstones:** only a full id finds one (Identifiers); the 10 carries error.details: "
+        "{state, removed_at}. A path never matches a tombstone, so adopt of a worktree's path "
+        "records it anew; a path in the throwaway root is refused with exit 2 whatever the "
+        "record's state."
+    ),
+    (
+        "**forget** follows its own rules in every live state (plain forget is human-only; "
+        "--holder removes a holder)."
+    ),
+    (
+        "**A throwaway whose directory vanished** while its record is still active (before "
+        "Reconcile saw it): remove marks it gone and exits 0 with a warning; extract exits 20, "
+        "unlinked."
+    ),
+    (
+        "**A live creator.** Commands that take the per-record lease (remove, bootstrap, extract,"
+        " baseline accept, adopt of its path, forget, label) wait for a creating record's lease "
+        "while its creator is alive and then exit 12, busy; the creating row shows the outcome "
+        "once the creator has died."
+    ),
+    (
+        "**A crashed create** leaves a creating record; a retried create reports branch_in_use or"
+        " path_exists with its holder_id until Reconcile settles it. Then a retry succeeds "
+        "normally if the record became gone; if it was reclaimed (adopted_after_crash), a retry "
+        'with one of its holders gets it back with "reused": true (Retry after a crash), and any '
+        "other retry is still refused. A retry made while the creator is alive waits for it as "
+        "described in Retry after a crash."
+    ),
+)
+
 # The commands (and actor variants) that answer each column; ``exp`` has a value for each.
 COLUMN_CMDS: dict[str, tuple[str, ...]] = {
     "show": ("show",),
@@ -176,6 +226,17 @@ def doc_table() -> dict[str, tuple[str, ...]]:
     return {r[0]: tuple(r[1:]) for r in cells[2:]}
 
 
+def doc_prose() -> tuple[str, tuple[str, ...]]:
+    """The paragraph before the table and the bullets after it, normalized like the cells."""
+    text = DOC.read_text()
+    section = text.split("\n### Commands by record state\n", 1)[1].split("\n### ", 1)[0]
+    lines = [ln for ln in section.splitlines() if ln.strip()]
+    first_row = next(i for i, ln in enumerate(lines) if ln.startswith("|"))
+    before = " ".join(lines[:first_row])
+    bullets = tuple(_plain(ln[2:]) for ln in lines if ln.startswith("- "))
+    return _plain(before), bullets
+
+
 def doc_states() -> list[str]:
     return [s for label in doc_table() for s in label.split(", ")]
 
@@ -189,14 +250,49 @@ def test_the_doc_table_is_the_one_tested() -> None:
         ), f"interface.md row {label!r} changed: revisit exp() and DOC_CELLS"
 
 
+def test_the_prose_around_the_table_is_the_one_tested() -> None:
+    before, bullets = doc_prose()
+    assert before == DOC_PRECEDING, "interface.md: the paragraph above the table changed"
+    assert bullets == DOC_BULLETS, "interface.md: a bullet under the table changed: revisit exp()"
+
+
+EXPECTATION = re.compile(r"^(ok|\d+(:\w+)?)$")
+
+
 def test_every_cell_has_an_expectation() -> None:
+    """Every (cmd, actor, kind, state) has a well-formed expectation whose exit class agrees with
+    the table cell, except for the exit 2 (wrong object type) and 13 (actor gate) the paragraph
+    above the table documents, and `adopt` of a `missing` record (the cell's "missing: 10")."""
     assert sorted(doc_states()) == sorted(STATES)
-    for state in doc_states():
-        for column in COLUMNS:
-            for cmd in COLUMN_CMDS[column]:
-                for kind in KINDS:
-                    for actor in actors(cmd):
-                        assert exp(cmd, actor, kind, state), (cmd, actor, kind, state)
+    table = doc_table()
+    for label, cells in table.items():
+        for state in label.split(", "):
+            for column, cell in zip(COLUMNS, cells, strict=True):
+                for cmd in COLUMN_CMDS[column]:
+                    for kind in KINDS:
+                        for actor in actors(cmd):
+                            want = exp(cmd, actor, kind, state)
+                            assert EXPECTATION.match(want), (cmd, actor, kind, state, want)
+                            lead = re.match(r"\d+", cell)
+                            if lead is None:  # a reference to another section, or "never"
+                                continue
+                            got = 0 if want == "ok" else int(want.partition(":")[0])
+                            allowed = {int(lead.group()), 2, 13}
+                            if "missing: 10" in cell and state == "missing":
+                                allowed.add(10)
+                            assert got in allowed, (cmd, actor, kind, state, want, cell)
+
+
+def test_exp_rejects_what_it_does_not_know() -> None:
+    unknown = [
+        ("nope", "auto", "worktree", "active"),
+        ("show", "robot", "worktree", "active"),
+        ("show", "auto", "branch", "active"),
+        ("show", "auto", "worktree", "limbo"),
+    ]
+    for bad in unknown:
+        with pytest.raises(ValueError):
+            exp(*bad)
 
 
 def test_every_command_is_covered() -> None:
@@ -206,7 +302,24 @@ def test_every_command_is_covered() -> None:
         set(COVERED) | set(NO_STATE_DEPENDENCE)
     )
     tested = {c for cmds in COLUMN_CMDS.values() for c in cmds}
-    assert {c for c in COVERED if "per-state matrix" in COVERED[c]} <= tested | {"remove"}
+    assert {c for c in COVERED if "per-state matrix" in COVERED[c]} <= tested
+
+
+# What the free-text parts of COVERED stand for.
+COVERING_TESTS = {
+    "per-state matrix": "test_commands_by_record_state",
+    "actor gate": "test_the_actor_gate_comes_before_record_resolution",
+    "adopted main worktree": "test_an_adopted_main_worktree_is_refused_before_the_human_gate",
+    "vanished throwaway": "test_a_throwaway_whose_directory_vanished_while_active",
+}
+
+
+def test_every_covering_test_exists() -> None:
+    for cmd, where in COVERED.items():
+        for part in (p.strip() for p in where.split(";")):
+            name = part if part.startswith("test_") else COVERING_TESTS.get(part)
+            assert name is not None, (cmd, part)
+            assert callable(globals().get(name)), (cmd, part, name)
 
 
 # -- expectations -------------------------------------------------------------------------------
@@ -224,6 +337,13 @@ def exp(cmd: str, actor: str, kind: str, state: str) -> str:
 
     ``10:tomb`` is exit 10 with ``details: {state, removed_at}``.
     """
+    if (
+        cmd not in SCHEMAS
+        or actor not in ("human", "auto")
+        or kind not in KINDS
+        or state not in STATES
+    ):
+        raise ValueError(f"no expectation for {(cmd, actor, kind, state)}")
     worktree = kind != "throwaway"
     human = actor == "human"
     if cmd in HUMAN_GATED and not human:
@@ -255,7 +375,10 @@ def exp(cmd: str, actor: str, kind: str, state: str) -> str:
             state, "20:unlinked"
         )
     if state != "active":
-        return "20:unlinked"  # bootstrap, baseline check, baseline accept
+        # bootstrap, baseline check, baseline accept. For `clone_missing`, a human `baseline
+        # accept` with an unmoved clone is still 20 unlinked; the moved-clone re-attach is tested
+        # in tests/test_reconcile_pointers.py::test_baseline_accept_reattaches_a_moved_clone.
+        return "20:unlinked"
     if cmd == "bootstrap" and kind == "adopted":
         return "20:not_owned"
     return "ok"
@@ -346,7 +469,7 @@ class SW(XW):
         return self.state_of(rid)
 
 
-def check(r: Run, cmd: str, want: str, state: str) -> dict[str, Any]:
+def check(r: Run, cmd: str, want: str, state: str, rid: str | None = None) -> dict[str, Any]:
     """Assert the exit code, error code, reason and schema of one run; returns the JSON."""
     data = r.json()
     if want == "ok":
@@ -362,7 +485,12 @@ def check(r: Run, cmd: str, want: str, state: str) -> dict[str, Any]:
         assert err["details"]["state"] == state and err["details"]["removed_at"], err
     elif marker:
         assert err["reason"] == marker, (cmd, state, err)
+        if marker == "path_exists" and rid is not None:  # the `creating` record is the holder
+            assert err["holder_id"] == rid, (cmd, state, err)
     return data
+
+
+GIT_CHECKS = ("locked", "baseline", "fetch")  # the checks that run git
 
 
 def check_ok_shape(cmd: str, kind: str, state: str, data: dict[str, Any]) -> None:
@@ -373,6 +501,8 @@ def check_ok_shape(cmd: str, kind: str, state: str, data: dict[str, Any]) -> Non
             "worktree" if worktree else "throwaway"
         )
     elif cmd in ("status", "remove_dry"):
+        # A `partial` or `creating` status shape (human_required, would_remove) is not in the table,
+        # which says only "0"; it rests on the implementation, not the documentation.
         assert data["id"] and ("dry_run" in data) == (cmd == "remove_dry")
         if state == "active":
             assert data["would_remove"] is True and data["reason"] is None
@@ -382,6 +512,9 @@ def check_ok_shape(cmd: str, kind: str, state: str, data: dict[str, Any]) -> Non
         else:
             assert data["would_remove"] is False and data["reason"] == "unlinked"
             assert data["human_required"] is (kind == "adopted")
+            if state != "creating":  # unlinked, missing, clone_missing: git is not run
+                skipped = {n: c["status"] for n, c in data["checks"].items() if n in GIT_CHECKS}
+                assert skipped and set(skipped.values()) == {"skipped"}, (cmd, state, skipped)
     elif cmd == "baseline_check":
         assert data["changed"] is False
     elif cmd == "adopt" and state == "active":
@@ -404,8 +537,29 @@ def consuming(cmd: str, actor: str, kind: str, state: str) -> bool:
 CELLS = [(cmd, actor) for cmd in COMMAND_ARGV for actor in actors(cmd)]
 
 
-@pytest.mark.parametrize("state", STATES)
-@pytest.mark.parametrize("kind", KINDS)
+def reachable(kind: str, state: str) -> bool:
+    """Reconcile sends a vanished throwaway to `gone` (never `unlinked`, `missing` or
+    `clone_missing`), so a throwaway in those states cannot occur."""
+    return not (kind == "throwaway" and state in ("unlinked", "missing", "clone_missing"))
+
+
+MATRIX = [pytest.param(k, st, id=f"{k}-{st}") for k in KINDS for st in STATES if reachable(k, st)]
+
+
+def snapshot(w: SW, rid: str, ignore: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The whole record, as `show` prints it and as the database row holds it. ``updated`` is left
+    out: adding and then removing a label legitimately moves it. ``ignore`` names fields a command
+    in the sequence legitimately rewrites (a successful `bootstrap` re-run records its outcome)."""
+    skip = {"updated", *ignore}
+    shown = w.run("show", rid)
+    assert shown.code == 0, shown.out
+    record = {k: v for k, v in shown.json().items() if k not in skip}
+    row = {k: v for k, v in dict(w.rows("SELECT * FROM records WHERE id = ?", rid)[0]).items()
+           if k not in skip}  # fmt: skip
+    return {"shown": record, "row": row}
+
+
+@pytest.mark.parametrize(("kind", "state"), MATRIX)
 def test_commands_by_record_state(
     tmp_path: Path, private_home: Path, kind: str, state: str
 ) -> None:
@@ -413,11 +567,15 @@ def test_commands_by_record_state(
     w = SW(tmp_path, private_home).seed(kind, state)
     rid = w.rec["id"]
     status_seen: dict[str, Any] = {}
+    rewritten = (
+        ("bootstrap", "bootstrap_state") if exp("bootstrap", "human", kind, state) == "ok" else ()
+    )
+    before = snapshot(w, rid, rewritten)
     for cmd, actor in CELLS:
         want = exp(cmd, actor, kind, state)
         if consuming(cmd, actor, kind, state):
             continue
-        data = check(run_cell(w, cmd, actor), cmd, want, state)
+        data = check(run_cell(w, cmd, actor), cmd, want, state, rid)
         if want == "ok":
             check_ok_shape(cmd, kind, state, data)
         if cmd in ("status", "remove_dry") and want == "ok":
@@ -429,6 +587,14 @@ def test_commands_by_record_state(
             k: v for k, v in status_seen["status"].items() if k != "warnings"
         }
     assert w.row_state(rid) == state  # nothing above changed the record's state
+    after = snapshot(w, rid, rewritten)  # nor any other field (labels round-trip)
+    changed = {
+        (part, k): (before[part][k], after[part][k])
+        for part in before
+        for k in before[part]
+        if before[part][k] != after[part][k]
+    }
+    assert not changed, changed
 
 
 def consuming_cells() -> list[Any]:
@@ -437,7 +603,7 @@ def consuming_cells() -> list[Any]:
         for kind in KINDS
         for state in STATES
         for cmd, actor in CELLS
-        if consuming(cmd, actor, kind, state)
+        if reachable(kind, state) and consuming(cmd, actor, kind, state)
     ]
 
 
@@ -629,6 +795,22 @@ def test_an_adopted_main_worktree_is_refused_before_the_human_gate(
         out = w.run("remove", rid, "--yes", human=human)
         assert out.code == 20 and out.json()["error"]["reason"] == "main_worktree", out.out
     assert w.state_of(rid) == "active"
+
+
+def test_adopt_of_a_removed_worktrees_deleted_path_is_not_a_directory(
+    tmp_path: Path, private_home: Path
+) -> None:
+    """The table's "a tombstone's path is recorded anew" needs the path to exist: after a real
+    `remove` the directory is gone, so `adopt` of it exits 10 (not a directory)."""
+    w = SW(tmp_path, private_home).build()
+    rec = w.make("worktree")
+    assert w.run("remove", rec["id"], "--yes", human=True).code == 0
+    assert w.state_of(rec["id"]) == "removed" and not Path(rec["path"]).exists()
+    r = w.run("adopt", rec["path"], "--repo", REPO)
+    assert r.code == 10, (r.out, r.err)
+    validate("wtctl/cli/error.json", r.json())
+    assert r.json()["error"]["code"] == "not_found"
+    assert w.state_of(rec["id"]) == "removed"
 
 
 def test_a_throwaway_whose_directory_vanished_while_active(
