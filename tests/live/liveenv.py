@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (the variable descriptions are prose data)
 """The environment contract of the live suite: variable names, parsing and prerequisites.
 
 Everything a live test needs from outside comes from ``WTCTL_LIVE_*`` variables, read from a
@@ -57,15 +58,42 @@ def _forge_vars() -> list[EnvVar]:
     out: list[EnvVar] = []
     for f in FORGES.values():
         out += [
-            EnvVar(f.var("PUBLIC_REPO"), f"project path of a small, stable PUBLIC repository on {f.host} with at least 8 commits and years of history"),
-            EnvVar(f.var("PRIVATE_REPO"), f"project path of a PRIVATE repository on {f.host} that the token can read"),
-            EnvVar(f.var("TOKEN_ENV"), f"NAME of the variable holding a read token for {f.host} (private-repository tests)"),
-            EnvVar(f.var("PUSH_REPO"), f"project path of a disposable repository on {f.host} the push token may create and delete branches in"),
-            EnvVar(f.var("PUSH_TOKEN_ENV"), f"NAME of the variable holding a write token for {f.host} (push tests)"),
-            EnvVar(f.var("FORK_PR_HEAD"), f"full sha of a {'pull' if f.key == 'github' else 'merge'} request head from a fork of the public repository, on no branch"),
-            EnvVar(f.var("FORK_ONLY_SHA"), "optional: full sha of a commit present only in a fork of the public repository (observed, not asserted)"),
-            EnvVar(f.var("TOKEN_COMMAND"), f"optional JSON argv printing a token for {f.host} ({'default: gh auth token --hostname {host}' if f.key == 'github' else 'required for the token_command test'})"),
-            EnvVar(f.var("CONFIG_DIR"), f"optional: the {f.cli} configuration directory handed to the token command (default: the maintainer's own, when it exists)"),
+            EnvVar(
+                f.var("PUBLIC_REPO"),
+                f"project path of a small, stable PUBLIC repository on {f.host} with at least 8 commits and years of history",
+            ),
+            EnvVar(
+                f.var("PRIVATE_REPO"),
+                f"project path of a PRIVATE repository on {f.host} that the token can read",
+            ),
+            EnvVar(
+                f.var("TOKEN_ENV"),
+                f"NAME of the variable holding a read token for {f.host} (private-repository tests)",
+            ),
+            EnvVar(
+                f.var("PUSH_REPO"),
+                f"project path of a disposable repository on {f.host} the push token may create and delete branches in",
+            ),
+            EnvVar(
+                f.var("PUSH_TOKEN_ENV"),
+                f"NAME of the variable holding a write token for {f.host} (push tests)",
+            ),
+            EnvVar(
+                f.var("FORK_PR_HEAD"),
+                f"full sha of a {'pull' if f.key == 'github' else 'merge'} request head from a fork of the public repository, on no branch",
+            ),
+            EnvVar(
+                f.var("FORK_ONLY_SHA"),
+                "optional: full sha of a commit present only in a fork of the public repository (observed, not asserted)",
+            ),
+            EnvVar(
+                f.var("TOKEN_COMMAND"),
+                f"optional JSON argv printing a token for {f.host} ({'default: gh auth token --hostname {host}' if f.key == 'github' else 'required for the token_command test'})",
+            ),
+            EnvVar(
+                f.var("CONFIG_DIR"),
+                f"optional: the {f.cli} configuration directory handed to the token command (default: the maintainer's own, when it exists)",
+            ),
         ]
     return out
 
@@ -101,9 +129,7 @@ def valid_project_path(value: str) -> bool:
     return not any(p in _BAD_PATH_PARTS or p.endswith(".git") for p in value.split("/"))
 
 
-def project_path(
-    forge: Forge, suffix: str, environ: Mapping[str, str] | None = None
-) -> str | None:
+def project_path(forge: Forge, suffix: str, environ: Mapping[str, str] | None = None) -> str | None:
     value = getenv(forge.var(suffix), environ)
     return value if value is not None and valid_project_path(value) else None
 
@@ -240,4 +266,3 @@ def all_unmet(
     needs: list[str], environ: Mapping[str, str] | None = None, which: Which | None = None
 ) -> list[str]:
     return [m for n in needs if (m := unmet(n, environ, which))]
-

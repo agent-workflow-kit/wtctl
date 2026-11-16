@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.live import scenarios as sc, worlds
+from tests.live import scenarios as sc
+from tests.live import worlds
+from tests.live.harness import Record
 from tests.live.liveenv import FORGES
 
 pytestmark = pytest.mark.live
@@ -20,7 +22,7 @@ FORGE_PARAMS = [pytest.param(k, id=k, marks=needs(f"{k}:public")) for k in sorte
 
 @pytest.mark.parametrize("key", FORGE_PARAMS)
 def test_mirror_refresh_default_branch_and_local_strict_transfer(
-    key: str, tmp_path: Path, record_property: pytest.RecordProperty
+    key: str, tmp_path: Path, record_property: Record
 ) -> None:
     """G1-G3: the treeless first refresh and an incremental one succeed with
     ``GIT_NO_LAZY_FETCH=1`` set on the network calls; the default branch from

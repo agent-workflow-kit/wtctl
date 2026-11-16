@@ -307,12 +307,16 @@ def push_fast_forward(w: LiveWorld, depth: int, prefix: str) -> str:
                 )  # fmt: skip
                 assert res.returncode == 0, f"push step {step}: {res.err[:1500]}"
                 assert not any(ln.startswith("!") for ln in _porcelain(res.out)), res.out[:800]
-                assert w.tip(ref) == head, f"step {step}: the remote branch is not at the pushed commit"
+                assert w.tip(ref) == head, (
+                    f"step {step}: the remote branch is not at the pushed commit"
+                )
     finally:
         # The deletion needs no objects: a bare empty repository is enough, and it works even
         # when the throwaway could not be created.
         w.net_git(["push", "--porcelain", "--", url, f":{ref}"], url=url, git_dir=w.scratch())
-    assert [r for r in w.ls_remote(ref) if r[1] == ref] == [], "the disposable branch is still there"
+    assert [r for r in w.ls_remote(ref) if r[1] == ref] == [], (
+        "the disposable branch is still there"
+    )
     return branch
 
 

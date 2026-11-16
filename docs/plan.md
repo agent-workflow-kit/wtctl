@@ -7,7 +7,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 - Test-first: each behavior starts as a failing test. Unit and integration tests use real git in temporary directories (no network); the process scanner and the clock are faked through `gateway`.
 - Every `--json` output gets golden files validated against `schemas/` with a `referencing` registry keyed by `$id`; every hook payload is validated the same way.
 - Every relied-on git behavior from the spikes and the safety checks (design.md, Live verification) becomes a regression test in the stage that relies on it. Security vectors (planted config, forged history, symlink swaps) are ordinary tests: the payload only touches a marker file, and the test asserts the marker is absent.
-- Tests that need the network or real credentials carry the pytest marker `live`, are deselected by default and never run in CI.
+- Tests that need the network or real credentials carry the pytest marker `live`, are deselected by default and never run in CI. The suite is `tests/live/` (`make live`, never in CI or `make verify`); see [live-testing.md](live-testing.md).
 - `make verify` passes before every commit. Runtime dependencies: `pyyaml`, `pydantic`. Test-only: `pytest`, `jsonschema`, `referencing`.
 - No awkit tool is imported or called; git is the only external program (plus `lsof` on macOS).
 

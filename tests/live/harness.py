@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from wtctl.credentials import NetworkKind, prepare_network_auth, run_network_git
 from wtctl.gateway import Gateway, GitResult
 from wtctl.hardgit import Git
 
+Record = Callable[[str, object], None]  # pytest's ``record_property`` fixture
 ACTOR = "human:live"
 FRESH_KEYS = frozenset({"core.repositoryformatversion", "core.filemode", "core.bare"})
 # Token shapes of the common forge CLIs, scrubbed from output even when the value is not known

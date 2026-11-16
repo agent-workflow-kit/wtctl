@@ -9,15 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from tests.live import liveenv, scenarios as sc, worlds
+from tests.live import liveenv, worlds
+from tests.live import scenarios as sc
+from tests.live.harness import Record
 from tests.live.liveenv import FORGES
 
 pytestmark = pytest.mark.live
 needs = pytest.mark.needs
 
-FORGE_PARAMS = [
-    pytest.param(key, id=key, marks=needs(f"{key}:public")) for key in sorted(FORGES)
-]
+FORGE_PARAMS = [pytest.param(key, id=key, marks=needs(f"{key}:public")) for key in sorted(FORGES)]
 
 
 @pytest.mark.parametrize("key", FORGE_PARAMS)
@@ -50,15 +50,13 @@ def test_port_443_in_the_url_matches_the_bare_host(key: str, tmp_path: Path) -> 
     host's header and reach the same server."""
     forge = FORGES[key]
     project = liveenv.project_path(forge, "PUBLIC_REPO")
-    w = worlds.public_world(
-        tmp_path, forge, clone_url=f"https://{forge.host}:443/{project}.git"
-    )
+    w = worlds.public_world(tmp_path, forge, clone_url=f"https://{forge.host}:443/{project}.git")
     sc.tip_by_sha(w, 1)
 
 
 @pytest.mark.parametrize("key", FORGE_PARAMS)
 def test_a_redirecting_url_is_not_followed_blindly(
-    key: str, tmp_path: Path, record_property: pytest.RecordProperty
+    key: str, tmp_path: Path, record_property: Record
 ) -> None:
     """``http.followRedirects=false``: a URL without ``.git`` (the forges redirect it) is
     fetched directly or refused, never hung on. The outcome is recorded for the checklist."""
@@ -71,9 +69,7 @@ def test_a_redirecting_url_is_not_followed_blindly(
 
 
 @pytest.mark.parametrize("key", FORGE_PARAMS)
-def test_ssh_never_prompts(
-    key: str, tmp_path: Path, record_property: pytest.RecordProperty
-) -> None:
+def test_ssh_never_prompts(key: str, tmp_path: Path, record_property: Record) -> None:
     """Real ssh in batch mode: no key means ``auth_required`` at once, not a hung prompt.
     ``WTCTL_LIVE_SSH_EXPECT`` pins the expected outcome (run it once with no usable key and
     once with a passphrase-locked key and no agent, both ``auth_required``)."""
@@ -88,9 +84,7 @@ def test_ssh_never_prompts(
     record_property("ssh_outcome", sc.ssh_batchmode(w, sha, expect))
 
 
-FORK_PARAMS = [
-    pytest.param(key, id=key, marks=needs(f"{key}:fork")) for key in sorted(FORGES)
-]
+FORK_PARAMS = [pytest.param(key, id=key, marks=needs(f"{key}:fork")) for key in sorted(FORGES)]
 
 
 @pytest.mark.parametrize("key", FORK_PARAMS)
@@ -102,9 +96,7 @@ def test_a_fork_request_head_is_fetched_by_sha(key: str, tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("key", FORK_PARAMS)
-def test_a_fork_only_commit_is_observed(
-    key: str, tmp_path: Path, record_property: pytest.RecordProperty
-) -> None:
+def test_a_fork_only_commit_is_observed(key: str, tmp_path: Path, record_property: Record) -> None:
     """A commit in a fork and in no PR or MR head: the outcome (fetched or ``ref_not_found``)
     is recorded, not asserted; it differs per forge."""
     forge = FORGES[key]

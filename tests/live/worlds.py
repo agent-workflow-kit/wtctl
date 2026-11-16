@@ -82,9 +82,7 @@ def private_world(
     )  # fmt: skip
 
 
-def push_world(
-    base: Path, forge: Forge, *, environ: Mapping[str, str] | None = None
-) -> LiveWorld:
+def push_world(base: Path, forge: Forge, *, environ: Mapping[str, str] | None = None) -> LiveWorld:
     """The disposable repository with the write token."""
     name = liveenv.token_env_name(forge.var("PUSH_TOKEN_ENV"), environ)
     value = liveenv.token_value(forge.var("PUSH_TOKEN_ENV"), environ)

@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.live import liveenv, scenarios as sc, worlds
+from tests.live import liveenv, worlds
+from tests.live import scenarios as sc
 from tests.live.liveenv import FORGES
 
 pytestmark = pytest.mark.live

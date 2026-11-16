@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.live import liveenv, scenarios as sc, worlds
+from tests.live import liveenv, worlds
+from tests.live import scenarios as sc
+from tests.live.harness import Record
 from tests.live.liveenv import FORGES
 
 pytestmark = pytest.mark.live
@@ -37,7 +39,7 @@ def test_a_private_repository_without_a_token_is_auth_required(key: str, tmp_pat
 
 @pytest.mark.parametrize("key", PRIVATE)
 def test_a_rejected_token_says_so_and_does_not_fall_back(
-    key: str, tmp_path: Path, record_property: pytest.RecordProperty
+    key: str, tmp_path: Path, record_property: Record
 ) -> None:
     """A7: a bad token gets 401 and the message names the token, not its absence."""
     sha = worlds.private_world(tmp_path / "ref", FORGES[key]).tip("HEAD")
@@ -50,9 +52,7 @@ def test_port_443_still_gets_the_token(key: str, tmp_path: Path) -> None:
     """The header is scoped to the bare host; real git must match it for a ``:443`` URL."""
     forge = FORGES[key]
     project = liveenv.project_path(forge, "PRIVATE_REPO")
-    w = worlds.private_world(
-        tmp_path, forge, clone_url=f"https://{forge.host}:443/{project}.git"
-    )
+    w = worlds.private_world(tmp_path, forge, clone_url=f"https://{forge.host}:443/{project}.git")
     sc.token_fetch(w)
 
 

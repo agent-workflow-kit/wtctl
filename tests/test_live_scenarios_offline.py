@@ -115,10 +115,11 @@ def test_push_deletes_its_branch_when_a_step_fails(
 
 
 def test_the_throwaway_is_removed_when_the_body_fails(world: LiveWorld) -> None:
+    paths: list[Path] = []
     with pytest.raises(RuntimeError), sc.throwaway(world, world.tip("HEAD"), depth=1) as rec:
-        path = Path(rec["path"])
+        paths.append(Path(rec["path"]))
         raise RuntimeError("body failed")
-    assert not path.exists()
+    assert paths and not paths[0].exists()
 
 
 @pytest.mark.parametrize(

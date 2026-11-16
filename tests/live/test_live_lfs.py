@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.live import liveenv, scenarios as sc, worlds
+from tests.live import liveenv, worlds
+from tests.live import scenarios as sc
 
 pytestmark = [pytest.mark.live, pytest.mark.needs("lfs")]
 
