@@ -12,7 +12,7 @@ from tests.schemacheck import validate
 from tests.test_bootstrap_cmd import err_of, made, rerun
 from tests.test_create import ok
 from wtctl import errors
-from wtctl.errors import WARNINGS_MAX, WARNING_MAX_CHARS, WtctlError, bounded_warnings
+from wtctl.errors import WARNING_MAX_CHARS, WARNINGS_MAX, WtctlError, bounded_warnings
 
 PY = sys.executable
 FAIL = {"argv": [PY, "-c", "raise SystemExit(3)"]}
@@ -50,7 +50,7 @@ def test_a_failing_rerun_reports_the_copy_env_warnings(w: CW, capsys) -> None:  
     rec = made(w, capsys)
     w.repo_cfg["copy_env"] = ["/abs"]
     w.repo_cfg["bootstrap"] = {"steps": [FAIL]}
-    err = err_of(rerun(w, capsys, rec["id"], "--copy-env", human=False), 12)
+    err = err_of(rerun(w, capsys, rec["id"], "--copy-env"), 12)
     validate("wtctl/cli/error.json", {"error": err})
     assert any("copy_env" in m and "/abs" in m for m in err["details"]["warnings"])
 
@@ -78,6 +78,7 @@ def test_a_successful_create_still_reports_them_in_warnings(w: CW, capsys) -> No
 def test_bounded_warnings_caps_count_length_and_escapes() -> None:
     long = "a" * (WARNING_MAX_CHARS * 3)
     out = bounded_warnings([long, "line1\nline2", "nul\0byte", *["x"] * (WARNINGS_MAX + 10)])
+    assert out is not None
     assert len(out) == WARNINGS_MAX
     assert len(out[0]) <= WARNING_MAX_CHARS and out[0].endswith("...")
     assert out[1] == "line1\\x0aline2" and out[2] == "nul\\x00byte"
@@ -85,6 +86,7 @@ def test_bounded_warnings_caps_count_length_and_escapes() -> None:
 
 def test_bounded_warnings_keeps_surrogates_json_safe() -> None:
     out = bounded_warnings(["bad \udcff name"])
+    assert out is not None
     out[0].encode("utf-8")  # must not raise
 
 
@@ -114,6 +116,8 @@ def test_warnings_belong_to_bootstrap_failed_only() -> None:
 def test_the_limits_match_the_schema() -> None:
     import json
 
-    schema = json.loads(Path(errors.__file__).parents[2].joinpath("schemas/cli/error.json").read_text())
+    schema = json.loads(
+        Path(errors.__file__).parents[2].joinpath("schemas/cli/error.json").read_text()
+    )
     prop = schema["properties"]["error"]["properties"]["details"]["properties"]["warnings"]
     assert prop["maxItems"] == WARNINGS_MAX and prop["items"]["maxLength"] == WARNING_MAX_CHARS

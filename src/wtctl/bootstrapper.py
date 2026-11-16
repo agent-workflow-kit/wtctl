@@ -15,6 +15,7 @@ TODO(#5): log the ``bootstrap`` events (step runs, copied files) when the log la
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import fnmatch
@@ -24,7 +25,7 @@ import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
-from . import fsafe, gateway, removalfs
+from . import fsafe, fsafe_child, gateway, removalfs
 from .errors import WtctlError
 from .hardgit import Git, PorcelainError, parse_status_v2
 
@@ -39,6 +40,8 @@ ENV_FILE_MAX_BYTES = 1024 * 1024  # an env file larger than this is not copied
 ENV_FILE_MAX_COUNT = 1000
 ENV_WALK_LIMIT = 200_000  # directory entries the copy_env source walk reads
 ENV_WALK_DEPTH = 255  # directory levels the copy_env source walk enters
+ENV_BATCH_BYTES = 8 * 1024 * 1024  # content one copy_env read child returns (it stops after this)
+ENV_WARN_CAP = 200  # warnings the copy_env walk child returns (the rest are counted in one)
 _CHUNK = 1 << 16
 
 Warn = Callable[[str], None]
@@ -411,7 +414,7 @@ def _match_dir(
     out.add((*rel, comp))
 
 
-def _read_source(anchor: fsafe.Anchor, root_fd: int, rel: tuple[str, ...]) -> bytes:
+def _read_source(anchor: fsafe.Anchor, root_fd: int, rel: tuple[str, ...], max_bytes: int) -> bytes:
     """The content of one source file: every component opened no-follow below the anchor, a
     regular file with link count 1, read from the opened fd (``FsafeError`` otherwise)."""
     dirfd = fsafe.open_chain(anchor, root_fd, rel[:-1], start_path=anchor.path)
@@ -421,7 +424,7 @@ def _read_source(anchor: fsafe.Anchor, root_fd: int, rel: tuple[str, ...]) -> by
         os.close(dirfd)
     try:
         size = os.fstat(fd).st_size
-        if size > ENV_FILE_MAX_BYTES:
+        if size > max_bytes:
             raise fsafe.FsafeError("limit", f"too large ({size} bytes)")
         chunks: list[bytes] = []
         got = 0
@@ -430,7 +433,7 @@ def _read_source(anchor: fsafe.Anchor, root_fd: int, rel: tuple[str, ...]) -> by
             if not data:
                 break
             got += len(data)
-            if got > ENV_FILE_MAX_BYTES:
+            if got > max_bytes:
                 raise fsafe.FsafeError("limit", "too large (it grew while being read)")
             chunks.append(data)
         return b"".join(chunks)
@@ -471,6 +474,111 @@ def _tracked_conflict(rel: tuple[str, ...], folded: set[str]) -> bool:
     return any("/".join(rel[: i + 1]).casefold() in folded for i in range(len(rel)))
 
 
+# -- the child operations (fsafe_child ``env_match`` and ``env_read``) -------------------------
+
+
+def env_match_op(args: dict[str, Any]) -> dict[str, Any]:
+    """Child: open the clone's main worktree, check its ``.git`` identity (``common_id``) and walk
+    it for the ``plans`` (lists of glob components). Returns the root ``identity``, the sorted
+    ``matches``, the capped ``warnings`` and ``refuse`` (a final warning when the root must not
+    be used). An anchor that cannot be opened raises ``FsafeError``."""
+    spec = args["anchor"]
+    plans = [[str(c) for c in plan] for plan in args["plans"]]
+    limit = int(args["limit"])
+    common_id = args.get("common_id")
+    anchor = fsafe.open_anchor(str(spec["path"]), expected=None)
+    warnings: list[str] = []
+    dropped = [0]
+
+    def warn(text: str) -> None:
+        if len(warnings) < ENV_WARN_CAP:
+            warnings.append(text)
+        else:
+            dropped[0] += 1
+
+    try:
+        root = fsafe.identity_of(anchor.fd)
+        out: dict[str, Any] = {
+            "identity": [root.dev, root.ino],
+            "matches": [],
+            "warnings": warnings,
+            "refuse": None,
+        }
+        if common_id:
+            try:
+                gfd = fsafe.open_dir(anchor, anchor.fd, ".git")
+            except fsafe.FsafeError as exc:
+                out["refuse"] = (
+                    f"copy_env: the clone's .git cannot be checked ({exc.kind}); nothing copied"
+                )
+                return out
+            try:
+                ident = fsafe.identity_of(gfd)
+            finally:
+                os.close(gfd)
+            if f"{ident.dev}:{ident.ino}" != str(common_id):
+                out["refuse"] = (
+                    "copy_env: the clone's main worktree is not the recorded clone; nothing copied"
+                )
+                return out
+        matches: set[tuple[str, ...]] = set()
+        budget = [limit]
+        try:
+            for comps in plans:
+                _match(anchor, anchor.fd, comps, matches, budget, warn)
+        except (fsafe.FsafeError, OSError, RecursionError) as exc:
+            warn(f"copy_env: the source walk stopped early ({getattr(exc, 'kind', 'io')})")
+        if dropped[0]:
+            warnings.append(f"copy_env: {dropped[0]} more warnings were suppressed")
+        out["matches"] = [list(m) for m in sorted(matches)]
+        return out
+    finally:
+        anchor.close()
+
+
+def env_read_op(args: dict[str, Any]) -> dict[str, Any]:
+    """Child: read the files ``paths`` (lists of components) below the clone's main worktree,
+    re-opened against the identity ``env_match`` reported. Stops after ``batch_bytes`` of content
+    (at least one file is read). ``files`` has one entry per file read: ``{"data": base64}`` or
+    ``{"kind", "message"}``; ``next`` is the index of the first file not read."""
+    spec = args["anchor"]
+    paths = args["paths"]
+    max_bytes = int(args["max_bytes"])
+    batch_bytes = int(args["batch_bytes"])
+    raw = spec.get("identity")
+    expected = None
+    if raw is not None:
+        if not (isinstance(raw, list) and len(raw) == 2 and all(isinstance(i, int) for i in raw)):
+            raise fsafe.FsafeError("bad_request", f"not an identity: {raw!r}")
+        expected = fsafe.Identity(int(raw[0]), int(raw[1]))
+    anchor = fsafe.open_anchor(str(spec["path"]), expected=expected)
+    files: list[dict[str, Any]] = []
+    total = 0
+    try:
+        for parts in paths:
+            if files and total >= batch_bytes:
+                break
+            try:
+                data = _read_source(anchor, anchor.fd, tuple(str(c) for c in parts), max_bytes)
+            except fsafe.FsafeError as exc:
+                files.append({"kind": exc.kind, "message": exc.message})
+            except OSError as exc:
+                files.append({"kind": "io", "message": exc.strerror or str(exc)})
+            else:
+                total += len(data)
+                files.append({"data": base64.b64encode(data).decode("ascii")})
+    finally:
+        anchor.close()
+    return {"files": files, "next": len(files)}
+
+
+# -- copy_env ---------------------------------------------------------------------------------
+
+
+def _child_failure(res: Any) -> str:
+    return "deadline" if res.timed_out else (res.error.kind if res.error is not None else "failed")
+
+
 def copy_env_files(
     wt: Worktree,
     *,
@@ -480,11 +588,18 @@ def copy_env_files(
     warn: Warn,
     common_dir: str | None = None,
     common_id: str | None = None,
+    on_tick: Callable[[], bool | None] | None = None,
 ) -> list[Copied]:
     """Copy the files matching ``patterns`` from the clone's main worktree into ``wt``.
 
-    Nothing is ever overwritten or followed; any file that cannot be copied under the rules is
-    skipped with a warning. A source root that cannot be opened safely copies nothing.
+    Everything that touches the source (the anchor open, the ``.git`` identity check, the walk and
+    every read) runs in child processes under the 60 s walk deadline (``fsafe_child`` ``env_match``
+    and ``env_read``); a walk that does not finish copies nothing, and a read that does not finish
+    copies nothing more (files of earlier, completed reads stay). The destination is written here,
+    in the parent, from the verified bytes. Nothing is ever overwritten or followed; any file that
+    cannot be copied under the rules is skipped with a warning. A source root that cannot be opened
+    safely copies nothing. ``on_tick`` (the lease renewal) runs before each child; a True result
+    (lease lost) stops the copy.
     """
     if not patterns:
         return []
@@ -497,77 +612,143 @@ def copy_env_files(
             plans.append(comps)
     if not plans:
         return []
-    try:
-        src = fsafe.open_anchor(source_root)
-    except fsafe.FsafeError as exc:
-        warn(f"copy_env: the clone's main worktree cannot be opened ({exc.kind}); nothing copied")
+
+    def lost() -> bool:
+        if on_tick is not None and on_tick():
+            warn("copy_env: the lease was lost; nothing more copied")
+            return True
+        return False
+
+    if lost():
         return []
-    try:
-        if common_dir is not None and common_id and common_dir == source_root.rstrip("/") + "/.git":
-            try:
-                gfd = fsafe.open_dir(src, src.fd, ".git")
-            except fsafe.FsafeError as exc:
-                warn(f"copy_env: the clone's .git cannot be checked ({exc.kind}); nothing copied")
-                return []
-            try:
-                ident = fsafe.identity_of(gfd)
-            finally:
-                os.close(gfd)
-            if f"{ident.dev}:{ident.ino}" != common_id:
+    use_common = (
+        common_dir is not None and common_id and common_dir == source_root.rstrip("/") + "/.git"
+    )
+    res = removalfs.run(
+        "env_match",
+        {
+            "anchor": {"path": source_root, "identity": None},
+            "plans": plans,
+            "limit": ENV_WALK_LIMIT,
+            "common_id": common_id if use_common else None,
+        },
+    )
+    if not res.ok or res.value is None:
+        if res.timed_out:
+            warn(
+                f"copy_env: the source walk exceeded its {fsafe_child.WALK_DEADLINE:g} s deadline "
+                "and was killed; nothing copied"
+            )
+        else:
+            warn(
+                "copy_env: the clone's main worktree cannot be opened "
+                f"({_child_failure(res)}); nothing copied"
+            )
+        return []
+    value = res.value
+    for text in value.get("warnings", []):
+        warn(str(text))
+    if value.get("refuse"):
+        warn(str(value["refuse"]))
+        return []
+    root_id = value["identity"]
+    matches = sorted(tuple(str(c) for c in m) for m in value["matches"])
+    folded = {t.casefold() for t in tracked}
+    eligible = [
+        rel
+        for rel in matches
+        if _text("/".join(rel)) is not None
+        and "\0" not in "/".join(rel)
+        and not _tracked_conflict(rel, folded)
+    ]
+    position = {rel: i for i, rel in enumerate(eligible)}
+    results: dict[tuple[str, ...], dict[str, Any]] = {}
+    budget = fsafe_child.Budget(fsafe_child.WALK_DEADLINE)  # all reads together: one walk
+
+    def fetch(rel: tuple[str, ...]) -> bool:
+        """Read the next batch of files from ``rel`` on into ``results``."""
+        if lost():
+            return False
+        start = position[rel]
+        window = eligible[start : start + ENV_FILE_MAX_COUNT]
+        got = removalfs.run(
+            "env_read",
+            {
+                "anchor": {"path": source_root, "identity": root_id},
+                "paths": [list(r) for r in window],
+                "max_bytes": ENV_FILE_MAX_BYTES,
+                "batch_bytes": ENV_BATCH_BYTES,
+            },
+            budget=budget,
+        )
+        files = got.value.get("files") if got.ok and got.value is not None else None
+        if not files:
+            if got.timed_out:
                 warn(
-                    "copy_env: the clone's main worktree is not the recorded clone; nothing copied"
+                    f"copy_env: reading the source exceeded its {fsafe_child.WALK_DEADLINE:g} s "
+                    "deadline and was killed; nothing more copied"
                 )
-                return []
-        matches: set[tuple[str, ...]] = set()
-        budget = [ENV_WALK_LIMIT]
+            else:
+                kind = _child_failure(got)
+                warn(f"copy_env: reading the source failed ({kind}); nothing more copied")
+            return False
+        for k, entry in enumerate(files[: len(window)]):
+            results[window[k]] = entry
+        return True
+
+    copied: list[Copied] = []
+    for rel in matches:
+        shown = _esc("/".join(rel))
+        text = "/".join(rel)
+        if _text(text) is None or "\0" in text:
+            warn(f"copy_env: {shown!r} is not valid UTF-8; skipped")
+            continue
+        if len(copied) >= ENV_FILE_MAX_COUNT:
+            warn(f"copy_env: more than {ENV_FILE_MAX_COUNT} matches; the rest are skipped")
+            break
+        if _tracked_conflict(rel, folded):
+            warn(f"copy_env: {shown!r} is tracked in the worktree; skipped")
+            continue
+        if rel not in results and not fetch(rel):
+            break
+        entry = results.pop(rel, None)
+        if entry is None:
+            continue
+        data = _entry_data(entry)
+        if data is None:
+            kind = str(entry.get("kind", "io"))
+            if kind == "missing":
+                continue  # raced away between the walk and the read: silently skipped
+            why = {"hardlink": "it is a hard link", "symlink": "it is a symlink"}.get(
+                kind, str(entry.get("message", kind)) if kind in ("limit", "io") else kind
+            )
+            warn(f"copy_env: {shown!r} not copied: {_esc(why)}")
+            continue
         try:
-            # TODO(#10): run the copy_env source walk in fsafe_child with the 60 s deadline (add ops to fsafe_child.OPS)  # noqa: E501
-            for comps in plans:
-                _match(src, src.fd, comps, matches, budget, warn)
-        except (fsafe.FsafeError, OSError, RecursionError) as exc:
-            warn(f"copy_env: the source walk stopped early ({getattr(exc, 'kind', 'io')})")
-        folded = {t.casefold() for t in tracked}
-        copied: list[Copied] = []
-        for rel in sorted(matches):
-            shown = _esc("/".join(rel))
-            text = "/".join(rel)
-            if _text(text) is None or "\0" in text:
-                warn(f"copy_env: {shown!r} is not valid UTF-8; skipped")
-                continue
-            if len(copied) >= ENV_FILE_MAX_COUNT:
-                warn(f"copy_env: more than {ENV_FILE_MAX_COUNT} matches; the rest are skipped")
-                break
-            if _tracked_conflict(rel, folded):
-                warn(f"copy_env: {shown!r} is tracked in the worktree; skipped")
-                continue
-            try:
-                data = _read_source(src, src.fd, rel)
-            except fsafe.FsafeError as exc:
-                if exc.kind == "missing":
-                    continue  # raced away between the walk and the read: silently skipped
-                why = {"hardlink": "it is a hard link", "symlink": "it is a symlink"}.get(
-                    exc.kind, exc.message if exc.kind == "limit" else exc.kind
-                )
-                warn(f"copy_env: {shown!r} not copied: {why}")
-                continue
-            except OSError as exc:
-                warn(f"copy_env: {shown!r} not copied: {exc.strerror}")
-                continue
-            try:
-                _write_dest(wt, rel, data)
-            except fsafe.FsafeError as exc:
-                if exc.kind == "missing":
-                    continue  # raced away: not a match any more
-                why = "it already exists" if exc.kind == "exists" else f"destination {exc.kind}"
-                warn(f"copy_env: {shown!r} not copied: {why}")
-                continue
-            except OSError as exc:
-                warn(f"copy_env: {shown!r} not copied: {exc.strerror}")
-                continue
-            copied.append(Copied(text, hashlib.sha256(data).hexdigest()))
-        return copied
-    finally:
-        src.close()
+            _write_dest(wt, rel, data)
+        except fsafe.FsafeError as exc:
+            if exc.kind == "missing":
+                continue  # raced away: not a match any more
+            why = "it already exists" if exc.kind == "exists" else f"destination {exc.kind}"
+            warn(f"copy_env: {shown!r} not copied: {why}")
+            continue
+        except OSError as exc:
+            warn(f"copy_env: {shown!r} not copied: {exc.strerror}")
+            continue
+        copied.append(Copied(text, hashlib.sha256(data).hexdigest()))
+    return copied
+
+
+def _entry_data(entry: Mapping[str, Any]) -> bytes | None:
+    """The bytes of a read result, or None when it is an error entry (or malformed)."""
+    raw = entry.get("data")
+    if not isinstance(raw, str):
+        return None
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except ValueError:
+        return None
+    return data if len(data) <= ENV_FILE_MAX_BYTES else None
 
 
 # -- steps (Bootstrap steps 3 and 5) ----------------------------------------------------------
@@ -799,6 +980,7 @@ def run_bootstrap(
                     warn=warn,
                     common_dir=record.get("common_dir"),
                     common_id=record.get("common_id"),
+                    on_tick=on_tick,
                 )
         results: list[dict[str, Any]] = []
         failed = False

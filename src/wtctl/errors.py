@@ -5,7 +5,8 @@ The mapping is the "Errors" table in docs/interface.md; ``schemas/cli/error.json
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
 
@@ -71,6 +72,36 @@ REFUSAL_REASONS = frozenset(
         "locked",
     }
 )
+
+# `details.warnings` of bootstrap_failed (schemas/cli/error.json): bounded in count and length.
+WARNINGS_MAX = 50
+WARNING_MAX_CHARS = 1024
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def bounded_warnings(warnings: Sequence[str]) -> list[str] | None:
+    """The run's warnings as ``details.warnings``: at most ``WARNINGS_MAX`` entries of at most
+    ``WARNING_MAX_CHARS`` characters, control characters escaped (``\\xNN``) and lone surrogates
+    (names that are not UTF-8) made printable; None when there are none."""
+    out: list[str] = []
+    for text in warnings[:WARNINGS_MAX]:
+        text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+        text = _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+        if len(text) > WARNING_MAX_CHARS:
+            text = text[: WARNING_MAX_CHARS - 3] + "..."
+        out.append(text)
+    return out or None
+
+
+def bootstrap_failed_details(record: Any, step: Any, warnings: Sequence[str]) -> dict[str, Any]:
+    """``details`` of ``bootstrap_failed``: the record, the failed step and, when the run warned
+    (``copy_env`` skips, a stopped scan), the bounded warnings."""
+    details: dict[str, Any] = {"record": record, "step": step}
+    bounded = bounded_warnings(warnings)
+    if bounded:
+        details["warnings"] = bounded
+    return details
+
 
 # `details.cause` values the schema allows, per code (when the cause is present).
 _CAUSES = {
@@ -172,6 +203,16 @@ def _validate(code: str, fields: Mapping[str, Any]) -> None:
         details_need(_REASON_DETAILS[reason])
 
     details = fields.get("details")
+    if isinstance(details, dict) and "warnings" in details:
+        warns = details["warnings"]
+        if code != "bootstrap_failed":
+            fail("details.warnings is only for bootstrap_failed")
+        if not (
+            isinstance(warns, list)
+            and len(warns) <= WARNINGS_MAX
+            and all(isinstance(m, str) and len(m) <= WARNING_MAX_CHARS for m in warns)
+        ):
+            fail(f"details.warnings is at most {WARNINGS_MAX} strings of {WARNING_MAX_CHARS} chars")
     cause = details.get("cause") if isinstance(details, dict) else None
     if cause is not None and code in _CAUSES and cause not in _CAUSES[code]:
         fail(f"details.cause must be one of {sorted(_CAUSES[code])}")
