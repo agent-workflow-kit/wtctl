@@ -144,14 +144,14 @@ def test_userinfo_in_the_remote_is_stripped_from_the_fetch_url(
     assert stored is not None and "s3cret" not in json.dumps(stored)
 
 
-def test_scp_like_remote_is_accepted_and_reported_stripped(
+def test_scp_like_remote_is_accepted_and_reported_with_its_user(
     w: World, capsys: pytest.CaptureFixture[str]
 ) -> None:
     clone = w.stub(w.tmp / "mine", "git@example.test:org/repo.git")
     w.repos[REPO] = {"clone": str(clone)}
     r = w.cli(capsys, "locate", REPO)
     assert r.code == 0, r.out
-    assert r.json()["fetch_url"] == "example.test:org/repo.git"
+    assert r.json()["fetch_url"] == "git@example.test:org/repo.git"  # #63: the user is kept
 
 
 def test_custom_remote_name(w: World, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1558,3 +1558,199 @@ def test_the_reaccept_prompt_escapes_untrusted_mount_text(
     monkeypatch.setattr(clone_cmd, "confirm", lambda q, *, tty: asked.append(q) or False)
     w.cli(capsys, "clone", REPO, human=True)
     assert len(asked) == 1 and "\x1b" not in asked[0] and "\\x1b[2J" in asked[0]
+
+
+# -- the SSH user in the fetch URL (#63) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("remote", "fetch"),
+    [
+        ("git@example.test:org/repo.git", "git@example.test:org/repo.git"),
+        ("example.test:org/repo.git", "example.test:org/repo.git"),
+        ("ssh://git@example.test/org/repo", "ssh://git@example.test/org/repo"),
+        ("ssh://git@example.test:2222/org/repo", "ssh://git@example.test:2222/org/repo"),
+        ("ssh://Svc.User:hunter2@example.test/org/repo", "ssh://Svc.User@example.test/org/repo"),
+        ("https://bot:s3cret@example.test/org/repo.git", URL),
+        ("https://bot@example.test/org/repo.git", URL),
+    ],
+)
+def test_the_ssh_user_is_kept_and_the_password_dropped(
+    w: World, capsys: pytest.CaptureFixture[str], remote: str, fetch: str
+) -> None:
+    clone = w.stub(w.tmp / "mine", remote)
+    w.repos[REPO] = {"clone": str(clone)}
+    r = w.cli(capsys, "locate", REPO)
+    assert r.code == 0, r.out
+    assert r.json()["fetch_url"] == fetch
+    stored = row()
+    assert stored is not None and stored["fetch_url"] == fetch
+    assert "hunter2" not in r.out + r.err + json.dumps(stored)
+
+
+def test_changing_the_user_of_the_remote_keeps_one_identity_and_updates_the_url(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine", "example.test:org/repo.git")
+    w.repos[REPO] = {"clone": str(clone)}
+    assert w.cli(capsys, "locate", REPO).json()["fetch_url"] == "example.test:org/repo.git"
+    g(["config", "remote.origin.url", "git@example.test:org/repo.git"], clone, w.home)
+    r = w.cli(capsys, "locate", REPO)
+    assert r.code == 0 and r.json()["fetch_url"] == "git@example.test:org/repo.git"
+    row_ = row()
+    assert row_ is not None and row_["fetch_url"] == "git@example.test:org/repo.git"
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "-oProxyCommand=touch_x@example.test:org/repo.git",
+        "a-oProxyCommand=x@example.test:org/repo.git",
+        "ssh://-oProxyCommand=x@example.test/org/repo.git",
+        "--upload-pack=x@example.test:org/repo.git",
+        "a@b@example.test:org/repo.git",
+        "ssh://a@b@example.test/org/repo.git",
+        "user:pass@example.test:org/repo.git",
+        "@example.test:org/repo.git",
+        "ssh://@example.test/org/repo.git",
+        "u%41@example.test:org/repo.git",
+        "x" * 33 + "@example.test:org/repo.git",
+        "ssh://a b@example.test/org/repo.git",
+        "ssh://[::1]/org/repo.git",
+        "ssh://git@[::1]/org/repo.git",
+        "git@example.test:org/other.git",
+        "git@evil.test:org/repo.git",
+    ],
+)
+def test_a_hostile_or_foreign_ssh_remote_is_remote_mismatch(
+    w: World, capsys: pytest.CaptureFixture[str], remote: str
+) -> None:
+    clone = w.stub(w.tmp / "mine", remote)
+    w.repos[REPO] = {"clone": str(clone)}
+    r = w.cli(capsys, "locate", REPO)
+    assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch")
+    assert row() is None
+
+
+@pytest.mark.parametrize("prefix", ["git@example.test:", "example.test:", "git@"])
+def test_an_insteadof_on_the_user_bearing_url_is_refused(
+    w: World, capsys: pytest.CaptureFixture[str], prefix: str
+) -> None:
+    clone = w.stub(w.tmp / "mine", "git@example.test:org/repo.git")
+    g(["config", "url.ssh://evil.test/.insteadOf", prefix], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    r = w.cli(capsys, "locate", REPO)
+    if prefix == "example.test:":
+        # Does not prefix "git@example.test:...": git would not rewrite this URL either.
+        assert r.code == 0
+    else:
+        assert (r.code, r.json()["error"]["code"]) == (12, "remote_mismatch")
+
+
+def test_two_urls_for_the_remote_are_still_refused(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine", "git@example.test:org/repo.git")
+    g(["config", "--add", "remote.origin.url", "git@evil.test:org/repo.git"], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    assert w.cli(capsys, "locate", REPO).code == 12
+
+
+def test_a_pushurl_on_an_ssh_user_remote_is_refused(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clone = w.stub(w.tmp / "mine", "git@example.test:org/repo.git")
+    g(["config", "remote.origin.pushurl", "git@evil.test:org/repo.git"], clone, w.home)
+    w.repos[REPO] = {"clone": str(clone)}
+    assert w.cli(capsys, "locate", REPO).code == 12
+
+
+@pytest.mark.parametrize(
+    ("template", "want"),
+    [
+        ("git@{host}:{path}.git", "git@example.test:org/repo.git"),
+        ("ssh://git:hunter2@{host}/{path}.git", "ssh://git@example.test/org/repo.git"),
+        ("ssh://git@{host}:2222/{path}.git", "ssh://git@example.test:2222/org/repo.git"),
+        ("https://bob@{host}/{path}.git", URL),
+    ],
+)
+def test_a_template_ssh_user_reaches_git_after_the_separator_and_never_a_token(
+    w: World, template: str, want: str
+) -> None:
+    w.top["hosts"] = {"example.test": {"clone_url": template, "token_env": "WTCTL_TEST_TOKEN"}}
+    captured: list[dict[str, Any]] = []
+
+    def runner(argv: list[str], **kw: Any) -> GitResult:
+        if "clone" in argv:
+            captured.append({"argv": argv, **kw})
+            return GitResult(128, b"", b"fatal: x")
+        return Gateway().git(argv, **kw)
+
+    res = make_resolver(w, runner=runner)
+    assert res.clone_url(REPO) == want
+    with pytest.raises(WtctlError):
+        res.clone(REPO)
+    argv = captured[0]["argv"]
+    assert argv[argv.index("--") + 1] == want
+    assert "hunter2" not in " ".join(argv)
+    env = captured[0]["env"]
+    if want.startswith("https"):
+        assert env["GIT_ALLOW_PROTOCOL"] == "https"
+    else:
+        assert env["GIT_ALLOW_PROTOCOL"] == "ssh"
+        assert not any("Authorization" in str(v) for v in env.values())
+        assert "GIT_SSH_COMMAND" not in env
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "-oProxyCommand=x@{host}:{path}.git",
+        "a@b@{host}:{path}.git",
+        "user:pass@{host}:{path}.git",
+        "ssh://-oProxyCommand=x@{host}/{path}.git",
+        "ssh://a@b@{host}/{path}.git",
+        "@{host}:{path}.git",
+    ],
+)
+def test_a_hostile_template_user_is_remote_mismatch_without_echo(w: World, template: str) -> None:
+    w.top["hosts"] = {"example.test": {"clone_url": template}}
+    with pytest.raises(WtctlError) as exc:
+        make_resolver(w).clone_url(REPO)
+    assert exc.value.code == "remote_mismatch"
+    assert "ProxyCommand" not in exc.value.message and "pass" not in exc.value.message
+
+
+def test_the_host_settings_are_looked_up_by_host_never_by_user(w: World) -> None:
+    w.top["hosts"] = {"example.test": {"clone_url": "git@{host}:{path}.git"}}
+    cfg = load_config(w.config())
+    assert cfg.host("example.test").clone_url == "git@{host}:{path}.git"
+    assert urls_host("git@example.test:org/repo") == "example.test"
+    assert urls_host("ssh://svc@Example.Test:2222/org/repo") == "example.test"
+
+
+def urls_host(url: str) -> str | None:
+    from wtctl import urls
+
+    return urls.url_host(url)
+
+
+def test_dry_run_clone_reports_the_user_bearing_url(w: World) -> None:
+    w.top["hosts"] = {"example.test": {"clone_url": "git@{host}:{path}.git"}}
+    res = make_resolver(w, readonly=True).clone(REPO)
+    assert res.fetch_url == "git@example.test:org/repo.git"
+
+
+def test_the_clone_config_keeps_the_ssh_user_after_a_cloned_local_source(
+    w: World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A fake ssh transport is not available; a local bare remote proves the round trip of the
+    # verified URL: a clone whose remote carries the user is verified, stored and reported with it.
+    bare = w.bare()
+    clone = w.tmp / "wt" / "clones" / "example.test" / "org" / "repo"
+    g(["clone", "-q", str(bare), str(clone)], w.tmp, w.home)
+    g(["config", "remote.origin.url", "ssh://git:pw@example.test/org/repo.git"], clone, w.home)
+    r = w.cli(capsys, "locate", REPO)
+    assert r.code == 0, r.out
+    assert r.json()["fetch_url"] == "ssh://git@example.test/org/repo.git"
+    assert "pw@" not in r.out

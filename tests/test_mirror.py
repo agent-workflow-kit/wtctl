@@ -89,6 +89,31 @@ def test_config_text_round_trips_awkward_urls(tmp_path: Path, private_home: Path
     assert keys_of(str(d))["remote.origin.url"] == url
 
 
+@pytest.mark.parametrize(
+    "url", ["git@h.example:o/r.git", "ssh://git@h.example:2222/o/r", "ssh://Svc.User@h.example/o/r"]
+)
+def test_the_mirror_config_keeps_the_ssh_user(tmp_path: Path, private_home: Path, url: str) -> None:
+    d = tmp_path / "c"
+    d.mkdir()
+    (d / "config").write_bytes(config_text(mirror_url(url)))
+    assert keys_of(str(d))["remote.origin.url"] == url
+
+
+def test_the_mirror_wants_a_config_with_the_ssh_user(w: World) -> None:
+    m = w.mirror(url="git@h.example:o/r.git")
+    assert b"url = \"git@h.example:o/r.git\"" in m._wanted_config()
+
+
+@pytest.mark.parametrize(
+    "url", ["-oProxyCommand=x@h.example:o/r", "a@b@h.example:o/r", "ssh://user:pw@h.example/o/r"]
+)
+def test_the_mirror_refuses_a_hostile_ssh_user(w: World, url: str) -> None:
+    m = w.mirror(url=url)
+    with pytest.raises(WtctlError) as exc:
+        m._wanted_config()
+    assert exc.value.code == "remote_mismatch" and "pw" not in exc.value.message
+
+
 def test_config_text_refuses_control_characters() -> None:
     with pytest.raises(ValueError):
         config_text("/tmp/a\nb")
