@@ -412,7 +412,14 @@ def op_baseline_claude(args: dict[str, object]) -> dict[str, object]:
     return repobaseline.op_baseline_claude(args)
 
 
+def op_extract_read(args: dict[str, object]) -> dict[str, object]:
+    from wtctl import extraction
+
+    return extraction.read_op(args)
+
+
 OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
+    "extract_read": op_extract_read,
     "walk": op_walk,
     "delete_tree": op_delete_tree,
     "admin_check": op_admin_check,
