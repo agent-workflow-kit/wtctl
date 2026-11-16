@@ -1,0 +1,19 @@
+{
+ "changes": [
+  {
+   "id": "<id>",
+   "from": "creating",
+   "to": "active",
+   "action": "adopt_after_crash"
+  }
+ ],
+ "reports": [
+  {
+   "kind": "adopted_after_crash",
+   "id": "<id>",
+   "path": "<tmp>/wt/worktrees/example.test/org/repo/one"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

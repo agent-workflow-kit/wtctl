@@ -1,0 +1,19 @@
+{
+ "changes": [
+  {
+   "id": "<id>",
+   "from": "active",
+   "to": "clone_missing",
+   "action": "mark_clone_missing"
+  }
+ ],
+ "reports": [
+  {
+   "kind": "clone_missing",
+   "id": "<id>",
+   "clone_path": "<tmp>/clone"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

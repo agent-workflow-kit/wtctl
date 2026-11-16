@@ -29,6 +29,7 @@ class Verdict:
     tip: str | None = None
     message: str | None = None
     head: str | None = None
+    head_file: str | None = None  # the text of the entry's HEAD file when it was verified
 
 
 def entry_args(rec: dict[str, Any]) -> dict[str, Any]:
@@ -183,4 +184,4 @@ def decide(
     for sha in sorted(seen):
         if not pushed(sha):
             return Verdict("kept_unpushed", sha, "a commit in the HEAD reflog is not pushed")
-    return Verdict("delete", head, head=head)
+    return Verdict("delete", head, head=head, head_file=info.get("head_file"))

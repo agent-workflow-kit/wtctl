@@ -1,0 +1,13 @@
+{
+ "changes": [],
+ "reports": [
+  {
+   "kind": "kept_unpushed",
+   "id": "<id>",
+   "tip": "<sha>",
+   "message": "a commit in the HEAD reflog is not pushed"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

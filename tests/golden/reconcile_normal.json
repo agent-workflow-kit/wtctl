@@ -1,0 +1,13 @@
+{
+ "changes": [
+  {
+   "id": "<id>",
+   "from": "active",
+   "to": "missing",
+   "action": "mark_missing"
+  }
+ ],
+ "reports": [],
+ "already_running": false,
+ "dry_run": false
+}

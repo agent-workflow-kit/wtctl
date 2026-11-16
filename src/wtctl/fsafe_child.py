@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import time
 from collections.abc import Callable
@@ -249,6 +250,49 @@ def op_admin_check(args: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _recheck_entry(
+    anchor: fsafe.Anchor,
+    parent: int,
+    name: str,
+    ident: fsafe.Identity,
+    expect_gitdir: str,
+    recheck: dict[str, object],
+) -> str | None:
+    """Reconcile's last look at the entry, on the very entry that is about to be deleted: why it
+    must not be deleted after all, or None. Everything inspected before is checked again: no
+    ``locked``, no ``modules``, no file below ``refs``, ``gitdir`` still naming the path,
+    ``commondir`` still the recorded common dir, ``HEAD`` still the text that was verified."""
+    fd = fsafe.open_dir(anchor, parent, name, owner_uid=os.geteuid())
+    try:
+        if fsafe.identity_of(fd, anchor.fs) != ident:
+            return "the entry was replaced"
+        for entry in ("locked", "modules"):
+            try:
+                anchor.fs.lstat_at(fd, entry)
+            except FileNotFoundError:
+                continue
+            return f"the entry now has {entry}"
+        if _refs_hold_files(anchor, fd):
+            return "the entry now holds per-worktree refs"
+        if _strip_nl(_read_small(anchor, fd, "gitdir")) != expect_gitdir:
+            return "the entry's gitdir changed"
+        cd = _strip_nl(_read_small(anchor, fd, "commondir"))
+        admin_dir, common_dir = recheck.get("admin_dir"), recheck.get("common_dir")
+        if (
+            cd is None
+            or not isinstance(admin_dir, str)
+            or not isinstance(common_dir, str)
+            or os.path.normpath(os.path.join(admin_dir, cd)) != os.path.normpath(common_dir)
+        ):
+            return "the entry's commondir is not the recorded common dir"
+        head = _strip_nl(_read_small(anchor, fd, "HEAD"))
+        if head is None or head != recheck.get("head_file"):
+            return "the entry's HEAD changed"
+        return None
+    finally:
+        os.close(fd)
+
+
 def op_delete_admin(args: dict[str, object]) -> dict[str, object]:
     """Delete the admin entry ``name`` of the ``worktrees`` directory (the chain) fd-based, but
     only if its ``gitdir`` file names ``expect_gitdir``. Returns ``{"state": "absent" |
@@ -266,6 +310,11 @@ def op_delete_admin(args: dict[str, object]) -> dict[str, object]:
         ident, _, gitdir = found
         if _gitdir_value(gitdir) != expect:
             return {"state": "foreign", "remaining": [], "remaining_total": 0}
+        recheck = args.get("recheck")
+        if isinstance(recheck, dict):
+            why = _recheck_entry(anchor, parent, name, ident, expect, recheck)
+            if why is not None:
+                return {"state": "changed", "why": why, "remaining": [], "remaining_total": 0}
         res = fsafe.delete_tree(anchor, parent, name, expected=ident, parent_path=parent_path)
     finally:
         os.close(parent)
@@ -279,6 +328,11 @@ def op_delete_admin(args: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _parent_dev(fd: int) -> int:
+    """``st_dev`` of the parent of the directory ``fd`` (it differs at a mount's root)."""
+    return os.stat("..", dir_fd=fd).st_dev
+
+
 def op_entry_state(args: dict[str, object]) -> dict[str, object]:
     """Whether ``name`` exists below the chain, opened from the anchor's recorded identity:
     ``{"state": "absent"}`` or ``{"state": "present", "kind": ...}`` (never followed, never
@@ -287,11 +341,29 @@ def op_entry_state(args: dict[str, object]) -> dict[str, object]:
     if not isinstance(name, str):
         raise fsafe.FsafeError("bad_request", "name must be a string")
     fsafe.check_component(name)
-    anchor, parent, _ = _open_root(args, parent=True)
+    try:
+        anchor, parent, _ = _open_root(args, parent=True)
+    except fsafe.FsafeError as exc:
+        if exc.kind != "missing":
+            raise
+        # a missing component of the chain below an anchor that opens and matches its recorded
+        # identity: the directory is not there. A missing anchor raises again here.
+        spec = args["anchor"]
+        assert isinstance(spec, dict)
+        fsafe.open_anchor(
+            str(spec["path"]),
+            expected=_identity(spec.get("identity")),
+            precheck=bool(spec.get("precheck", True)),
+        ).close()
+        return {"state": "absent"}
     try:
         try:
             st = os.stat(name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
+            if args.get("same_device_parent") and _parent_dev(parent) != os.fstat(parent).st_dev:
+                raise fsafe.FsafeError(
+                    "mount_point", "the directory's parent is a mount point or was replaced"
+                ) from None
             return {"state": "absent"}
         except OSError as exc:
             raise fsafe.FsafeError("io", f"{name}: {exc.strerror}") from exc
@@ -503,6 +575,7 @@ def op_admin_inspect(args: dict[str, object]) -> dict[str, object]:
                 "refs_files": _refs_hold_files(anchor, fd),
                 "gitdir": _strip_nl(_read_small(anchor, fd, "gitdir")),
                 "commondir": _strip_nl(_read_small(anchor, fd, "commondir")),
+                "head_file": _strip_nl(_read_small(anchor, fd, "HEAD")),
             }
         finally:
             os.close(fd)
@@ -512,6 +585,21 @@ def op_admin_inspect(args: dict[str, object]) -> dict[str, object]:
 
 
 SCAN_ENTRIES = 5000
+
+
+def _scan_gitdir(anchor: fsafe.Anchor, efd: int) -> tuple[str | None, bool]:
+    """``(gitdir text, readable)`` of an entry: no ``gitdir`` is ``(None, True)``; one that exists
+    but is not a readable regular file (a link, say) is ``(None, False)``."""
+    try:
+        st = anchor.fs.lstat_at(efd, "gitdir")
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+    if not stat.S_ISREG(st.mode):
+        return None, False
+    text = _read_small(anchor, efd, "gitdir")
+    return _strip_nl(text), text is not None
 
 
 def op_admin_scan(args: dict[str, object]) -> dict[str, object]:
@@ -542,9 +630,14 @@ def op_admin_scan(args: dict[str, object]) -> dict[str, object]:
                     if e.is_dir(follow_symlinks=False):
                         efd = fsafe.open_dir(anchor, parent, e.name)
                         try:
-                            text = _strip_nl(_read_small(anchor, efd, "gitdir"))
+                            text, readable = _scan_gitdir(anchor, efd)
+                            complete = complete and readable
                         finally:
                             os.close(efd)
+                    else:
+                        # a link or a file where an entry directory belongs: what it names
+                        # cannot be told, so the scan cannot say that no entry names a path
+                        complete = False
                 except (fsafe.FsafeError, OSError):
                     complete = False
                 entries.append([e.name, text])

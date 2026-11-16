@@ -1,0 +1,21 @@
+{
+ "changes": [
+  {
+   "id": "<id>",
+   "from": "missing",
+   "to": "gone",
+   "action": "mark_gone"
+  }
+ ],
+ "reports": [
+  {
+   "kind": "gone",
+   "id": "<id>",
+   "path": "<tmp>/wt/worktrees/example.test/org/repo/one",
+   "admin_entry": "absent",
+   "branch": "b-one"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

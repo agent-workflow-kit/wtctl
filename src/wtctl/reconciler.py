@@ -315,6 +315,13 @@ class Reconciler:
             self.report("adopted_after_crash", id=rec["id"], path=rec["path"])
             return True
         info = worktrees.inspect_existing(self.git, rec["common_dir"], admin)
+        # the baseline first: a record that cannot be adopted is left exactly as it was
+        baseline = baselinesvc.record_current(
+            self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}
+        )
+        if baseline.has_detail():
+            self.warnings.append(f"{rec['id']}: the repo-config baseline could not be recorded")
+            return False
         self.state.transition(
             rec["id"], "creating", "creating",
             admin_dir=admin, dir_id=links.dir_id, head_at_create=info.head,
@@ -324,10 +331,6 @@ class Reconciler:
         self.state.clear_bootstrap_sets(rec["id"], expected="creating")
         current = self.state.get_record(rec["id"])
         assert current is not None
-        baseline = baselinesvc.record_current(self.config, current)
-        if baseline.has_detail():
-            self.warnings.append(f"{rec['id']}: the repo-config baseline could not be recorded")
-            return False
         done = self.move(
             current, "creating", "active", "adopt_after_crash",
             baseline_digest=baseline.digest, baseline_items=baselinesvc.item_rows(baseline),
@@ -335,6 +338,11 @@ class Reconciler:
         )  # fmt: skip
         if done:
             self.report("adopted_after_crash", id=rec["id"], path=rec["path"])
+        else:  # lost a race: no half-adopted record is left behind
+            with contextlib.suppress(WtctlError):
+                self.state.transition(
+                    rec["id"], "creating", "creating", admin_dir=None, dir_id=None
+                )
         return done
 
     # -- worktree records -----------------------------------------------------------------------
@@ -375,7 +383,7 @@ class Reconciler:
         if candidate is not None:
             self.report("moved_clone", id=rec["id"], clone_path=candidate.clone_path)
         else:
-            self.report("clone_missing", id=rec["id"], clone_path=rec["clone_path"] or "/")
+            self.report("clone_missing", id=rec["id"], clone_path=rec["clone_path"])
 
     def present(self, rec: Record) -> None:
         check, _ = removal_integrity.integrity_check(self.state, rec, self.git)
@@ -386,9 +394,10 @@ class Reconciler:
                     missing_since=None, missing_seen=None,
                 )  # fmt: skip
             elif rec["missing_since"] or rec["missing_seen"]:
-                self.state.transition(
-                    rec["id"], "active", "active", missing_since=None, missing_seen=None
-                )
+                self.move(
+                    rec, "active", "active", "clear_missing",
+                    missing_since=None, missing_seen=None,
+                )  # fmt: skip
             return
         step = check["details"][0]["step"]
         if not (rec["owned"] and rec["admin_dir"] and step in ("dotgit", "admin_gitdir")):
@@ -427,9 +436,17 @@ class Reconciler:
                 missing_since=stamp, missing_seen="1",
             )  # fmt: skip
             return
-        seen = int(rec["missing_seen"]) + 1 if (rec["missing_seen"] or "").isdigit() else 2
+        raw = rec["missing_seen"] or ""
+        # a count that is not a plain number is not evidence of earlier runs: count from one
+        seen = int(raw) + 1 if raw.isascii() and raw.isdigit() else 1
         if not self.dry:
-            self.state.transition(rec["id"], "missing", "missing", missing_seen=str(seen))
+            try:
+                self.state.transition(rec["id"], "missing", "missing", missing_seen=str(seen))
+            except WtctlError as exc:
+                if exc.code not in ("busy", "not_found"):
+                    raise
+                self.warnings.append(f"{rec['id']}: changed by another command; left alone")
+                return
         since = _epoch(rec["missing_since"])
         if seen < 2 or since is None or now.timestamp() - since < self.grace:
             return
@@ -482,9 +499,7 @@ class Reconciler:
         if verdict.action == "keep":
             self.warnings.append(f"{rec['id']}: the admin entry was kept: {verdict.message}")
         elif verdict.action == "kept_unpushed":
-            self.report(
-                "kept_unpushed", id=rec["id"], tip=verdict.tip or "0" * 40, message=verdict.message
-            )
+            self.report("kept_unpushed", id=rec["id"], tip=verdict.tip, message=verdict.message)
         else:
             self.delete_entry(rec, verdict)
 
@@ -523,8 +538,19 @@ class Reconciler:
         bad = self.journal.prepare_audit(
             "admin_entry_delete", inputs=inputs, result="error", **common
         )
+        recheck = {
+            "admin_dir": rec["admin_dir"], "common_dir": rec["common_dir"],
+            "head_file": verdict.head_file,
+        }  # fmt: skip
         with self.state.lease(clone_lease(rec["clone_path"]), wait=5):
-            outcome, remaining = removal_delete.delete_admin(self.state, dict(rec), self.budget)
+            # the directory may have come back while the audit was prepared and the lease awaited
+            again = reconcile_probe.probe_entry(self.state, rec, self.budget)
+            if again.status != "absent":
+                outcome = "the directory is not missing any more"
+            else:
+                outcome, _ = removal_delete.delete_admin(
+                    self.state, dict(rec), self.budget, recheck
+                )
         if outcome not in ("deleted", "absent"):
             with contextlib.suppress(audit.JournalIOError):
                 self.journal.commit_audit(bad)
@@ -538,9 +564,8 @@ class Reconciler:
             self.unpushed_branch(rec, tip)
 
     def unpushed_branch(self, rec: Record, tip: str | None) -> None:
-        """The record is gone; a branch it created is kept, and reported when its tip is not
-        pushed."""
-        if not rec["created_branch"] or tip is None:
+        """The record is gone; its branch is kept, and reported when its tip is not pushed."""
+        if tip is None:
             return
         mirror, tips = self.tips_for(rec)
         if mirror is not None and tips is not None and mirror.is_pushed(tip, tips).pushed:

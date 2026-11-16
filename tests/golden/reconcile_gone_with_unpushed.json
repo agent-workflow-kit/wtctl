@@ -1,0 +1,20 @@
+{
+ "changes": [
+  {
+   "id": "<id>",
+   "from": "missing",
+   "to": "gone",
+   "action": "admin_entry_delete"
+  }
+ ],
+ "reports": [
+  {
+   "kind": "gone_with_unpushed",
+   "id": "<id>",
+   "branch": "b-one",
+   "tip": "<sha>"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

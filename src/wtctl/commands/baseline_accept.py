@@ -189,6 +189,22 @@ def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
         anchors = [anchor] if anchor else []
         old = baselinesvc.recorded_digest(record)
         return _result(ctx, out, old, digest, [], anchors, dry=True, note=note)
+    # the baseline of the worktree against the candidate clone, before anything is asked or
+    # written: a baseline that cannot be recorded refuses with the pointers untouched
+    recorded = baselinesvc.recorded_items(state, record["id"])
+    preview = baselinesvc.compute(
+        baselinesvc.spec_for(
+            config,
+            new,
+            common_id=moved.common_id,
+            dir_id=record["dir_id"],
+            hooks_id=baselinesvc.hooks_identity(recorded),
+            hooks_path=baselinesvc.hooks_recorded_path(recorded),
+            rebind_hooks=True,
+        )  # fmt: skip
+    )
+    if preview.has_detail():
+        raise baselinesvc.refusal(record, preview, repobaseline.compare(recorded, preview.items))
     question = (
         f"{escape_control(record['name'] or record['id'])}: re-attach to the moved clone "
         f"{escape_control(moved.clone_path)} (was {escape_control(record['clone_path'] or '')})?"

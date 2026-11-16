@@ -11,7 +11,7 @@ import pytest
 
 from tests.createlib import REPO
 from tests.reclib import RC
-from wtctl.gateway import Gateway, ProcessInfo
+from wtctl.gateway import Gateway
 from wtctl.state import State, record_lease
 
 
@@ -166,7 +166,3 @@ def test_a_throwaway_with_a_replaced_directory_is_left(w: RC) -> None:
     data = w.reconciled()
     assert (Path(rec["path"]) / "mine.txt").read_text() == "keep"
     assert w.row(rec["id"])["state"] == "gone" and w.kinds(data) == ["stray", "stray"]
-
-
-def test_prune_and_unused_imports() -> None:
-    assert ProcessInfo and record_lease

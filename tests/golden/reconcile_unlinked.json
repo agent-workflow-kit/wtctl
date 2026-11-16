@@ -1,0 +1,20 @@
+{
+ "changes": [
+  {
+   "id": "<id>",
+   "from": "active",
+   "to": "unlinked",
+   "action": "mark_unlinked"
+  }
+ ],
+ "reports": [
+  {
+   "kind": "unlinked",
+   "id": "<id>",
+   "path": "<tmp>/wt/worktrees/example.test/org/repo/one",
+   "message": "the integrity check failed at root"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

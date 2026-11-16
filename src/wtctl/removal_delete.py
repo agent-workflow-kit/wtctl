@@ -195,10 +195,14 @@ def admin_check(
 
 
 def delete_admin(
-    state: Any, record: dict[str, Any], budget: fsafe_child.Budget
+    state: Any,
+    record: dict[str, Any],
+    budget: fsafe_child.Budget,
+    recheck: dict[str, Any] | None = None,
 ) -> tuple[str, list[str]]:
     """Delete the admin entry if its ``gitdir`` names ``<path>/.git``. Returns ``(state,
-    remaining)``: ``deleted``, ``absent``, ``foreign`` (left alone), ``partial`` or ``failed``."""
+    remaining)``: ``deleted``, ``absent``, ``foreign`` (left alone), ``changed`` (a recheck
+    failed; left alone), ``partial`` or ``failed``."""
     try:
         args = admin_args(record, state)
     except fsafe.FsafeError:
@@ -206,6 +210,8 @@ def delete_admin(
     if args is None:
         return "absent", []
     args["expect_gitdir"] = os.path.join(record["path"], ".git")
+    if recheck is not None:
+        args["recheck"] = recheck  # the child looks again on the entry it deletes (``changed``)
     res = removalfs.run("delete_admin", args, budget, fsafe_child.REMOVE_DEADLINE)
     entry = fsafe.escape_for_details(record["admin_dir"])
     if not res.ok or res.value is None:
