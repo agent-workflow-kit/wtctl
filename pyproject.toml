@@ -47,6 +47,7 @@ testpaths = ["tests"]
 markers = [
   "live: needs real models/hosts/credentials; never run in CI",
   "bench: large-repository timing runs (tests/bench); never run in CI",
+  "needs(name): prerequisites of a live test (tests/live/liveenv.py); unmet ones skip it",
 ]
 addopts = "-m 'not live and not bench'"
 
