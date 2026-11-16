@@ -14,6 +14,9 @@ from tests.throwlib import leaks
 from wtctl.gateway import ProcessInfo
 
 
+pytestmark = pytest.mark.usefixtures("inproc")
+
+
 @pytest.fixture
 def w(tmp_path: Path, private_home: Path) -> XW:
     return XW(tmp_path, private_home).build()
@@ -638,3 +641,17 @@ def test_hostile_names_are_escaped_in_the_error(w: XW) -> None:
     r = w.ex(s, w.plain_dest(), [b"a\x1b[31mred\x01", b"\xff\xfe"], nul=True)
     assert r.code == 12
     assert "\x1b" not in r.out + r.err and "\x01" not in r.out + r.err
+
+
+def test_the_real_child_process_path(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reading runs in a child under a deadline when no test runner replaces it."""
+    from wtctl import removalfs
+
+    monkeypatch.setattr(removalfs, "RUNNER", None)
+    s = w.src()
+    w.put(s, "d/a", b"hello")
+    os.symlink("a", Path(s["path"]) / "d" / "l")
+    dest = w.plain_dest()
+    assert w.invalid(s, dest, ["d/a", "d/l"]) == {"d/l": "symlink"}
+    w.extracted(s, dest, ["d/a"])
+    assert (dest / "d" / "a").read_text() == "hello"
