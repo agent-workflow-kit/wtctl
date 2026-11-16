@@ -174,7 +174,7 @@ class NotAClone(Exception):
 class Verified:
     clone_path: str  # realpath of the clone directory
     common_dir: str  # <clone_path>/.git
-    fetch_url: str  # userinfo stripped, normalizes to the repo id, unchanged by ls-remote
+    fetch_url: str  # fetch form (ssh user kept), normalizes to the repo id, unchanged by ls-remote
     common_id: str  # "<dev>:<ino>" of the common dir, from a no-follow open
     object_format: str  # "sha1" or "sha256"
 
@@ -274,11 +274,12 @@ def verify_clone(
 ) -> Verified:
     """Check that ``path`` is a clone of ``repo_id`` and describe it (raises :class:`NotAClone`).
 
-    The remote URL is read with hardened git, its userinfo stripped; it must normalize to the repo
-    id (or match the configured ``clone_url``). Because the clone URL is also the push target, no
+    The remote URL is read with hardened git and reduced by ``urls.fetch_url`` (https userinfo
+    and any password dropped, a plain ssh user kept); it must normalize to the repo id (or match
+    the configured ``clone_url``). Because the clone URL is also the push target, no
     ``url.*.insteadOf`` / ``pushInsteadOf`` prefix may match it and the remote may have no
-    ``pushurl``; the stripped URL must also come back unchanged from ``ls-remote --get-url``. The
-    raw URL (it may hold a password) is never passed to git as an argument.
+    ``pushurl``; the fetch-form URL must also come back unchanged from ``ls-remote --get-url``.
+    The raw URL (it may hold a password) is never passed to git as an argument.
 
     ``allow_includes`` false (discovery) refuses a clone whose config mentions include.
     """
@@ -327,8 +328,10 @@ def verify_clone(
     except UnicodeDecodeError:
         raise NotAClone(f"remote {remote!r} has a URL that is not UTF-8") from None
     if not urls.matches_repo(raw, repo_id, clone_url=clone_url):
+        if urls.ssh_user_refused(raw):
+            raise NotAClone(f"remote {remote!r} has an SSH user that is not a plain user name")
         raise NotAClone(f"remote {remote!r} does not point at {repo_id}")
-    stripped = urls.strip_userinfo(raw)
+    stripped = urls.fetch_url(raw)
     if not urls.matches_repo(stripped, repo_id, clone_url=clone_url):
         raise NotAClone(f"remote {remote!r} does not point at {repo_id}")
     push = run(["config", "--no-includes", "-z", "--get-all", f"remote.{remote}.pushurl"])
@@ -607,9 +610,9 @@ class Resolver:
     def clone_url(self, repo_id: str) -> str:
         """The URL to clone from: ``repos.<id>.clone_url``, else ``hosts.<host>.clone_url``.
 
-        Either way the result is a plain local path or an https/ssh URL without userinfo: the
-        configured text may hold a password, which must reach neither git's argv nor the new
-        clone's ``.git/config``.
+        Either way the result is a plain local path or an https/ssh URL in fetch form (an ssh URL
+        keeps a plain user name): the configured text may hold a password, which must reach
+        neither git's argv nor the new clone's ``.git/config``.
         """
         s = self.config.repo(repo_id)
         if s.clone_url is not None:
@@ -624,8 +627,12 @@ class Resolver:
         local = urls.local_path(raw)
         if local is not None:
             return local  # a plain path, never a file:// URL (hardened git rule)
-        stripped = urls.strip_userinfo(raw)
+        stripped = urls.fetch_url(raw)
         if urls.normalize_url(stripped) is None:
+            if urls.ssh_user_refused(raw):
+                raise WtctlError(
+                    "remote_mismatch", f"{what} has an SSH user that is not a plain user name"
+                )
             raise WtctlError("remote_mismatch", f"{what} is not an https, ssh or local path URL")
         return stripped
 
@@ -680,7 +687,7 @@ class Resolver:
             return existing
         # Nothing exists to compare: "0:0" is a placeholder, never an identity to warn about.
         return Resolution(
-            repo_id, dest, os.path.join(dest, ".git"), "cloned", urls.strip_userinfo(url),
+            repo_id, dest, os.path.join(dest, ".git"), "cloned", urls.fetch_url(url),
             None, "sha1", "0:0", None, True,
         )  # fmt: skip
 

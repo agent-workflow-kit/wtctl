@@ -284,6 +284,8 @@ def test_command_environment_is_the_given_one(tmp_path: Path) -> None:
         ("https://127.0.0.1:9/x", "https", "127.0.0.1:9"),
         ("ssh://git@forge.example/org/repo", "ssh", None),
         ("git@forge.example:org/repo.git", "ssh", None),
+        ("ssh://git@forge.example:2222/org/repo", "ssh", None),
+        ("Git.User_1@forge.example:org/repo", "ssh", None),
         ("forge.example:org/repo", "ssh", None),
         ("/srv/git/repo.git", "file", None),
         ("./rel/repo", "file", None),
@@ -309,6 +311,21 @@ def test_fetch_target(url: str, scheme: str, hostport: str | None) -> None:
 @pytest.mark.parametrize(
     "url",
     [
+        "-oProxyCommand=x@forge.example:o/r",  # #63: option injection through the ssh user
+        "a-oProxyCommand=x@forge.example:o/r",
+        "ssh://-oProxyCommand=x@forge.example/o/r",
+        "ssh://--upload-pack=x@forge.example/o/r",
+        "a@b@forge.example:o/r",
+        "ssh://a@b@forge.example/o/r",
+        "ssh://user:hunter2@forge.example/o/r",  # a password is never passed on
+        "@forge.example:o/r",
+        "git:pw@forge.example:o/r",  # a password in the scp-like form is never passed on
+        "git:x@y@forge.example:o/r",
+        "ssh://@forge.example/o/r",
+        "ssh://.dot@forge.example/o/r",
+        "u%41@forge.example:o/r",
+        "ssh://" + "x" * 33 + "@forge.example/o/r",
+        "x" * 33 + "@forge.example:o/r",
         "https://good.example@evil.example/x",  # userinfo: the host is not the first name
         "https://evil.example@good.example/x",
         "https://user:pw@forge.example/x",
@@ -489,6 +506,22 @@ def test_prepare_file_url_has_no_credentials(tmp_path: Path) -> None:
         cfg, "/srv/x.git", environ=ENV, gateway=Gateway(), warn=lambda m: None
     )
     assert auth == NetworkAuth("file") and not marker.exists()
+
+
+def test_an_ssh_user_url_gets_the_agent_socket_and_never_a_token(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    cfg = cfg_with(token_env="T", token_command=sh(f"touch {marker}; echo {TOKEN}"))
+    for url in ("git@forge.example:o/r", "ssh://git@forge.example/o/r"):
+        auth = prepare_network_auth(
+            cfg,
+            url,
+            environ={**ENV, "T": TOKEN, "SSH_AUTH_SOCK": "/run/agent.sock"},
+            gateway=Gateway(),
+            warn=lambda m: None,
+        )
+        assert auth == NetworkAuth("ssh", ssh_auth_sock="/run/agent.sock")
+        assert not auth.has_token and auth.extra_config == ()
+    assert not marker.exists()
 
 
 def test_prepare_refuses_userinfo_urls_without_echoing_them() -> None:

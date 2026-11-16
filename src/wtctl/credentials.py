@@ -92,8 +92,20 @@ class FetchTarget:
     hostport: str | None  # lowercase ``host[:port]`` of an https URL, default port dropped
 
 
+def _check_ssh_user(authority: str) -> None:
+    """An ssh authority (or the host part of an scp-like URL) carries at most one plain user name:
+    ``user@host`` with a :func:`urls.valid_ssh_user` user. A second ``@``, a password (``:``) or
+    any other user text, which ssh could read as an option or a different host, is refused."""
+    if "@" not in authority:
+        return
+    user, _, host = authority.partition("@")
+    if "@" in host or not host or not urls.valid_ssh_user(user):
+        raise ValueError("unsupported ssh user in fetch URL")
+
+
 def fetch_target(url: str) -> FetchTarget:
-    """Scheme and host of an already normalized fetch URL (userinfo stripped).
+    """Scheme and host of an already normalized fetch URL (``urls.fetch_url``: https without
+    userinfo, ssh with at most a plain user name and no password).
 
     A URL starting with ``-`` (git would read it as an option), or holding a control character or
     leading whitespace, is refused. A plain local path (``/``, ``./``, ``../``, ``~`` or no
@@ -103,8 +115,10 @@ def fetch_target(url: str) -> FetchTarget:
     exactly ``:443`` is dropped.
 
     An https URL's host comes from the ``urls`` module (the one parser of host and port grammar);
-    this function adds the checks for a URL that goes to argv. Anything unexpected raises
-    ``ValueError`` (the message never contains the URL, which could carry a secret).
+    this function adds the checks for a URL that goes to argv. An ``@`` is refused for https and
+    allowed for ssh only as ``user@`` with a plain user name (tokens are never sent over ssh).
+    Anything unexpected raises ``ValueError`` (the message never contains the URL, which could
+    carry a secret).
     """
     if not url or url.startswith("-") or url[:1].isspace() or _CONTROL.search(url):
         raise ValueError("unsupported fetch URL (option-like, or control or leading whitespace)")
@@ -117,10 +131,16 @@ def fetch_target(url: str) -> FetchTarget:
     if not _URL_CHARS.fullmatch(url) or "\\" in url:
         raise ValueError("unsupported fetch URL (whitespace, control or non-ASCII character)")
     if "://" not in url:
+        # scp-like ``[user@]host:path``: the authority is everything before the first "/", so a
+        # password (``user:pw@host:o/r``) or a second "@" lands in the user part and is refused
+        _check_ssh_user(url.partition("/")[0])
         return FetchTarget("ssh", None)  # scp-like ``[user@]host:path``
     scheme, _, rest = url.partition("://")
-    if scheme in ("ssh", "file"):
-        return FetchTarget(scheme, None)
+    if scheme == "ssh":
+        _check_ssh_user(re.split(r"[/?#]", rest, maxsplit=1)[0])
+        return FetchTarget("ssh", None)
+    if scheme == "file":
+        return FetchTarget("file", None)
     if scheme != "https":
         raise ValueError(f"unsupported fetch URL scheme {scheme[:16]!r}")
     authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
@@ -304,7 +324,8 @@ def prepare_network_auth(
     warn: Warn,
     command_timeout: float = TOKEN_COMMAND_TIMEOUT,
 ) -> NetworkAuth:
-    """Credentials for one network call to ``url`` (the URL actually used, userinfo stripped).
+    """Credentials for one network call to ``url`` (the URL actually used, in fetch form: https
+    without userinfo, ssh with at most a plain user name).
 
     https: the token of ``hosts.<host>`` as a header scoped to that host, if there is one; ssh:
     the caller's ``SSH_AUTH_SOCK``; file: nothing. The caller's ``GIT_SSH_COMMAND`` and the rest

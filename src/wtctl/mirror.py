@@ -275,8 +275,8 @@ def find_path(edges: Mapping[str, list[str]], tip: str, target: str) -> list[str
 @dataclass
 class Mirror:
     """The mirror of one clone. ``fetch_url`` is the clone fetch URL recorded by locate
-    (userinfo stripped, verified on every resolution); ``clone_path`` names the per-clone lease
-    and ``common_dir`` the mirror's path."""
+    (fetch form: https userinfo stripped, ssh user kept; verified on every resolution);
+    ``clone_path`` names the per-clone lease and ``common_dir`` the mirror's path."""
 
     git: Git
     cfg: Config

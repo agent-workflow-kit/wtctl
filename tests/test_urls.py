@@ -408,3 +408,156 @@ def test_the_template_error_never_echoes_the_template() -> None:
     with pytest.raises(WtctlError) as exc:
         urls.render_clone_url(REPO, template="https://user:hunter2@evil.test/{path}.git")
     assert "hunter2" not in exc.value.message and "evil.test" not in exc.value.message
+
+
+# -- the SSH user in the fetch URL (#63) -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "want"),
+    [
+        ("git@github.com:o/r.git", "git@github.com:o/r.git"),
+        ("github.com:o/r", "github.com:o/r"),
+        ("ssh://git@github.com/o/r", "ssh://git@github.com/o/r"),
+        ("SSH://git@github.com/o/r", "ssh://git@github.com/o/r"),
+        ("ssh://git@github.com:2222/o/r", "ssh://git@github.com:2222/o/r"),
+        ("ssh://Git.User@GitHub.com/o/r", "ssh://Git.User@GitHub.com/o/r"),  # user case kept
+        ("ssh://git:hunter2@github.com/o/r", "ssh://git@github.com/o/r"),  # password dropped
+        ("ssh://git:@github.com/o/r", "ssh://git@github.com/o/r"),
+        ("ssh://github.com/o/r", "ssh://github.com/o/r"),
+        ("https://git@github.com/o/r", "https://github.com/o/r"),  # https: all userinfo goes
+        ("https://u:p@github.com/o/r", "https://github.com/o/r"),
+        ("/srv/git/repo", "/srv/git/repo"),
+        ("a_b-c.d@host.example:o/r", "a_b-c.d@host.example:o/r"),
+        ("x" * 32 + "@host.example:o/r", "x" * 32 + "@host.example:o/r"),
+    ],
+)
+def test_fetch_url_keeps_a_plain_ssh_user_and_drops_the_rest(url: str, want: str) -> None:
+    assert urls.fetch_url(url) == want
+    assert "hunter2" not in urls.fetch_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "-oProxyCommand=x@host.example:o/r",
+        "a-oProxyCommand=x@host.example:o/r",
+        "oProxyCommand=x@host.example:o/r",
+        "ssh://-oProxyCommand=x@host.example/o/r",
+        "ssh://--upload-pack=x@host.example/o/r",
+        "-a@host.example:o/r",
+        ".a@host.example:o/r",
+        "ssh://.a@host.example/o/r",
+        "a@b@host.example:o/r",
+        "ssh://a@b@host.example/o/r",
+        "user:pass@host.example:o/r",
+        "@host.example:o/r",
+        "ssh://@host.example/o/r",
+        "ssh://:pw@host.example/o/r",
+        "ssh://u%41@host.example/o/r",
+        "u%41@host.example:o/r",
+        "ünï@host.example:o/r",
+        "ssh://ünï@host.example/o/r",
+        "a b@host.example:o/r",
+        "ssh://a b@host.example/o/r",
+        "ssh://a\\b@host.example/o/r",
+        "a/b@host.example:o/r",
+        "ssh://a/b@host.example/o/r",
+        "ssh://a\nb@host.example/o/r",
+        "a\nb@host.example:o/r",
+        "a\x00b@host.example:o/r",
+        "ssh://a\x00b@host.example/o/r",
+        "u~x@host.example:o/r",
+        "x" * 33 + "@host.example:o/r",
+        "ssh://" + "x" * 33 + "@host.example/o/r",
+        "ssh://git@[::1]/o/r",
+        "git@[::1]:o/r",
+        "ssh://git@host.example./o/r",
+        "ssh://git@/o/r",
+    ],
+)
+def test_a_hostile_ssh_user_makes_the_url_unusable(url: str) -> None:
+    assert urls.normalize_url(url) is None
+    assert urls.url_host(url) is None
+    assert not urls.matches_repo(url, "host.example/o/r")
+
+
+def test_the_user_is_not_part_of_the_identity() -> None:
+    forms = [
+        "git@github.com:org/repo.git",
+        "github.com:org/repo",
+        "ssh://git@github.com/org/repo",
+        "ssh://other@GitHub.com:2222/org/repo.git",
+        "ssh://github.com/org/repo/",
+        "ssh://git:pw@github.com/org/repo",
+    ]
+    for url in forms:
+        assert urls.normalize_url(url) == REPO
+        assert urls.url_host(url) == "github.com"
+        assert urls.url_scheme(url) == "ssh"
+        assert urls.matches_repo(url, REPO)
+        assert urls.matches_repo(urls.fetch_url(url), REPO)
+    assert not urls.matches_repo("git@github.com:org/other", REPO)
+    assert not urls.matches_repo("git@evil.test:org/repo", REPO)
+
+
+def test_render_clone_url_keeps_a_template_user() -> None:
+    assert (
+        urls.render_clone_url(REPO, template="git@{host}:{path}.git")
+        == "git@github.com:org/repo.git"
+    )
+    with pytest.raises(WtctlError):
+        urls.render_clone_url(REPO, template="-oProxyCommand=x@{host}:{path}.git")
+
+
+def test_render_clone_url_names_a_refused_ssh_user() -> None:
+    with pytest.raises(WtctlError) as exc:
+        urls.render_clone_url(REPO, template="-oProxyCommand=x@{host}:{path}.git")
+    assert "SSH user" in exc.value.message and "ProxyCommand" not in exc.value.message
+    with pytest.raises(WtctlError) as exc:
+        urls.render_clone_url(REPO, template="https://evil.test/{path}.git")
+    assert "SSH user" not in exc.value.message
+
+
+@pytest.mark.parametrize(
+    ("url", "refused"),
+    [
+        ("-oProxyCommand=x@github.com:org/repo", True),
+        ("ssh://a@b@github.com/org/repo", True),
+        ("ssh://user:pw@github.com/org/repo", False),  # a password is dropped, not refused
+        ("git@github.com:org/repo", False),
+        ("-oProxyCommand=x@github.com", False),  # no path: not a user problem
+        ("https://u@github.com/org/repo", False),
+        ("/srv/git/r.git", False),
+    ],
+)
+def test_ssh_user_refused(url: str, refused: bool) -> None:
+    assert urls.ssh_user_refused(url) is refused
+
+
+@pytest.mark.parametrize(
+    ("user", "ok"),
+    [
+        ("git", True),
+        ("a", True),
+        ("_a", True),
+        ("A.b-c_9", True),
+        ("x" * 32, True),
+        ("x" * 33, False),
+        ("", False),
+        ("-a", False),
+        (".a", False),
+        ("a:b", False),
+        ("a@b", False),
+        ("a%41", False),
+        ("a b", False),
+        ("a\n", False),
+        ("a\x00", False),
+        ("a\t", False),
+        ("é", False),
+        ("a/b", False),
+        ("a\\b", False),
+    ],
+)
+def test_ssh_user_grammar(user: str, ok: bool) -> None:
+    assert urls.valid_ssh_user(user) is ok

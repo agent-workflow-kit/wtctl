@@ -1644,7 +1644,7 @@
             "string",
             "null"
           ],
-          "description": "Worktree: the clone fetch URL recorded at create or adopt (interface: Clone resolution), without userinfo. Throwaway: the URL fetched from, or the clone's path for a local source; null while creating, until the source is chosen."
+          "description": "Worktree: the clone fetch URL recorded at create or adopt (interface: Clone resolution), in fetch form (no https userinfo and no password; a plain ssh user is kept). Throwaway: the URL fetched from, or the clone's path for a local source; null while creating, until the source is chosen."
         },
         "remote": {
           "type": [

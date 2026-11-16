@@ -23,7 +23,8 @@ _LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _HOSTNAME = rf"{_LABEL}(?:\.{_LABEL})*"
 _HOST_RE = re.compile(_HOSTNAME)
 _SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
-_USER_RE = re.compile(r"[A-Za-z0-9._~-]+")
+# A plain SSH user name kept in the fetch URL: 1-32 of [A-Za-z0-9._-], not starting with "-" or ".".
+_SSH_USER_RE = re.compile(r"(?![-.])[A-Za-z0-9._-]{1,32}")
 _PORT_RE = re.compile(r"[1-9][0-9]{0,4}")
 # Userinfo of an https/ssh URL: anything printable except what delimits a URL.
 _USERINFO_BAD = re.compile(r"[\x00-\x20\x7f-\U0010ffff/?#\\@\[\]%]")
@@ -32,6 +33,13 @@ MAX_URL = 4096
 MAX_LABEL = 63
 MAX_HOST = 253
 MAX_SEGMENT = 200  # leaves room for the ".wtctl-tmp-<random>" suffix within NAME_MAX (255)
+
+
+def valid_ssh_user(user: str) -> bool:
+    """Whether ``user`` is a plain SSH user name (docs/interface.md, Clone resolution): 1-32
+    characters of ``[A-Za-z0-9._-]``, not starting with ``-`` or ``.``. A ``:``, ``@``, ``%``,
+    space, control character or non-ASCII character is never part of one."""
+    return isinstance(user, str) and _SSH_USER_RE.fullmatch(user) is not None
 
 
 def _printable_ascii(text: str) -> bool:
@@ -153,13 +161,13 @@ def _split_userinfo(authority: str) -> tuple[str | None, str] | None:
 
 
 class _Parsed:
-    __slots__ = ("host", "path", "port", "scheme", "userinfo")
+    __slots__ = ("host", "path", "port", "scheme", "user")
 
     def __init__(
-        self, scheme: str, userinfo: str | None, host: str, port: str | None, path: str
+        self, scheme: str, user: str | None, host: str, port: str | None, path: str
     ) -> None:
         self.scheme = scheme  # "https" or "ssh"
-        self.userinfo = userinfo
+        self.user = user  # the SSH user (validated); always None for https, whose userinfo goes
         self.host = host
         self.port = port
         self.path = path  # project path, ".git" and trailing "/" already dropped
@@ -180,7 +188,7 @@ def _parse_scp(url: str) -> _Parsed | None:
     host = head
     if "@" in head:
         user, _, host = head.rpartition("@")
-        if not _USER_RE.fullmatch(user) or user.startswith("-"):
+        if not valid_ssh_user(user):
             return None
     if not _valid_host(host):
         return None
@@ -209,13 +217,18 @@ def _parse(url: str) -> _Parsed | None:
     if ui is None:
         return None
     userinfo, hostport = ui
+    user: str | None = None
+    if scheme == "ssh" and userinfo is not None:
+        user = userinfo.partition(":")[0]  # anything after the first ":" is a password: dropped
+        if not valid_ssh_user(user):
+            return None
     hp = _host_port(hostport)
     if hp is None:
         return None
     clean = _clean_path(path)
     if clean is None:
         return None
-    return _Parsed(scheme, userinfo, hp[0], hp[1], clean)
+    return _Parsed(scheme, user, hp[0], hp[1], clean)
 
 
 def normalize_url(url: str) -> str | None:
@@ -230,6 +243,27 @@ def normalize_url(url: str) -> str | None:
     if parsed is None:
         return None
     return f"{parsed.hostport}/{parsed.path}"
+
+
+def ssh_user_refused(url: str) -> bool:
+    """Whether ``url`` does not normalize only because of its SSH user part: it has a user part
+    (everything before the last ``@`` of the authority, or of the scp-like host part) and the
+    URL parses once that part is dropped. Used to say "not a plain user name" instead of a
+    misleading "does not point at host/o/r"; nothing of the URL is returned."""
+    if not isinstance(url, str) or normalize_url(url) is not None:
+        return False
+    m = _SCHEME_RE.fullmatch(url)
+    if m is not None:
+        if m.group(1).lower() != "ssh":
+            return False
+        authority, slash, path = m.group(2).partition("/")
+        if "@" not in authority:
+            return False
+        return normalize_url(f"ssh://{authority.rpartition('@')[2]}{slash}{path}") is not None
+    head, colon, path = url.partition(":")
+    if not colon or "/" in head or "@" not in head:
+        return False
+    return normalize_url(f"{head.rpartition('@')[2]}{colon}{path}") is not None
 
 
 def _lower_host(url: str) -> str:
@@ -279,9 +313,27 @@ def strip_userinfo(url: str) -> str:
     if m is not None:
         authority, slash, path = m.group(2).partition("/")
         return f"{m.group(1).lower()}://{authority.rpartition('@')[2]}{slash}{path}"
-    if parsed.userinfo is None:
+    if parsed.user is None:
         return url
     return url.partition(":")[0].rpartition("@")[2] + ":" + url.partition(":")[2]
+
+
+def fetch_url(url: str) -> str:
+    """The URL wtctl hands to git for a network call: ``url`` with a lowercase scheme and no
+    password. An ``ssh://`` or scp-like URL keeps its plain SSH user (see :func:`valid_ssh_user`;
+    the parser refuses any other user part), so a private clone connects as the intended account;
+    HTTPS userinfo is removed entirely. Text that is not a parsed URL is returned unchanged (the
+    caller's identity check then refuses it). The identity (:func:`normalize_url`) never has a
+    user."""
+    parsed = _parse(_lower_host(url))
+    if parsed is None or parsed.scheme == "https":
+        return strip_userinfo(url)
+    m = _SCHEME_RE.fullmatch(url)
+    if m is None:
+        return url  # scp-like: the parser checked the user, and it has no password form
+    authority, slash, path = m.group(2).partition("/")
+    user = "" if parsed.user is None else parsed.user + "@"
+    return f"{m.group(1).lower()}://{user}{authority.rpartition('@')[2]}{slash}{path}"
 
 
 # --- local repositories (tests and mirrors) -----------------------------------------------------
@@ -333,6 +385,12 @@ def matches_repo(url: str, repo_id: str, *, clone_url: str | None = None) -> boo
 def render_clone_url(repo_id: str, *, template: str) -> str:
     """``hosts.<host>.clone_url`` rendered for ``repo_id``; it must normalize back to the id."""
     url = template.replace("{host}", repo_host(repo_id)).replace("{path}", repo_path(repo_id))
+    if ssh_user_refused(url):
+        raise WtctlError(
+            "remote_mismatch",
+            f"the clone URL template of host {repo_host(repo_id)} has an SSH user that is not a "
+            "plain user name (1-32 of A-Za-z0-9._-, not starting with - or .)",
+        )
     if normalize_url(url) != repo_id:
         raise WtctlError(
             "remote_mismatch",
