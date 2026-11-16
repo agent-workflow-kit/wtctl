@@ -92,11 +92,12 @@ class Extractor:
 
     def check_dest(self, source: Record) -> None:
         real = _real_dest(self.ctx.args.dest)
-        protected = [os.path.realpath(str(state_path().parent))]
-        cfg_path = self.ctx.config_path or default_config_path()
-        protected.append(os.path.realpath(os.path.dirname(os.path.abspath(cfg_path))))
-        if _inside(real, protected[0]) or real == protected[1]:
-            raise UsageError("--dest must not be wtctl's state or configuration directory")
+        protected = {os.path.realpath(str(state_path().parent))}
+        for cfg_path in (self.ctx.config_path, default_config_path()):
+            if cfg_path:
+                protected.add(os.path.realpath(os.path.dirname(os.path.abspath(cfg_path))))
+        if any(_inside(real, p) for p in protected):
+            raise UsageError("--dest must not be inside wtctl's state or configuration directory")
         if _inside(real, source["path"]):
             raise UsageError("--dest must not be inside the source throwaway")
         for rec in self.state.records(object_type="throwaway"):
@@ -157,10 +158,17 @@ class Extractor:
     def _finish(self, plan: extraction.Plan, dest: extract_dest.Dest | None) -> Result:
         bad = plan.errors()
         if bad:
+            capped = len(bad) > extraction.MAX_ERRORS_SHOWN
             raise WtctlError(
                 "extract_invalid",
-                f"{len(bad)} of {len(plan.entries)} entries cannot be extracted; nothing changed",
-                details={"paths": [{"path": e.shown, "error": e.error} for e in bad]},
+                f"{len(bad)} of {len(plan.entries)} entries cannot be extracted; nothing changed"
+                + (f" (the first {extraction.MAX_ERRORS_SHOWN} are listed)" if capped else ""),
+                details={
+                    "paths": [
+                        {"path": e.shown, "error": e.error}
+                        for e in bad[: extraction.MAX_ERRORS_SHOWN]
+                    ]
+                },
             )
         if self.ctx.dry_run:
             return self._result(plan, dry=True)
@@ -199,8 +207,8 @@ class Extractor:
 
     def _read_source(self, rec: Record, plan: extraction.Plan) -> None:
         todo = [e for e in plan.files if e.error is None]
-        if not todo:
-            return
+        # The root is always opened and checked, also when nothing is left to read: a source that
+        # vanished or was replaced must not let a delete-only call through.
         if not (rec["base_dir"] and rec["root_id"] and rec["dir_id"]):
             raise self._unlinked(f"{rec['id']} has no recorded root or directory identity")
         try:
@@ -218,11 +226,11 @@ class Extractor:
             kind = res.error.kind if res.error else "deadline"
             if kind == "missing":
                 raise self._unlinked(f"{rec['id']}: its directory no longer exists")
-            # an unfinished read leaves the unread paths over the limit; a root that is not the
-            # recorded one is not found
+            # an expired deadline or failed read leaves every path of the call over the limit; a
+            # root that is not the recorded one is not found
             fail = "limit_exceeded" if res.timed_out or kind == "deadline" else "not_found"
-            for e in todo:
-                e.error = fail
+            for e in plan.entries:
+                e.error = e.error or fail
             return
         results = res.value["results"]
         for e, r in zip(todo, results, strict=True):
@@ -346,7 +354,6 @@ class Extractor:
         self._log(
             "info",
             {
-                "dest": self.dest_real,
                 "written": len(written),
                 "deleted": sum(d["result"] == "deleted" for d in deleted),
                 "absent": sum(d["result"] == "absent" for d in deleted),
@@ -357,7 +364,6 @@ class Extractor:
     def _log_failure(self, exc: WtctlError) -> None:
         d = exc.fields.get("details") or {}
         details: dict[str, Any] = {"code": exc.code, "reason": exc.fields.get("reason")}
-        details["dest"] = self.dest_real
         if exc.code == "extract_invalid":
             details["invalid"] = len(d.get("paths", []))
         if exc.code == "io_error":

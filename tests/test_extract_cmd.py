@@ -144,11 +144,16 @@ def test_stdin_list(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
     assert (dest / "x").read_text() == "1"
 
 
-def test_both_lists_from_stdin_is_usage(w: XW) -> None:
+def test_both_lists_from_stdin_is_usage(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    import sys
+
     s = w.src()
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"x\n")))  # readable
     r = w.run("extract", s["id"], "--dest", str(w.plain_dest()), "--files-from", "-",
               "--delete-from", "-")  # fmt: skip
-    assert r.code == 2
+    e = w.failed(r, 2)
+    assert "only one" in e["message"]
 
 
 def test_at_least_one_list_is_required(w: XW) -> None:
@@ -160,6 +165,18 @@ def test_missing_list_file_is_usage(w: XW) -> None:
     s = w.src()
     r = w.run("extract", s["id"], "--dest", str(w.plain_dest()), "--files-from", "/nonexistent")
     assert r.code == 2
+
+
+def test_list_over_the_size_limit_is_usage(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
+    from wtctl.commands import extract as cmd
+
+    monkeypatch.setattr(cmd, "LIST_LIMIT", 8)
+    s = w.src()
+    w.put(s, "a", b"1")
+    dest = w.plain_dest()
+    assert w.ex(s, dest, ["123456789"]).code == 2  # 10 bytes with the newline
+    assert w.ex(s, dest, ["1234567"]).code != 2  # exactly 8 bytes is within the limit
+    assert tree(dest) == {}
 
 
 def test_empty_lists_write_nothing_and_succeed(w: XW) -> None:
@@ -539,6 +556,40 @@ def test_vanished_directory_is_unlinked(w: XW) -> None:
     assert e["reason"] == "unlinked"
 
 
+def test_vanished_directory_is_unlinked_for_a_delete_only_call(w: XW) -> None:
+    import shutil
+
+    s = w.src()
+    dest = w.plain_dest()
+    (dest / "a").write_text("keep")
+    shutil.rmtree(s["path"])
+    e = w.failed(w.ex(s, dest, None, ["a"]), 20)
+    assert e["reason"] == "unlinked"
+    assert (dest / "a").read_text() == "keep"
+
+
+def test_vanished_directory_is_unlinked_when_every_entry_is_invalid_or_the_lists_are_empty(
+    w: XW,
+) -> None:
+    import shutil
+
+    s = w.src()
+    shutil.rmtree(s["path"])
+    for files, deletes in ((["../x"], None), (["a", "a"], ["a"]), ([], []), (None, [])):
+        e = w.failed(w.ex(s, w.plain_dest(), files, deletes), 20)
+        assert e["reason"] == "unlinked"
+
+
+def test_replaced_directory_is_not_found_for_a_delete_only_call(w: XW) -> None:
+    s = w.src()
+    os.rename(s["path"], w.tmp / "moved")
+    os.mkdir(s["path"])
+    dest = w.plain_dest()
+    (dest / "a").write_text("keep")
+    assert w.invalid(s, dest, None, ["a"]) == {"a": "not_found"}
+    assert (dest / "a").read_text() == "keep"
+
+
 def test_replaced_directory_is_not_found_per_path_and_never_read(w: XW) -> None:
     s = w.src()
 
@@ -625,6 +676,19 @@ def test_success_is_logged_without_contents_and_not_audited(w: XW) -> None:
     assert w.audit_records() == []
 
 
+def test_log_carries_counts_only_never_paths(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = w.src()
+    w.put(s, "uniquewritten", b"1")
+    dest = w.plain_dest("uniquedestdir")
+    (dest / "uniquedeleted").write_text("x")
+    w.extracted(s, dest, ["uniquewritten"], ["uniquedeleted"])
+    w.ex(s, dest, ["../uniqueinvalid"])
+    text = str(w.log_events())
+    for needle in ("uniquewritten", "uniquedeleted", "uniqueinvalid", "uniquedestdir"):
+        assert needle not in text
+    assert all("dest" not in e["details"] for e in w.log_events() if e["event"] == "extract")
+
+
 def test_refusal_is_logged(w: XW) -> None:
     s = w.src()
     w.ex(s, w.plain_dest(), ["../x"])
@@ -652,3 +716,68 @@ def test_the_real_child_process_path(w: XW, monkeypatch: pytest.MonkeyPatch) -> 
     assert w.invalid(s, dest, ["d/a", "d/l"]) == {"d/l": "symlink"}
     w.extracted(s, dest, ["d/a"])
     assert (dest / "d" / "a").read_text() == "hello"
+
+
+# -- review round: huge lists, display escaping, the total limit ---------------------------------
+
+
+def test_a_huge_list_is_limit_exceeded_with_bounded_output(w: XW) -> None:
+    w.top["extract"] = {"max_files": 10}
+    s = w.src()
+    for i in range(10):
+        w.put(s, f"f{i}", b"1")
+    names = [f"f{i}" for i in range(50_000)]
+    r = w.ex(s, w.plain_dest(), names)
+    e = w.failed(r, 12)
+    assert e["code"] == "extract_invalid"
+    paths = e["details"]["paths"]
+    assert {"path": "f10", "error": "limit_exceeded"} in paths
+    assert len(paths) == 1 and len(r.out) < 4096
+    assert tree(w.plain_dest()) == {}
+
+
+def test_per_path_errors_in_the_output_are_capped(w: XW) -> None:
+    s = w.src()
+    r = w.ex(s, w.plain_dest(), [f"../x{i}" for i in range(1000)])
+    e = w.failed(r, 12)
+    assert len(e["details"]["paths"]) == 100 and len(r.out) < 64 * 1024
+
+
+def test_c1_bidi_and_line_separator_characters_are_escaped_in_the_error(w: XW) -> None:
+    s = w.src()
+    bad = [0x85, 0x9F, 0x202A, 0x202E, 0x2066, 0x2069, 0x2028, 0x2029]
+    names = [f"a{chr(c)}b" for c in bad]
+    r = w.ex(s, w.plain_dest(), [n.encode() for n in names], nul=True)
+    e = w.failed(r, 12)
+    shown = [p["path"] for p in e["details"]["paths"]]
+    assert len(shown) == len(bad)
+    for text in shown:
+        assert all(not (0x80 <= ord(c) <= 0x9F or ord(c) in bad) for c in text)
+    assert shown[0] == "a\\x85b" and shown[3] == "a\\u202eb"
+    assert all(chr(c) not in r.out + r.err for c in bad)
+
+
+def test_total_bytes_exactly_at_the_limit_is_accepted(w: XW) -> None:
+    w.top["extract"] = {"max_file_bytes": 10, "max_total_bytes": 16}
+    s = w.src()
+    for n in "ab":
+        w.put(s, n, b"x" * 8)
+    assert len(w.extracted(s, w.plain_dest(), ["a", "b"])["written"]) == 2
+
+
+def test_total_bytes_one_over_the_limit_is_rejected(w: XW) -> None:
+    w.top["extract"] = {"max_file_bytes": 10, "max_total_bytes": 15}
+    s = w.src()
+    for n in "ab":
+        w.put(s, n, b"x" * 8)
+    assert w.invalid(s, w.plain_dest(), ["a", "b"]) == {"b": "limit_exceeded"}
+
+
+def test_nothing_after_the_first_total_overflow_is_read(w: XW) -> None:
+    w.top["extract"] = {"max_file_bytes": 10, "max_total_bytes": 15}
+    s = w.src()
+    w.put(s, "a", b"x" * 8)
+    w.put(s, "b", b"x" * 8)
+    w.put(s, "empty", b"")
+    errs = w.invalid(s, w.plain_dest(), ["a", "b", "empty", "missing"])
+    assert errs == {"b": "limit_exceeded", "empty": "limit_exceeded", "missing": "limit_exceeded"}

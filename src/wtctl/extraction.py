@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -38,9 +39,23 @@ def parse_list(data: bytes) -> list[bytes]:
     return [e for e in data.split(sep) if e]
 
 
+# Characters a terminal or a reader may act on: C1 controls, bidirectional controls and the line
+# and paragraph separators. They stay valid in a path; only their display is escaped.
+_DISPLAY_ESCAPE = re.compile("[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+# At most this many per-path errors are listed in the error output.
+MAX_ERRORS_SHOWN = 100
+
+
 def shown(raw: bytes) -> str:
     """The entry as text for output: invalid bytes and control characters escaped."""
-    return fsafe.escape_for_details(raw.decode("utf-8", "backslashreplace"))
+    text = fsafe.escape_for_details(raw.decode("utf-8", "backslashreplace"))
+    return _DISPLAY_ESCAPE.sub(_escape_display, text)
+
+
+def _escape_display(m: re.Match[str]) -> str:
+    code = ord(m.group())
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
 
 
 def _has_control(text: str) -> bool:
@@ -110,15 +125,19 @@ class Plan:
 
 
 def plan_lists(files: list[bytes], deletes: list[bytes], *, max_files: int) -> Plan:
-    """Validate every entry of both lists (nothing is opened)."""
+    """Validate every entry of both lists (nothing is opened).
+
+    Memory and output stay bounded by ``max_files``: no item is built beyond the first entry past
+    the limit, which is reported ``limit_exceeded`` (whatever else is wrong with it).
+    """
     plan = Plan()
     for role, raws, out in (("file", files, plan.files), ("delete", deletes, plan.deletes)):
         for i, raw in enumerate(raws):
+            if i >= max_files:
+                out.append(Item(role, shown(raw), None, "limit_exceeded"))
+                break
             parts, error = check_path(raw)
-            item = Item(role, shown(raw), parts, error)
-            if item.error is None and i >= max_files:
-                item.error = "limit_exceeded"
-            out.append(item)
+            out.append(Item(role, shown(raw), parts, error))
     _mark_collisions(plan.entries)
     return plan
 
@@ -200,12 +219,16 @@ def read_op(args: dict[str, object]) -> dict[str, object]:
     anchor, root_fd, root_path = fsafe_child._open_root(args, parent=False)
     results: list[dict[str, str]] = []
     used = 0
+    overflow = False
     try:
         for parts in raw:
+            if overflow:  # nothing after the first overflow is read
+                results.append({"error": "limit_exceeded"})
+                continue
             error, data = _read_one(anchor, root_fd, root_path, [str(p) for p in parts], max_file)
             if error is None and used + len(data) > max_total:
                 error, data = "limit_exceeded", b""
-                used = max_total  # nothing after the first overflow is read
+                overflow = True
             if error is not None:
                 results.append({"error": error})
                 continue

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from tests.createlib import REPO
 from tests.helpers import Run
 from tests.schemacheck import validate
 from tests.throwlib import TW
@@ -21,6 +24,15 @@ class XW(TW):
     def build(self) -> XW:
         super().build()
         return self
+
+    def config(self) -> str:
+        """The configuration lives in its own directory: ``--dest`` may not be inside that one,
+        and the tests' destinations sit directly under ``tmp``."""
+        cfg = self.tmp / "cfg"
+        cfg.mkdir(exist_ok=True)
+        data = {**self.top, "repos": {REPO: self.repo_cfg}}
+        (cfg / "config.yaml").write_text(json.dumps(data))
+        return str(cfg / "config.yaml")
 
     # -- fixtures ---------------------------------------------------------------------------
 
@@ -45,7 +57,7 @@ class XW(TW):
 
     # -- running ----------------------------------------------------------------------------
 
-    def listfile(self, entries: list[str | bytes], nul: bool = False) -> str:
+    def listfile(self, entries: Sequence[str | bytes], nul: bool = False) -> str:
         self.n += 1
         raw = [e.encode() if isinstance(e, str) else e for e in entries]
         sep = b"\0" if nul else b"\n"
@@ -57,8 +69,8 @@ class XW(TW):
         self,
         rec: dict[str, Any] | str,
         dest: Path | str,
-        files: list[str | bytes] | None = None,
-        deletes: list[str | bytes] | None = None,
+        files: Sequence[str | bytes] | None = None,
+        deletes: Sequence[str | bytes] | None = None,
         *argv: str,
         nul: bool = False,
         human: bool = False,

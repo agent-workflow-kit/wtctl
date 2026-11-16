@@ -239,7 +239,7 @@ def test_shown_path_is_escaped_and_lossless_for_valid_utf8() -> None:
 
 def test_entries_over_max_files_are_limit_exceeded() -> None:
     plan = extraction.plan_lists([f"f{i}".encode() for i in range(5)], [], max_files=3)
-    assert errors(plan) == {"f3": "limit_exceeded", "f4": "limit_exceeded"}
+    assert errors(plan) == {"f3": "limit_exceeded"}  # nothing is built beyond the first excess
 
 
 def test_deletions_have_their_own_count_limit() -> None:

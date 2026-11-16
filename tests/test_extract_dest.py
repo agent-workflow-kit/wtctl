@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import os
+import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,7 @@ from typing import Any
 import pytest
 
 from tests.extractlib import XW, tree
-from wtctl import extraction, fsafe
+from wtctl import extract_dest, extraction, fsafe, gateway
 
 pytestmark = pytest.mark.usefixtures("inproc")
 
@@ -97,11 +99,31 @@ def test_dest_inside_the_state_dir_is_refused(w: XW) -> None:
     assert w.ex(s, sub, ["a"]).code == 2
 
 
-def test_dest_inside_the_config_dir_is_refused(w: XW) -> None:
+def test_dest_equal_to_or_inside_the_active_config_dir_is_refused(w: XW) -> None:
     s = one(w)
     cfg = Path(w.config()).parent
     assert w.ex(s, cfg, ["a"]).code == 2
-    assert not (cfg / "a").exists()
+    sub = cfg / "sub"
+    sub.mkdir()
+    assert w.ex(s, sub, ["a"]).code == 2
+    assert not (cfg / "a").exists() and not (sub / "a").exists()
+
+
+def test_dest_in_the_default_config_dir_is_refused_with_another_config(w: XW) -> None:
+    s = one(w)
+    default_dir = w.home / ".config" / "wtctl"
+    sub = default_dir / "sub"
+    sub.mkdir(parents=True)
+    assert Path(w.config()).parent != default_dir  # --config points elsewhere
+    assert w.ex(s, default_dir, ["a"]).code == 2
+    assert w.ex(s, sub, ["a"]).code == 2
+    assert not (default_dir / "a").exists() and not (sub / "a").exists()
+
+
+def test_dest_containing_a_protected_directory_is_not_refused(w: XW) -> None:
+    s = one(w)
+    w.config()
+    assert w.extracted(s, w.tmp, ["a"])["written"][0]["path"] == "a"
 
 
 def test_dest_inside_the_source_throwaway_is_refused(w: XW) -> None:
@@ -118,6 +140,27 @@ def test_dest_reaching_the_source_through_a_symlink_is_refused(w: XW) -> None:
     sub = Path(s["path"]) / "sub"
     sub.mkdir()
     assert w.ex(s, w.tmp / "viasrc" / "sub", ["a"]).code == 2
+
+
+def test_dest_inside_the_source_after_the_throwaway_root_changed_is_refused(w: XW) -> None:
+    s = one(w)
+    sub = Path(s["path"]) / "sub"
+    sub.mkdir()
+    other = w.tmp / "other-root"
+    other.mkdir()
+    w.top["throwaway_root"] = str(other)  # the recorded path is no longer under the root
+    assert w.ex(s, sub, ["a"]).code == 2
+    assert w.ex(s, s["path"], ["a"]).code == 2
+    assert not (sub / "a").exists()
+
+
+def test_dest_named_dotgit_by_a_symlink_to_a_plain_directory_is_refused(w: XW) -> None:
+    s = one(w)
+    plain = w.plain_dest("plain")
+    (plain / "sub").mkdir()
+    os.symlink(plain, w.tmp / ".git")  # the given path says .git, the resolved one does not
+    assert w.ex(s, w.tmp / ".git" / "sub", ["a"]).code == 2
+    assert tree(plain) == {"sub": "dir"}
 
 
 def test_dest_in_the_throwaway_root_but_no_record_is_refused(w: XW) -> None:
@@ -630,3 +673,276 @@ def test_source_path_crossing_a_mount_point_is_not_found(w: XW, mounts: None) ->
     dest = w.plain_dest()
     assert w.invalid(s, dest, ["mnt/f"]) == {"mnt/f": "not_found"}
     assert tree(dest) == {}
+
+
+# -- review round: swaps between lstat and open, growth, identities, temp names ----------------
+
+
+class SwapFs(fsafe.Fs):
+    """After the first ``lstat_at`` of ``name`` the file is replaced by ``make(dir_fd, name)``."""
+
+    def __init__(self, name: str, make: Callable[[int, str], None]) -> None:
+        self.name, self.make, self.done = name, make, False
+
+    def lstat_at(self, dir_fd: int, name: str) -> fsafe.FdStat:
+        st = super().lstat_at(dir_fd, name)
+        if name == self.name and not self.done:
+            self.done = True
+            os.unlink(name, dir_fd=dir_fd)
+            self.make(dir_fd, name)
+        return st
+
+
+def test_source_file_swapped_for_a_symlink_between_lstat_and_open(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = w.src()
+    secret = w.tmp / "secret"
+    secret.write_text("TOPSECRET")
+    w.put(s, "d/f", b"ok")
+    fs = SwapFs("f", lambda fd, n: os.symlink(secret, n, dir_fd=fd))
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", fs)
+    dest = w.plain_dest()
+    errs = w.invalid(s, dest, ["d/f"])
+    assert fs.done and errs["d/f"] in ("symlink", "not_found")
+    assert tree(dest) == {}
+
+
+def test_source_file_swapped_for_a_fifo_between_lstat_and_open(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = w.src()
+    w.put(s, "d/f", b"ok")
+    fs = SwapFs("f", lambda fd, n: os.mkfifo(n, 0o600, dir_fd=fd))
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", fs)
+    dest = w.plain_dest()
+    assert w.invalid(s, dest, ["d/f"]) == {"d/f": "not_regular"}
+    assert fs.done and tree(dest) == {}
+
+
+class _OsProxy:
+    """``extraction.os`` with ``fstat`` and ``read`` replaceable."""
+
+    def __init__(self, **over: Callable[..., Any]) -> None:
+        self.over = over
+
+    def __getattr__(self, name: str) -> Any:
+        return self.over.get(name) or getattr(os, name)
+
+
+def test_file_growing_after_its_size_was_read_is_too_large(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w.top["extract"] = {"max_file_bytes": 10}
+    s = w.src()
+    p = w.put(s, "f", b"12345")
+    grown: list[bool] = []
+
+    def fstat(fd: int) -> os.stat_result:
+        st = os.fstat(fd)
+        if not grown and st.st_ino == p.stat().st_ino:
+            grown.append(True)
+            with p.open("ab") as f:
+                f.write(b"x" * 100)
+        return st
+
+    monkeypatch.setattr(extraction, "os", _OsProxy(fstat=fstat))
+    dest = w.plain_dest()
+    assert w.invalid(s, dest, ["f"]) == {"f": "too_large"}
+    assert grown and tree(dest) == {}
+
+
+def test_file_growing_by_one_byte_after_the_first_read_is_too_large(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w.top["extract"] = {"max_file_bytes": 10}
+    s = w.src()
+    p = w.put(s, "f", b"1234567890")
+    grown: list[bool] = []
+
+    def read(fd: int, n: int) -> bytes:
+        data = os.read(fd, n)
+        if not grown:
+            grown.append(True)
+            with p.open("ab") as f:
+                f.write(b"x")
+        return data
+
+    monkeypatch.setattr(extraction, "os", _OsProxy(read=read))
+    dest = w.plain_dest()
+    assert w.invalid(s, dest, ["f"]) == {"f": "too_large"}
+    assert grown and tree(dest) == {}
+
+
+def test_destination_throwaway_moved_under_another_root_is_a_dest_conflict(w: XW) -> None:
+    """The recorded root identity is what notices this: the directory itself is the same inode."""
+    from wtctl.gateway import Gateway
+    from wtctl.state import State
+
+    c = clean(w)
+    st = State(w.db, Gateway())
+    rec = st.get_record(c["id"])
+    st.close()
+    assert rec is not None
+    real = str(Path(c["path"]).resolve())
+    other = w.tmp / "other-root"
+    other.mkdir()
+    os.rename(c["path"], other / c["id"])  # same inode, same name, another parent
+    moved_root = Path(rec["base_dir"]).rename(w.tmp / "old-root")
+    other.rename(rec["base_dir"])
+    assert moved_root.exists()
+    with pytest.raises(fsafe.FsafeError):
+        extract_dest.Dest.open(real, rec)
+
+
+def test_dotgit_can_never_be_written_directly(w: XW) -> None:
+    dest = w.plain_dest()
+    with extract_dest.Dest.open(str(dest), None) as d:
+        for parts in (["a", ".git", "x"], [".git"], [".git", "x"], ["a", ".GIT"]):
+            with pytest.raises((fsafe.FsafeError, extract_dest.DestConflict)):
+                d.write(parts, b"")
+    assert not any(".git" in n.upper() for n in tree(dest))
+
+
+def fixed_tokens(monkeypatch: pytest.MonkeyPatch, *tokens: str) -> None:
+    it = iter(tokens)
+    fake = types.SimpleNamespace(token_hex=lambda n=8: next(it))
+    monkeypatch.setattr(extract_dest, "secrets", fake)
+
+
+def test_temp_name_that_is_a_symlink_is_never_written_through(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = w.plain_dest()
+    victim = w.tmp / "victim"  # does not exist: a dangling target
+    os.symlink(victim, dest / ".wtctl-extract-aa")
+    fixed_tokens(monkeypatch, "aa", "bb")
+    with extract_dest.Dest.open(str(dest), None) as d:
+        assert d.write(["f"], b"new") == (0o644, True)
+    assert not victim.exists()
+    assert os.readlink(dest / ".wtctl-extract-aa") == str(victim)
+    assert (dest / "f").read_bytes() == b"new"
+    assert sorted(tree(dest)) == [".wtctl-extract-aa", "f"]
+
+
+def test_temp_name_that_is_a_regular_file_is_never_overwritten(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = w.plain_dest()
+    (dest / ".wtctl-extract-aa").write_text("mine")
+    fixed_tokens(monkeypatch, "aa", "bb")
+    with extract_dest.Dest.open(str(dest), None) as d:
+        d.write(["f"], b"new")
+    assert (dest / ".wtctl-extract-aa").read_text() == "mine"
+    assert sorted(tree(dest)) == [".wtctl-extract-aa", "f"]
+
+
+def test_temp_name_collisions_give_up_after_a_few_tries(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = w.plain_dest()
+    (dest / ".wtctl-extract-aa").write_text("mine")
+    monkeypatch.setattr(extract_dest, "secrets", types.SimpleNamespace(token_hex=lambda n=8: "aa"))
+    with extract_dest.Dest.open(str(dest), None) as d:
+        with pytest.raises(fsafe.FsafeError):
+            d.write(["f"], b"new")
+    assert tree(dest) == {".wtctl-extract-aa": "mine"}
+
+
+class TableFs(fsafe.Fs):
+    """A mount table naming ``points`` as mount points."""
+
+    def __init__(self, points: list[str]) -> None:
+        self.points = points
+
+    def mount_table(self) -> list[Any]:
+        return [gateway.MountEntry(1, p, "ext4", "x") for p in self.points]
+
+
+class DevFs(fsafe.Fs):
+    """The directory or file with inode ``ino`` reports another device."""
+
+    def __init__(self, ino: int) -> None:
+        self.ino = ino
+
+    def adjust(self, st: fsafe.FdStat) -> fsafe.FdStat:
+        return dataclasses.replace(st, dev=st.dev + 1) if st.ino == self.ino else st
+
+
+def test_source_path_listed_in_the_mount_table_is_not_found(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = w.src()
+    w.put(s, "d/m", b"secret")
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", TableFs([str(Path(s["path"]).resolve() / "d" / "m")]))
+    dest = w.plain_dest()
+    assert w.invalid(s, dest, ["d/m"]) == {"d/m": "not_found"}
+    assert tree(dest) == {}
+
+
+def test_destination_component_listed_in_the_mount_table_is_a_conflict(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = one(w)
+    w.put(s, "sub/f", b"2")
+    c = clean(w)
+    sub = Path(c["path"]).resolve() / "sub"
+    sub.mkdir()
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", TableFs([str(sub)]))
+    assert w.invalid(s, c["path"], ["a", "sub/f"]) == {"sub/f": "dest_conflict"}
+    assert tree(sub) == {}
+
+
+def test_source_file_on_another_device_is_not_found(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = w.src()
+    p = w.put(s, "f", b"secret")
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", DevFs(p.stat().st_ino))
+    dest = w.plain_dest()
+    assert w.invalid(s, dest, ["f"]) == {"f": "not_found"}
+    assert tree(dest) == {}
+
+
+def test_destination_directory_on_another_device_is_a_conflict(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s = w.src()
+    w.put(s, "a", b"1")
+    w.put(s, "sub/f", b"2")
+    dest = w.plain_dest()
+    (dest / "sub").mkdir()
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", DevFs((dest / "sub").stat().st_ino))
+    assert w.invalid(s, dest, ["a", "sub/f"]) == {"sub/f": "dest_conflict"}
+    assert tree(dest) == {"sub": "dir"}
+
+
+def test_destination_record_turning_inactive_before_the_lease_is_busy(
+    w: XW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl.commands import extract as cmd
+
+    s = one(w)
+    c = clean(w)
+    real = cmd.Extractor.check_dest
+
+    def check_then_change(self: Any, source: Any) -> None:
+        real(self, source)
+        w.set_state(c["id"], "partial")
+
+    monkeypatch.setattr(cmd.Extractor, "check_dest", check_then_change)
+    e = w.failed(w.ex(s, c["path"], ["a"]), 12)
+    assert e["code"] == "busy"
+    assert not (Path(c["path"]) / "a").exists()
+
+
+def test_io_error_message_is_escaped(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = one(w)
+    dest = w.plain_dest()
+
+    def failing(src: str, dst: str, **kw: Any) -> None:
+        raise OSError(errno.EIO, "bad\x1b[31m\x07 news")
+
+    patch_os(monkeypatch, "rename", failing)
+    r = w.ex(s, dest, ["a"])
+    e = w.failed(r, 1)
+    assert "\x1b" not in r.out + r.err and "\x07" not in r.out + r.err
+    assert "\\x1b" in e["message"]
