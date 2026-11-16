@@ -10,9 +10,7 @@ from pathlib import Path
 import pytest
 
 from tests.extractlib import XW, tree
-from tests.throwlib import leaks
 from wtctl.gateway import ProcessInfo
-
 
 pytestmark = pytest.mark.usefixtures("inproc")
 
@@ -423,7 +421,7 @@ def test_file_contents_are_data_not_executed_or_interpreted(w: XW) -> None:
     marker = w.tmp / "marker"
     w.put(s, "script.sh", f"#!/bin/sh\ntouch {marker}\n".encode(), mode=0o755)
     w.put(s, ".gitattributes", b"* filter=evil\n")
-    w.put(s, ".gitmodules", b"[submodule \"x\"]\n\turl = ext::sh -c touch% " + str(marker).encode())
+    w.put(s, ".gitmodules", b'[submodule "x"]\n\turl = ext::sh -c touch% ' + str(marker).encode())
     dest = w.plain_dest()
     w.extracted(s, dest, ["script.sh", ".gitattributes", ".gitmodules"])
     assert not marker.exists()
@@ -543,9 +541,8 @@ def test_vanished_directory_is_unlinked(w: XW) -> None:
 
 def test_replaced_directory_is_not_found_per_path_and_never_read(w: XW) -> None:
     s = w.src()
-    import shutil
 
-    shutil.rmtree(s["path"])
+    os.rename(s["path"], w.tmp / "moved")  # keeps the old inode alive: no number reuse
     os.mkdir(s["path"])
     (Path(s["path"]) / "a").write_text("impostor")
     dest = w.plain_dest()
@@ -600,7 +597,7 @@ def test_lease_is_released_and_nothing_else_is_left(w: XW) -> None:
     w.put(s, "a", b"1")
     w.extracted(s, w.plain_dest(), ["a"])
     assert w.leases() == []
-    assert leaks(w.troot / s["id"]) == ["a"]  # the source is untouched
+    assert (w.troot / s["id"] / "a").read_text() == "1"  # the source is untouched
 
 
 def test_extract_runs_no_git(w: XW) -> None:

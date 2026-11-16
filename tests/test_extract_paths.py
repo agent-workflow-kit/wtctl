@@ -99,7 +99,7 @@ def test_invalid_paths(raw: bytes) -> None:
 
 def test_path_of_exactly_4096_bytes_is_valid() -> None:
     comp = b"a" * 100
-    raw = b"/".join([comp] * 40) + b"/" + b"b" * (4096 - 40 * 101 - 1)
+    raw = b"/".join([comp] * 40) + b"/" + b"b" * (4096 - 40 * 101 - 1 + 1)
     assert len(raw) == 4096
     assert err(raw) is None
     assert err(raw + b"c") == "invalid_path"
@@ -220,7 +220,11 @@ def test_case_folded_prefix_is_a_duplicate() -> None:
 
 def test_invalid_entries_never_hide_the_others() -> None:
     plan = lists([b"ok", b"../bad", b".git/x", b"ok2"], [b"/abs"])
-    assert errors(plan) == {"../bad": "invalid_path", ".git/x": "git_component", "/abs": "invalid_path"}
+    assert errors(plan) == {
+        "../bad": "invalid_path",
+        ".git/x": "git_component",
+        "/abs": "invalid_path",
+    }
 
 
 def test_shown_path_is_escaped_and_lossless_for_valid_utf8() -> None:
@@ -239,7 +243,5 @@ def test_entries_over_max_files_are_limit_exceeded() -> None:
 
 
 def test_deletions_have_their_own_count_limit() -> None:
-    plan = extraction.plan_lists(
-        [b"a"], [f"d{i}".encode() for i in range(4)], max_files=3
-    )
+    plan = extraction.plan_lists([b"a"], [f"d{i}".encode() for i in range(4)], max_files=3)
     assert errors(plan) == {"d3": "limit_exceeded"}

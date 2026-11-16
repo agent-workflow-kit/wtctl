@@ -13,7 +13,6 @@ import pytest
 from tests.extractlib import XW, tree
 from wtctl import extraction
 
-
 pytestmark = pytest.mark.usefixtures("inproc")
 
 
@@ -212,6 +211,12 @@ def test_pre_existing_temp_name_does_not_break_anything(w: XW) -> None:
 
 
 # -- swaps between validation and write --------------------------------------------------------
+
+
+def patch_os(monkeypatch: pytest.MonkeyPatch, name: str, fn: Callable[..., Any]) -> None:
+    """Replace ``os.<name>`` (it stays one of the functions that take a ``dir_fd``)."""
+    monkeypatch.setattr(os, name, fn)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, fn})
 
 
 def swap_after_validation(monkeypatch: pytest.MonkeyPatch, action: Callable[[], None]) -> None:
@@ -444,16 +449,14 @@ def test_write_failure_reports_exact_progress_and_cleans_up(
             raise OSError(errno.ENOSPC, "No space left on device")
         real_rename(src, dst, **kw)
 
-    monkeypatch.setattr(os, "rename", failing)
+    patch_os(monkeypatch, "rename", failing)
     e = w.failed(w.ex(s, dest, ["a", "b", "c"], ["old"]), 1)
     assert e["code"] == "io_error"
     assert e["details"] == {"path": "c", "written": ["a", "b"], "deleted": []}
     assert sorted(tree(dest)) == ["a", "b", "old"]  # no temp file, c absent, old not deleted
 
 
-def test_delete_failure_reports_written_and_deleted(
-    w: XW, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_delete_failure_reports_written_and_deleted(w: XW, monkeypatch: pytest.MonkeyPatch) -> None:
     s = w.src()
     w.put(s, "a", b"1")
     dest = w.plain_dest()
@@ -466,7 +469,7 @@ def test_delete_failure_reports_written_and_deleted(
             raise OSError(errno.EIO, "Input/output error")
         real_unlink(path, **kw)
 
-    monkeypatch.setattr(os, "unlink", failing)
+    patch_os(monkeypatch, "unlink", failing)
     e = w.failed(w.ex(s, dest, ["a"], ["d1", "d2", "d3"]), 1)
     assert e["details"] == {"path": "d2", "written": ["a"], "deleted": ["d1"]}
     assert sorted(tree(dest)) == ["a", "d2", "d3"]
@@ -477,14 +480,12 @@ def test_io_error_is_logged_at_error_level_and_lists_stay_valid(
 ) -> None:
     s = one(w)
     dest = w.plain_dest()
-    real_rename = os.rename
 
     def failing(src: str, dst: str, **kw: Any) -> None:
         raise OSError(errno.EROFS, "Read-only file system")
 
-    monkeypatch.setattr(os, "rename", failing)
+    patch_os(monkeypatch, "rename", failing)
     w.failed(w.ex(s, dest, ["a"]), 1)
-    monkeypatch.setattr(os, "rename", real_rename)
     ev = [e for e in w.log_events() if e["event"] == "extract"]
     assert ev and ev[-1]["level"] == "error" and ev[-1]["details"]["code"] == "io_error"
     assert w.leases() == []
@@ -557,11 +558,9 @@ def test_throwaway_destination_lease_is_held_and_busy_when_taken(w: XW) -> None:
 
 
 def test_throwaway_destination_replaced_is_a_dest_conflict(w: XW) -> None:
-    import shutil
-
     s = one(w)
     c = clean(w)
-    shutil.rmtree(c["path"])
+    os.rename(c["path"], w.tmp / "moved")  # keeps the old inode alive: no number reuse
     os.mkdir(c["path"])  # same path, other identity
     assert w.invalid(s, c["path"], ["a"]) == {"a": "dest_conflict"}
     assert tree(Path(c["path"])) == {}

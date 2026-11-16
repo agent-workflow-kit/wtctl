@@ -33,7 +33,9 @@ class XW(TW):
         return d
 
     @staticmethod
-    def put(rec: dict[str, Any] | Path, rel: str, data: bytes = b"data\n", mode: int = 0o600) -> Path:
+    def put(
+        rec: dict[str, Any] | Path, rel: str, data: bytes = b"data\n", mode: int = 0o600
+    ) -> Path:
         base = Path(rec if isinstance(rec, Path) else rec["path"])
         p = base / rel
         p.parent.mkdir(parents=True, exist_ok=True)
