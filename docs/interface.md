@@ -436,7 +436,7 @@ What each single-target command does with a record in each state (exit code and 
 | `partial` | 0 | 0 (worktree: as [Partial records](#remove-order), `human_required: true`) | [Partial records](#remove-order) (worktree, human-only); [Throwaway removal](#throwaway-removal) (throwaway) | 20 `unlinked` | 20 `unlinked` | 20 `unlinked` | 20 `unlinked` | 0 | 0 |
 | `gone`, `removed`, `forgotten` | 0 (full id) | 10 | 10 | 10 | 10 | 10 | 0, a new record | 10 | 10 |
 
-- **Tombstones:** only a full id finds one ([Identifiers](#identifiers)); the 10 carries `error.details: {state, removed_at}`. A path never matches a tombstone, so `adopt` of a worktree's path records it anew; a path in the throwaway root is refused with exit 2 whatever the record's state.
+- **Tombstones:** only a full id finds one ([Identifiers](#identifiers)); the 10 carries `error.details: {state, removed_at}`. A path never matches a tombstone, so `adopt` of a worktree's path records it anew (the path must be a git worktree, otherwise exit 10); a path in the throwaway root is refused with exit 2 whatever the record's state.
 - **`forget`** follows its own rules in every live state (plain `forget` is human-only; `--holder` removes a holder).
 - **A throwaway whose directory vanished** while its record is still `active` (before [Reconcile](#reconcile) saw it): `remove` marks it `gone` and exits 0 with a warning; `extract` exits 20, `unlinked`.
 - **A live creator.** Commands that take the per-record lease (`remove`, `bootstrap`, `extract`, `baseline accept`, `adopt` of its path, `forget`, `label`) wait for a `creating` record's lease while its creator is alive and then exit 12, `busy`; the `creating` row shows the outcome once the creator has died.

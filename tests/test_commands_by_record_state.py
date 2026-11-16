@@ -143,8 +143,8 @@ DOC_BULLETS = (
     (
         "**Tombstones:** only a full id finds one (Identifiers); the 10 carries error.details: "
         "{state, removed_at}. A path never matches a tombstone, so adopt of a worktree's path "
-        "records it anew; a path in the throwaway root is refused with exit 2 whatever the "
-        "record's state."
+        "records it anew (the path must be a git worktree, otherwise exit 10); a path in the "
+        "throwaway root is refused with exit 2 whatever the record's state."
     ),
     (
         "**forget** follows its own rules in every live state (plain forget is human-only; "
@@ -256,6 +256,7 @@ def test_the_prose_around_the_table_is_the_one_tested() -> None:
     assert bullets == DOC_BULLETS, "interface.md: a bullet under the table changed: revisit exp()"
 
 
+WRONG_FOR_THROWAWAY = ("bootstrap", "baseline_check", "baseline_accept", "forget", "adopt")
 EXPECTATION = re.compile(r"^(ok|\d+(:\w+)?)$")
 
 
@@ -277,7 +278,13 @@ def test_every_cell_has_an_expectation() -> None:
                             if lead is None:  # a reference to another section, or "never"
                                 continue
                             got = 0 if want == "ok" else int(want.partition(":")[0])
-                            allowed = {int(lead.group()), 2, 13}
+                            allowed = {int(lead.group())}
+                            if (kind == "throwaway" and cmd in WRONG_FOR_THROWAWAY) or (
+                                kind != "throwaway" and cmd == "extract"
+                            ):
+                                allowed.add(2)  # wrong object type
+                            if cmd in (*HUMAN_GATED, "remove") and actor != "human":
+                                allowed.add(13)  # actor gate
                             if "missing: 10" in cell and state == "missing":
                                 allowed.add(10)
                             assert got in allowed, (cmd, actor, kind, state, want, cell)
