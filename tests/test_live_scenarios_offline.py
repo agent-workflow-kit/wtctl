@@ -87,6 +87,26 @@ def test_unadvertised_sha_never_picks_an_advertised_commit(world: LiveWorld) -> 
     assert old != shas[5] and old in shas
 
 
+def test_unadvertised_sha_lists_only_heads_and_tags(
+    world: LiveWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote = Path(world.fetch_url)
+    shas = git(remote, "rev-list", "trunk").split()
+    git(remote, "update-ref", "refs/pull/1/head", shas[5])
+    seen: list[list[str]] = []
+    real = world.net_git
+
+    def spy(args: list[str], **kw: object):  # noqa: ANN202
+        seen.append(args)
+        return real(args, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(world, "net_git", spy)
+    old = sc.unadvertised_sha(world, skip=5)
+    assert old == shas[5]  # a pull-request head is not consulted
+    ls = [a for a in seen if a[0] == "ls-remote"]
+    assert any("--heads" in a and "--tags" in a for a in ls)
+
+
 def test_unadvertised_sha_needs_enough_history(world: LiveWorld) -> None:
     with pytest.raises(AssertionError, match="more than 21 commits"):
         sc.unadvertised_sha(world, skip=20)
@@ -196,6 +216,41 @@ def test_a_failed_delete_after_success_names_the_branch(
     def flaky(args: list[str], **kw: object):  # noqa: ANN202
         if args[0] == "push" and args[-1].startswith(":"):
             return GitResult(1, b"", b"remote: nope")
+        return real(args, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(world, "net_git", flaky)
+    with pytest.raises(AssertionError, match=r"could not delete the disposable branch wtctl-live-"):
+        sc.push_fast_forward(world, 1, "wtctl-live-")
+
+
+def test_a_non_assertion_failure_in_the_delete_still_names_the_branch(
+    world: LiveWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = world.net_git
+    monkeypatch.setattr(sc.secrets, "token_hex", lambda _n: "0123456789ab")
+
+    def flaky(args: list[str], **kw: object):  # noqa: ANN202
+        if args[0] == "push" and args[-1].startswith(":"):
+            raise OSError("disk gone")
+        res = real(args, **kw)  # type: ignore[arg-type]
+        if args[0] == "push":
+            raise AssertionError("boom after the push")
+        return res
+
+    monkeypatch.setattr(world, "net_git", flaky)
+    with pytest.raises(AssertionError, match="boom after the push") as e:
+        sc.push_fast_forward(world, 1, "wtctl-live-")
+    assert "wtctl-live-0123456789ab" in "\n".join(getattr(e.value, "__notes__", []))
+
+
+def test_a_non_assertion_failure_in_the_delete_after_success_names_the_branch(
+    world: LiveWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = world.net_git
+
+    def flaky(args: list[str], **kw: object):  # noqa: ANN202
+        if args[0] == "push" and args[-1].startswith(":"):
+            raise OSError("disk gone")
         return real(args, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(world, "net_git", flaky)

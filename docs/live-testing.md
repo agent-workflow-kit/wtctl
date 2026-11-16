@@ -57,8 +57,10 @@ in that temporary directory and are removed with it.
 
 - **Public repository** (`..._PUBLIC_REPO`): small and long-lived: under 200 MB, under about 5000
   commits, at least 8 commits and years of history (the strict-fsck test wants real old history,
-  and the unadvertised-sha test needs a commit six back from the tip that no branch or request
-  points at). The mirror test (a full clone) and the strict-fsck test (a full-history fetch)
+  and the unadvertised-sha test needs a commit six back from the tip that no branch or tag
+  points at; only branches and tags are listed (`ls-remote --heads --tags`), so a commit that only
+  a pull-request head points to still counts as unadvertised, and the repository should have
+  fewer than about 5000 refs). The mirror test (a full clone) and the strict-fsck test (a full-history fetch)
   both fetch the whole history, so the bound is what a run costs. Choose a project you do not
   control, so nothing depends on it staying yours.
 - **Fork request head** (`..._FORK_PR_HEAD`): the head commit of an open or closed pull request
@@ -114,6 +116,12 @@ variables and the config directory, no keyring session, `GH_TOKEN` or session bu
 wtctl itself. It must print the token under those conditions; if it prints nothing the test is
 skipped with a message saying so. Its output is scrubbed from everything a test prints and scanned
 for in every file the run wrote.
+
+A forge CLI token command may only be `gh auth token` or `glab auth token` style (anything else
+of `gh` or `glab` is refused), and shells, interpreters and wrappers (`sh`, `bash`, `zsh`, `dash`,
+`env`, `xargs`, `python*`, `perl`, `ruby`, `node`, `busybox`) are refused. The remaining limit:
+the command runs with your real CLI config directory, so use only read commands of that kind (a
+password-manager `show` command, say); the suite cannot vet an arbitrary program.
 
 ## What each test verifies
 

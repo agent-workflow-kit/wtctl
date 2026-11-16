@@ -118,9 +118,13 @@ _RESERVED_BRANCHES = frozenset({"head", "main", "master", "trunk", "develop", "r
 # Variables a token variable must never name: the child's isolation and the tools' own settings.
 _RESERVED_ENV_RE = re.compile(
     r"(?:HOME|PATH|LANG|LANGUAGE|USER|SHELL|TMPDIR|PWD|PYTHONPATH|"
-    r"(?:XDG|GIT|SSH|WTCTL|LC|LD|PYTHON)_.*)"
+    r"(?:XDG|GIT|SSH|WTCTL|LC|LD|PYTHON|SSL|CURL|GCM|GH|GLAB)_.*|(?i:.*_PROXY))"
 )
 ALLOWED_TOKEN_COMMAND_CLIS = frozenset({"gh", "glab"})
+# Programs that run whatever they are given: never a token command (``sh -c ...`` and the like).
+REFUSED_TOKEN_COMMAND_PROGRAMS = frozenset(
+    {"sh", "bash", "zsh", "dash", "env", "xargs", "perl", "ruby", "node", "busybox"}
+)
 
 
 def getenv(name: str, environ: Mapping[str, str] | None = None) -> str | None:
@@ -187,8 +191,12 @@ def token_command(forge: Forge, environ: Mapping[str, str] | None = None) -> lis
 
 def token_command_is_read_only(argv: list[str]) -> bool:
     """A forge CLI may only run ``auth token``: nothing else of ``gh`` or ``glab`` is ever run
-    with the maintainer's credentials."""
-    if os.path.basename(argv[0]) in ALLOWED_TOKEN_COMMAND_CLIS:
+    with the maintainer's credentials. Shells, interpreters and wrappers that run an arbitrary
+    program (``sh``, ``env``, ``xargs``, ``python*``, ...) are refused outright."""
+    program = os.path.basename(argv[0])
+    if program in REFUSED_TOKEN_COMMAND_PROGRAMS or program.startswith("python"):
+        return False
+    if program in ALLOWED_TOKEN_COMMAND_CLIS:
         return argv[1:3] == ["auth", "token"]
     return True
 

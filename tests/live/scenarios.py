@@ -87,12 +87,13 @@ def unadvertised_sha(w: LiveWorld, skip: int = 5) -> str:
     """A commit that no ref of the forge advertises, fetched by sha at depth 1 and depth 50.
 
     The candidates are found in a shallow throwaway of the tip (``skip`` commits back and the few
-    after), checked against every advertised ref (``ls-remote`` with no pattern), then the first
-    unadvertised one is asked for from the forge by full sha: servers differ in whether they serve
+    after), checked against the advertised branches and tags (``ls-remote --heads --tags``;
+    pull-request refs are not consulted, which bounds the listing), then the first unadvertised
+    one is asked for from the forge by full sha: servers differ in whether they serve
     a sha they do not advertise. Raises :class:`NoUnadvertisedCommit` when all are advertised.
     """
     tip = w.tip("HEAD")
-    advertised = {sha for sha, _ in w.ls_remote(None)}
+    advertised = {sha for sha, _ in w.ls_remote(None, heads_tags=True)}
     with throwaway(w, tip, depth=skip + UNADVERTISED_CANDIDATES) as rec:
         path = Path(rec["path"])
         res = w.git.run(
@@ -190,21 +191,32 @@ def _find_leak(w: LiveWorld) -> str | None:
     The comparison lives here, not in the asserting function: a failing assert shows its frame's
     locals under ``pytest -l``, and only the path of the leak may be in them.
     """
-    forms = [f.encode() for f in w.secret_forms()]
-    if not forms:
-        return None
-    for path in w.base.rglob("*"):
-        if path.is_symlink() or not path.is_file():
-            continue
-        try:
-            if path.stat().st_size > MAX_SCAN_BYTES:
+    forms: list[bytes] = []
+    data = b""
+    try:
+        forms = [f.encode() for f in w.secret_forms()]
+        if not forms:
+            return None
+        for path in w.base.rglob("*"):
+            if path.is_symlink() or not path.is_file():
                 continue
-            data = path.read_bytes()
-        except OSError:
-            continue
-        if any(form in data for form in forms):
-            return str(path.relative_to(w.base))
-    return None
+            try:
+                too_big = path.stat().st_size > MAX_SCAN_BYTES
+            except OSError:
+                continue  # vanished between listing and stat
+            if too_big:
+                continue
+            data = path.read_bytes()  # unreadable: the scan fails rather than skip a file
+            if any(form in data for form in forms):
+                return str(path.relative_to(w.base))
+        return None
+    except Exception as exc:
+        # Under ``pytest -l`` the traceback would show ``forms`` and ``data``: only the class name
+        # leaves this function, and the ``finally`` drops the locals.
+        name = type(exc).__name__
+        raise RuntimeError(f"secret scan failed: {name}") from None
+    finally:
+        del forms, data
 
 
 def assert_secret_absent(w: LiveWorld) -> None:
@@ -427,11 +439,22 @@ def push_fast_forward(w: LiveWorld, depth: int, prefix: str, record: Record | No
         if created:
             try:
                 _delete_branch(w, url, ref, branch)
-            except AssertionError as cleanup:
-                failure.add_note(f"cleanup also failed: {cleanup}")
+            except Exception as cleanup:
+                failure.add_note(
+                    f"cleanup also failed, delete the branch {branch} by hand: "
+                    f"{w.scrub(str(cleanup))[:600] or type(cleanup).__name__}"
+                )
         raise
     if created:
-        _delete_branch(w, url, ref, branch)
+        try:
+            _delete_branch(w, url, ref, branch)
+        except AssertionError:
+            raise
+        except Exception as cleanup:
+            raise AssertionError(
+                f"could not delete the disposable branch {branch} "
+                f"({type(cleanup).__name__}); delete it by hand"
+            ) from None
     assert [r for r in w.ls_remote(ref) if r[1] == ref] == [], (
         f"the disposable branch {branch} is still there; delete it by hand"
     )

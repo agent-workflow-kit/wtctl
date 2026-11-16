@@ -303,7 +303,9 @@ def test_a_token_variable_name_must_be_a_plain_identifier() -> None:
 @pytest.mark.parametrize(
     "name",
     ["HOME", "PATH", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_ASKPASS", "SSH_AUTH_SOCK",
-     "WTCTL_LIVE_GITHUB_TOKEN_ENV", "LC_ALL", "LD_PRELOAD", "PYTHONPATH", "LANG"],
+     "WTCTL_LIVE_GITHUB_TOKEN_ENV", "LC_ALL", "LD_PRELOAD", "PYTHONPATH", "LANG",
+     "HTTPS_PROXY", "http_proxy", "NO_PROXY", "all_proxy", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
+     "GCM_CREDENTIAL_STORE", "GH_TOKEN", "GH_HOST", "GLAB_CONFIG_DIR"],
 )  # fmt: skip
 def test_a_token_variable_may_not_name_an_isolation_variable(name: str) -> None:
     env = {GITHUB.var("TOKEN_ENV"): name, name: TOKEN}
@@ -328,7 +330,13 @@ def test_the_child_environment_keeps_isolation_over_a_token_named_like_it(tmp_pa
      (["/usr/bin/glab", "auth", "token"], True),
      (["gh", "api", "-X", "DELETE", "/repos/o/r"], False), (["gh"], False),
      (["/opt/bin/gh", "repo", "delete", "o/r"], False), (["glab", "auth", "login"], False),
-     (["gh", "token", "auth"], False), (["pass", "show", "forge/token"], True)],
+     (["gh", "token", "auth"], False), (["pass", "show", "forge/token"], True),
+     (["sh", "-c", "echo x"], False), (["/bin/bash", "-c", "x"], False),
+     (["zsh", "-c", "x"], False), (["dash", "-c", "x"], False),
+     (["env", "gh", "auth", "token"], False), (["xargs", "echo"], False),
+     (["python3", "-c", "x"], False), (["/usr/bin/python3.12", "x"], False),
+     (["perl", "-e", "1"], False), (["ruby", "-e", "1"], False), (["node", "-e", "1"], False),
+     (["busybox", "sh"], False)],
 )  # fmt: skip
 def test_a_forge_cli_token_command_may_only_run_auth_token(argv: list[str], ok: bool) -> None:
     env = {GITHUB.var("TOKEN_COMMAND"): json.dumps(argv)}
@@ -822,3 +830,21 @@ def test_the_token_command_does_not_see_the_callers_environment(
         token_command=["sh", "-c", 'printf "%s" "${GH_TOKEN:-}"'],
     )  # fmt: skip
     assert w.prime_token_command() == ""
+
+
+def test_a_failing_secret_scan_leaks_no_secret_under_locals_display(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = LiveWorld(tmp_path / "w", host="forge.example", project="o/r", tokens={"T": TOKEN})
+    (w.base / "f.txt").write_text("x")
+
+    def boom(_self: Path) -> bytes:
+        raise PermissionError(TOKEN)
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    with pytest.raises(RuntimeError, match="secret scan failed: PermissionError") as e:
+        scenarios._find_leak(w)
+    assert TOKEN not in str(e.value) and e.value.__cause__ is None
+    assert e.value.__suppress_context__
+    frame_locals = repr(e.value.__traceback__.tb_next.tb_frame.f_locals)  # type: ignore[union-attr]
+    assert TOKEN not in frame_locals

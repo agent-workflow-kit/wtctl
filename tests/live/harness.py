@@ -368,10 +368,15 @@ class LiveWorld:
                 raise AssertionError(f"could not create the scratch repository: {out.err}")
         return path
 
-    def ls_remote(self, ref: str | None = "HEAD", *, symref: bool = False) -> list[tuple[str, str]]:
+    def ls_remote(
+        self, ref: str | None = "HEAD", *, symref: bool = False, heads_tags: bool = False
+    ) -> list[tuple[str, str]]:
         """``(object-or-target, ref)`` pairs; with ``symref`` the first row is the symref line.
-        ``ref=None`` lists every advertised ref."""
+        ``ref=None`` lists every advertised ref, or with ``heads_tags`` only branches and tags
+        (a forge advertises tens of thousands of pull-request refs besides)."""
         args = ["ls-remote"]
+        if heads_tags:
+            args += ["--heads", "--tags"]
         if symref:
             args.append("--symref")
         args += ["--", self.fetch_url]
