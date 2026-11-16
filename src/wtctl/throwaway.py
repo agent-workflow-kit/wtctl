@@ -522,9 +522,16 @@ class ThrowawayCreator:
     def tgit(self) -> str:
         return os.path.join(self.path, ".git")
 
-    def _git(self, args: list[str], *, timeout: float = 300) -> Any:
+    def _git(self, args: list[str], *, timeout: float = 300, work_tree: bool = False) -> Any:
+        """Hardened git in the throwaway. Only a command that writes the work tree gets one (and
+        then runs in it): without ``--work-tree`` git would write into its cwd."""
         return self.git.run(
-            args, git_dir=self.tgit, cwd=self.tgit, allow_shallow=True, timeout=timeout
+            args,
+            git_dir=self.tgit,
+            work_tree=self.path if work_tree else None,
+            cwd=self.path if work_tree else self.tgit,
+            allow_shallow=True,
+            timeout=timeout,
         )
 
     @staticmethod
@@ -619,7 +626,8 @@ class ThrowawayCreator:
         self._verify()
         limit = float(min(self.config.clone_timeout_s, 24 * 86400))
         self._checked(
-            self._git(["read-tree", "-u", "--reset", "HEAD"], timeout=limit), "git read-tree"
+            self._git(["read-tree", "-u", "--reset", "HEAD"], timeout=limit, work_tree=True),
+            "git read-tree",
         )
         self._verify()
         self._head_check()
