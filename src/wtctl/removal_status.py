@@ -127,6 +127,7 @@ class Status:
             dir_id=r["dir_id"],
             hooks_id=baselinesvc.hooks_identity(items),
             hooks_path=baselinesvc.hooks_recorded_path(items),
+            links=baselinesvc.follows_links(self.state, r["id"]),
         )
         current = baselinesvc.compute(spec)
         self.baseline_current = current

@@ -15,6 +15,7 @@ from . import linkcheck, repobaseline
 from .errors import UsageError, WtctlError
 from .locate import describe_mount
 from .repobaseline import Baseline, Item, Spec
+from .state import BASELINE_FORMAT
 
 # The collector runner: ``fsafe_child.run_op`` (a child process under the walk deadline) unless
 # a test substitutes ``repobaseline.inproc``.
@@ -73,6 +74,7 @@ def spec_for(
     hooks_id: str | None = None,
     hooks_path: str | None = None,
     rebind_hooks: bool = False,
+    links: bool = True,
 ) -> Spec:
     return Spec(
         common_dir=record["common_dir"],
@@ -86,7 +88,16 @@ def spec_for(
         hooks_identity=hooks_id,
         hooks_identity_path=hooks_path,
         rebind_hooks=rebind_hooks,
+        links=links,
     )
+
+
+def follows_links(state: Any, record_id: str) -> bool:
+    """Whether the record's baseline is compared with the symlink-following collector (format 2).
+    A baseline recorded before that (format 1) is compared by the collector that recorded it, so
+    the new coverage never makes a routine command fail by itself (docs/interface.md,
+    Baseline, Format)."""
+    return bool(state.baseline_format(record_id) >= BASELINE_FORMAT)
 
 
 def compute(spec: Spec) -> Baseline:
@@ -176,6 +187,7 @@ def verify_unchanged(
         dir_id=record["dir_id"],
         hooks_id=hooks_identity(items),
         hooks_path=hooks_recorded_path(items),
+        links=follows_links(state, record["id"]),
     )
     current = compute(spec)
     if is_changed(record, current):
@@ -183,7 +195,33 @@ def verify_unchanged(
     return links, current
 
 
-def record_current(config: Any, record: dict[str, Any]) -> Baseline:
+def new_coverage(
+    config: Any, state: Any, record: dict[str, Any], current: Baseline
+) -> list[dict[str, Any]]:
+    """For a format 1 record whose baseline matched: the items a ``baseline accept`` would add
+    (the format 2 collector's items that the format 1 one did not emit), as ``baseline_item``
+    rows. Empty for a format 2 record."""
+    if follows_links(state, record["id"]):
+        return []
+    items = recorded_items(state, record["id"])
+    full = compute(
+        spec_for(
+            config,
+            record,
+            common_id=record["common_id"],
+            dir_id=record["dir_id"],
+            hooks_id=hooks_identity(items),
+            hooks_path=hooks_recorded_path(items),
+        )
+    )
+    return repobaseline.compare(current.items, full.items)
+
+
+def record_current(config: Any, record: dict[str, Any], *, links: bool = True) -> Baseline:
     """The baseline of a worktree that was just made or just bootstrapped, from the record's own
     identities (``create`` and a bootstrap re-run record it)."""
-    return compute(spec_for(config, record, common_id=record["common_id"], dir_id=record["dir_id"]))
+    return compute(
+        spec_for(
+            config, record, common_id=record["common_id"], dir_id=record["dir_id"], links=links
+        )
+    )

@@ -14,7 +14,7 @@ import pytest
 from tests.statehelpers import FakeClock, FakeProcs, fake_gateway, make_state, rec
 from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway
-from wtctl.state import State, state_path
+from wtctl.state import MIGRATIONS, State, state_path
 
 
 def two_holders(tmp: Path) -> tuple[State, State, FakeClock, FakeProcs]:
@@ -343,7 +343,7 @@ def test_real_concurrent_id_allocation_never_collides(tmp_path: Path, worker: Pa
 def test_real_concurrent_first_open_migrates_once(tmp_path: Path, worker: Path) -> None:
     procs = [spawn(worker, "open", "-") for _ in range(8)]
     outs = finish(procs)
-    assert all(o.startswith("open 1") for o in outs)
+    assert all(o.startswith(f"open {len(MIGRATIONS)}") for o in outs)
 
 
 _ = (fake_gateway,)

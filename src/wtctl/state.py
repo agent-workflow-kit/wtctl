@@ -130,7 +130,20 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 expires REAL NOT NULL)""",
         ),
     ),
+    (
+        2,
+        (
+            # the baseline format of a record (docs/interface.md, Baseline, Format); no row: 1
+            """CREATE TABLE baseline_meta (
+                record_id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+                format INTEGER NOT NULL)""",
+        ),
+    ),
 )
+
+# The format of every baseline wtctl records now; a record without a baseline_meta row is 1.
+BASELINE_FORMAT = 2
+LEGACY_BASELINE_FORMAT = 1
 
 COLUMNS = (
     "id object_type owned state repo clone_path common_dir common_id admin_dir base_dir root_id "
@@ -640,6 +653,7 @@ class State:
         record became a tombstone or does not exist; nothing is changed.
         """
         baseline_items: Sequence[Mapping[str, Any]] | None = updates.pop("baseline_items", None)
+        baseline_format: int = updates.pop("baseline_format", BASELINE_FORMAT)
         anchor: tuple[str, str] | None = updates.pop("rerecord_anchor", None)
         clone: tuple[str, str, str] | None = updates.pop("rebind_clone", None)
         moved: tuple[str, str, str, str, str] | None = updates.pop("move_clone", None)
@@ -681,7 +695,7 @@ class State:
                     "another command changed it first",
                 )
             if baseline_items is not None:
-                self._write_baseline(c, record_id, baseline_items)
+                self._write_baseline(c, record_id, baseline_items, baseline_format)
             if anchor is not None:
                 self._write_anchor(c, *anchor)
             if clone is not None:
@@ -696,9 +710,16 @@ class State:
 
     @staticmethod
     def _write_baseline(
-        c: sqlite3.Connection, record_id: str, items: Sequence[Mapping[str, Any]]
+        c: sqlite3.Connection,
+        record_id: str,
+        items: Sequence[Mapping[str, Any]],
+        fmt: int = BASELINE_FORMAT,
     ) -> None:
         c.execute("DELETE FROM baseline_items WHERE record_id = ?", (record_id,))
+        c.execute(
+            "INSERT OR REPLACE INTO baseline_meta(record_id, format) VALUES (?, ?)",
+            (record_id, fmt),
+        )
         c.executemany(
             'INSERT INTO baseline_items(record_id, path, "key", kind, class, digest, anchor_id) '
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -707,6 +728,13 @@ class State:
                 for i in items
             ],
         )
+
+    def baseline_format(self, record_id: str) -> int:
+        """The format the record's baseline was recorded in (1 when nothing says otherwise)."""
+        row = self._conn.execute(
+            "SELECT format FROM baseline_meta WHERE record_id = ?", (record_id,)
+        ).fetchone()
+        return LEGACY_BASELINE_FORMAT if row is None else int(row[0])
 
     def baseline_items(self, record_id: str) -> list[dict[str, Any]]:
         """The recorded baseline rows as ``cls path key type sha256 anchor_id`` dicts."""

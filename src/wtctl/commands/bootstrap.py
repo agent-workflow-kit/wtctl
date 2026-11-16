@@ -15,7 +15,7 @@ from .. import baselinesvc, bootstrapper, fsafe, inuse, repobaseline
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError, bootstrap_failed_details
 from ..gitsetup import open_git, with_filters
-from ..state import Record, record_lease
+from ..state import BASELINE_FORMAT, LEGACY_BASELINE_FORMAT, Record, record_lease
 from .create import record_object
 
 BOOTSTRAPPABLE = "active"
@@ -118,7 +118,10 @@ def _rerecord(ctx: Context, record: Record) -> Record:
     (``repo_config_changed``, exit 20; the bootstrap bounds are the baseline's) and the old
     baseline stays recorded; the refused items are the incomplete ones, each with its ``detail``
     and its recorded state as ``before``."""
-    current = baselinesvc.record_current(ctx.config, record)
+    # a baseline recorded before symlink targets were covered stays in its format: only
+    # `baseline accept` upgrades it, so a re-run cannot start to fail on the new items
+    legacy = not baselinesvc.follows_links(ctx.state, record["id"])
+    current = baselinesvc.record_current(ctx.config, record, links=not legacy)
     if current.has_detail():
         recorded = baselinesvc.recorded_items(ctx.state, record["id"])
         rows = [r for r in repobaseline.compare(recorded, current.items) if r.get("detail")]
@@ -129,6 +132,7 @@ def _rerecord(ctx: Context, record: Record) -> Record:
         BOOTSTRAPPABLE,
         baseline_digest=current.digest,
         baseline_items=baselinesvc.item_rows(current),
+        baseline_format=LEGACY_BASELINE_FORMAT if legacy else BASELINE_FORMAT,
     )
 
 
