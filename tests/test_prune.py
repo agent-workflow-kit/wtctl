@@ -41,8 +41,9 @@ def test_removes_throwaways_older_than_the_given_age_and_nothing_else(w: TW) -> 
     assert Path(mid["path"]).is_dir() and Path(new["path"]).is_dir()
     assert w.state_of(old["id"]) == "removed" and w.state_of(mid["id"]) == "active"
     assert w.pruned("--older-than", "2d")["removed"] == [mid["id"]]
-    assert w.pruned("--older-than", "1s")["removed"] == []  # `new` is younger than a second? no:
-    # (the created time of `new` is real "now"; a 1s age may already be exceeded)
+    # `new` was just created: far inside a 1h age, whatever the machine's speed
+    assert w.pruned("--older-than", "1h")["removed"] == []
+    assert Path(new["path"]).is_dir() and w.state_of(new["id"]) == "active"
 
 
 @pytest.mark.parametrize("unit", ["12h", "2d", "1w", "30m", "86400s"])
@@ -338,8 +339,14 @@ def test_concurrent_prunes_remove_each_throwaway_once(w: TW) -> None:
     assert leaks(w.troot) == []
 
 
-def test_prune_does_not_remove_a_throwaway_that_is_being_created(w: TW) -> None:
+def test_prune_does_not_remove_a_throwaway_that_is_being_created(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from tests.createlib import Spy
+
+    # a cutoff in the far future: every record is "older" by age, so only the in-creation
+    # protection can keep the new one (no dependence on how long creation takes)
+    monkeypatch.setattr(State, "timestamp_before", lambda self, seconds: "2999-01-01T00:00:00.000Z")
 
     seen: dict[str, Any] = {}
     old = mk(w, 10)
@@ -347,7 +354,7 @@ def test_prune_does_not_remove_a_throwaway_that_is_being_created(w: TW) -> None:
     def before(sub, argv, kw):  # noqa: ANN001, ANN202
         if sub == "fetch" and "r" not in seen:
             seen["r"] = w.prune(
-                "--throwaways", "--older-than", "1s", gateway=Gateway(scanner=w.scanner)
+                "--throwaways", "--older-than", "1d", gateway=Gateway(scanner=w.scanner)
             )
         return None
 
