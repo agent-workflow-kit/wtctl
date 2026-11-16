@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import fsafe
@@ -598,18 +599,13 @@ def transfer_base(
 # --------------------------------------------------------------------------------------------
 
 
-def _is_shallow(git_dir: str) -> bool:
+def is_shallow(git_dir: str) -> bool:
     try:
         return os.stat(os.path.join(git_dir, "shallow")).st_size > 0
     except OSError:
         return False
 
 
-# todo(#21): fill_local_throwaway initializes the throwaway itself (_init_fresh), while
-# interface.md "Throwaway create order" step 7 has the caller create and init it (template,
-# info/attributes `* -filter`, core.logAllRefUpdates=false, none of which is written here) before
-# the fill. #21 reconciles the ownership, and anchors the throwaway directory's identity between
-# the init and the read-tree (TOCTOU: a same-user symlink swap of the directory).
 def fill_local_throwaway(
     git: Git,
     cfg: Config,
@@ -620,18 +616,25 @@ def fill_local_throwaway(
     depth: int = 0,
     honor_filters: bool = False,
     max_pack_bytes: int = MAX_PACK_BYTES,
+    verify: Callable[[], None] | None = None,
 ) -> None:
     """Fill the throwaway directory ``throwaway`` with commit ``sha`` of the clone (``local``).
 
     ``depth`` is ``0`` (the commit's full history) or ``1`` (a shallow throwaway); any other
-    value is a ``ValueError`` (the CLI reports it as usage, exit 2). ``throwaway`` must not exist
-    or be an empty directory: it is initialized here (``init --template=``). Every command that
+    value is a ``ValueError`` (the CLI reports it as usage, exit 2). The caller owns the
+    throwaway's directory and repository: it created the directory, recorded its identity and ran
+    ``init --template=`` with the attributes and config of interface.md "Throwaway create order"
+    step 7 (``wtctl.throwaway``); this function only fills it. ``verify`` is the caller's
+    re-check that the directory is still the one it created (its recorded identity); it runs
+    before every step that writes into the throwaway by path (the shallow file, the index
+    install, the work tree) and once at the end. Every command that
     reads the clone runs with protocols ``none`` (the clone is never fetched from): the object
     list is written to a file by ``rev-list --objects`` (its exit status checked, so a failure can
     never become a truncated pack), packed with ``pack-objects --stdout`` and indexed with
     ``--strict`` in the throwaway. Failures are ``create_failed``; the caller removes the
     throwaway.
     """
+    check = verify or (lambda: None)
     if not _SHA.fullmatch(sha):
         raise ValueError("sha must be a full 40-hex commit id")
     if depth not in (0, 1):
@@ -640,7 +643,7 @@ def fill_local_throwaway(
     timeout = _local_timeout(cfg)
     if not clone_has_commit(git, clone_dir, sha):
         raise _fail(f"the clone does not hold commit {sha}")
-    if depth == 0 and _is_shallow(clone_dir):
+    if depth == 0 and is_shallow(clone_dir):
         raise _fail(
             "source repository is shallow: its full history cannot be copied "
             "(use depth 1 or another source)"
@@ -665,8 +668,8 @@ def fill_local_throwaway(
             ),
             "git pack-objects in the clone",
         )  # fmt: skip
-        _init_fresh(git, t, p)
         tgit = os.path.join(t, ".git")
+        check()
         if depth == 1:  # before indexing: --strict needs it for the missing parents
             with fsafe.open_anchor(os.path.realpath(tgit)) as a:
                 fd = fsafe.create_new_file(a.fd, "shallow", mode=0o644, forbid_git=False)
@@ -674,6 +677,7 @@ def fill_local_throwaway(
                     os.write(fd, f"{sha}\n".encode())
                 finally:
                     os.close(fd)
+        check()
         _checked(
             git.run(
                 ["index-pack", "--stdin", "--strict"], git_dir=tgit, cwd=tgit, allow_shallow=True,
@@ -691,6 +695,7 @@ def fill_local_throwaway(
             ),
             "git update-ref in the throwaway",
         )
+        check()
         _checked(
             git.run(
                 ["read-tree", "-u", "--reset", "HEAD"], git_dir=tgit, work_tree=t, cwd=t,
@@ -703,21 +708,9 @@ def fill_local_throwaway(
             git.run(["rev-parse", "HEAD"], git_dir=tgit, cwd=tgit, allow_shallow=True, timeout=60),
             "git rev-parse in the throwaway",
         )
+        check()
         if head.out.strip() != sha:
             raise _fail("the throwaway's HEAD is not the requested commit")
-
-
-def _init_fresh(git: Git, throwaway: str, p: str) -> None:
-    """``init --template=`` of a throwaway that does not exist or is an empty real directory."""
-    try:
-        st = os.lstat(throwaway)
-    except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISDIR(st.st_mode) or os.listdir(throwaway):
-            raise _fail("the throwaway directory exists and is not an empty directory")
-    r = git.run(["init", "-q", "--template=", "--", throwaway], private_dir=p, timeout=60)
-    _checked(r, "git init of the throwaway")
 
 
 __all__ = [
@@ -726,6 +719,7 @@ __all__ = [
     "Transfer",
     "clone_has_commit",
     "fill_local_throwaway",
+    "is_shallow",
     "index_pack",
     "install_pack",
     "missing_objects",

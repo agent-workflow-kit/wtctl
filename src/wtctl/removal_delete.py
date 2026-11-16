@@ -87,11 +87,42 @@ def delete_worktree(state: Any, record: dict[str, Any], budget: fsafe_child.Budg
     """Delete the worktree directory, its ``.git`` pointer last. A directory that is already gone,
     under an anchor that opened and matched its recorded identity, counts as deleted; a missing
     anchor or chain component is a refusal (``missing``): the tree may exist elsewhere."""
-    path = record["path"]
     try:
         args = {**delete_args(state, record), "last": ".git"}
     except fsafe.FsafeError as exc:
         return TreeOutcome("refused", error=exc)
+    return _delete(args, record["path"], budget)
+
+
+def throwaway_args(record: dict[str, Any]) -> dict[str, Any]:
+    """The request that deletes a throwaway's directory: the anchor is the throwaway root
+    (``base_dir``, with the recorded ``root_id``), the directory exactly ``<base_dir>/<id>``
+    with the recorded ``dir_id``. Anything else is a refusal."""
+    path, base, rid = record["path"], record.get("base_dir"), record["id"]
+    if not base or not record.get("root_id") or not record.get("dir_id"):
+        raise fsafe.FsafeError("identity", f"{rid} has no recorded root or directory identity")
+    if path != os.path.join(base, rid):
+        raise fsafe.FsafeError("identity", f"{path} is not {rid} directly below {base}")
+    return {
+        "anchor": {"path": base, "identity": removalfs.identity_list(record["root_id"])},
+        "chain": [],
+        "name": rid,
+        "root_identity": removalfs.identity_list(record["dir_id"]),
+    }
+
+
+def delete_throwaway(record: dict[str, Any], budget: fsafe_child.Budget) -> TreeOutcome:
+    """Delete a throwaway's directory exactly as a worktree's tree is deleted (no ``.git`` last:
+    nothing points into a throwaway). Already gone, under a root that opened and matched, counts
+    as deleted."""
+    try:
+        args = throwaway_args(record)
+    except fsafe.FsafeError as exc:
+        return TreeOutcome("refused", error=exc)
+    return _delete(args, record["path"], budget)
+
+
+def _delete(args: dict[str, Any], path: str, budget: fsafe_child.Budget) -> TreeOutcome:
     res = removalfs.run("delete_tree", args, budget, fsafe_child.REMOVE_DEADLINE)
     if res.timed_out:
         if res.pid is None:  # no child ever ran: nothing was deleted

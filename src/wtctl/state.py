@@ -10,6 +10,7 @@ Plugs in as ``open_state(ctx)`` (see ``context.py``); the handle is a ``State``.
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import json
 import os
 import re
@@ -375,6 +376,16 @@ class State:
     def _now(self) -> str:
         """UTC, fixed width (``YYYY-MM-DDTHH:MM:SS.mmmZ``) so the text sorts like the time."""
         return self.gateway.clock.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    def timestamp_before(self, seconds: float) -> str:
+        """The timestamp ``seconds`` ago, in the same fixed-width form (so a ``created``
+        comparison is a text comparison). An age too large for a date is "the beginning of time":
+        nothing is older than it."""
+        try:
+            then = self.gateway.clock.now() - dt.timedelta(seconds=seconds)
+        except OverflowError:
+            return "0000-01-01T00:00:00.000Z"
+        return then.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     # -- ids ------------------------------------------------------------------------------
 

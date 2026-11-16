@@ -9,7 +9,7 @@ and never anything that is new at the step-9 re-check.
 The record is moved to ``partial`` before the first entry is deleted and to ``removed`` after the
 last, so a crash at any point in between leaves a truthful record that only a human can finish.
 
-TODO(#21): throwaway removal. TODO(#23): ``reconcile`` settles records this command left
+TODO(#23): ``reconcile`` settles records this command left
 ``partial``. TODO(#7): the record object comes from ``wtctl.record_view`` once list/show land.
 """
 
