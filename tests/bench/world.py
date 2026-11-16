@@ -11,6 +11,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,13 @@ def _within(path: Path, tree: Path) -> bool:
     return path == tree or tree in path.parents
 
 
+def _forbidden_trees() -> tuple[Path, ...]:
+    """Each temporary tree as written and as resolved (``/tmp`` is ``/private/tmp`` on macOS),
+    plus the platform's own temporary directory."""
+    named = (*_FORBIDDEN_TREES, Path(tempfile.gettempdir()))
+    return tuple(dict.fromkeys((*named, *(t.resolve() for t in named))))
+
+
 def bench_dir() -> Path:
     """The benchmark directory from ``BENCH_DIR`` (default ``.bench`` at the repository root),
     resolved. Refuses ``/``, the home directory, the repository root, any ancestor of those,
@@ -47,7 +55,7 @@ def bench_dir() -> Path:
             pytest.fail(f"BENCH_DIR {path} is, or contains, {keep}; use a dedicated directory")
     if path == Path("/"):
         pytest.fail("BENCH_DIR resolves to /")
-    for tree in _FORBIDDEN_TREES:
+    for tree in _forbidden_trees():
         if _within(path, tree):
             pytest.fail(
                 f"BENCH_DIR {path} is under {tree}; use a dedicated directory on a large disk"
@@ -76,7 +84,10 @@ def prepare_bench_dir(base: Path, *, min_free_gib: float = MIN_FREE_GIB) -> None
 
 
 def cleanup_bench_dir(base: Path) -> None:
-    """Remove everything under ``base`` except ``results.json`` and the marker."""
+    """Remove everything under ``base`` except ``results.json`` and the marker. Does nothing
+    unless ``base`` carries the marker, so a wrong path is never emptied."""
+    if not (base / MARKER).exists():
+        return
     for entry in base.iterdir():
         if entry.name in ("results.json", MARKER):
             continue
@@ -89,8 +100,13 @@ def cleanup_bench_dir(base: Path) -> None:
 
 def kill_group(proc: subprocess.Popen[bytes]) -> None:
     """Kill the process group of a child started with ``start_new_session=True`` (its pgid is
-    the exact pid we started) if the child is still running, and reap it."""
-    if proc.poll() is None:
+    the exact pid we started) and reap it.
+
+    The group is signalled whenever the child has not been reaped yet, even if the leader itself
+    already exited: an unreaped (zombie) leader keeps its pid, and so the pgid, reserved, so
+    ``killpg`` can only reach our own group. ``poll()`` is deliberately not used first, since it
+    would reap the leader and release the pgid for reuse while grandchildren may still run."""
+    if proc.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()

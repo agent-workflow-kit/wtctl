@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
-import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -137,6 +140,7 @@ def test_world_runs_the_real_cli_and_times_its_git_calls(tmp_path: Path) -> None
 def test_bench_dir_refuses_dangerous_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     if value == "~":
         value = str(Path.home())
+    monkeypatch.chdir(bw.ROOT)  # relative values resolve against the working directory
     monkeypatch.setenv("BENCH_DIR", value)
     with pytest.raises(pytest.fail.Exception):
         bw.bench_dir()
@@ -205,12 +209,62 @@ def test_cleanup_keeps_only_results_and_marker(tmp_path: Path) -> None:
     assert sorted(p.name for p in base.iterdir()) == [bw.MARKER, "results.json"]
 
 
-def test_a_killed_group_leaves_no_survivor(tmp_path: Path) -> None:
+def test_bench_dir_refuses_the_platform_temp_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tempfile
+
+    for p in (Path(tempfile.gettempdir()), Path(tempfile.gettempdir()).resolve()):
+        for value in (p, p / "x" / "y"):
+            monkeypatch.setenv("BENCH_DIR", str(value))
+            with pytest.raises(pytest.fail.Exception):
+                bw.bench_dir()
+
+
+def test_bench_dir_refuses_a_forbidden_tree_that_resolves_elsewhere(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = tmp_path / "private" / "tmp"
+    real.mkdir(parents=True)
+    link = tmp_path / "tmp"
+    link.symlink_to(real)  # like /tmp -> /private/tmp
+    monkeypatch.setattr(bw, "_FORBIDDEN_TREES", (link,))
+    monkeypatch.setenv("BENCH_DIR", str(link / "x"))
+    with pytest.raises(pytest.fail.Exception):
+        bw.bench_dir()
+
+
+def test_cleanup_refuses_a_directory_without_the_marker(tmp_path: Path) -> None:
+    (tmp_path / "keep.txt").write_text("precious")
+    (tmp_path / "sub").mkdir()
+    bw.cleanup_bench_dir(tmp_path)
+    assert (tmp_path / "keep.txt").read_text() == "precious" and (tmp_path / "sub").is_dir()
+
+
+def test_a_killed_group_leaves_no_surviving_grandchild() -> None:
     proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+        ["sh", "-c", "sleep 300 & echo $!; wait"],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
     )
-    bw.kill_group(proc)
-    assert proc.poll() is not None
+    assert proc.stdout is not None
+    grandchild = int(proc.stdout.readline())
+    proc.stdout.close()
+    try:
+        bw.kill_group(proc)
+        assert proc.returncode is not None
+        deadline = time.monotonic() + 5
+        gone = False
+        while time.monotonic() < deadline and not gone:
+            try:
+                os.kill(grandchild, 0)  # still there, or a zombie awaiting its reaper
+                time.sleep(0.05)
+            except ProcessLookupError:
+                gone = True
+        assert gone
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(grandchild, signal.SIGKILL)  # only the pid this test recorded
 
 
 def test_fast_import_reaps_its_process_when_the_stream_raises(
