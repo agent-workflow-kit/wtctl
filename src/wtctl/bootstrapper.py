@@ -38,7 +38,7 @@ HASH_FILE_CAP = 256 * 1024 * 1024  # a larger untracked file is recorded as `unh
 HASH_TOTAL_CAP = 1024 * 1024 * 1024  # bytes hashed per snapshot
 ENV_FILE_MAX_BYTES = 1024 * 1024  # an env file larger than this is not copied
 ENV_FILE_MAX_COUNT = 1000
-ENV_WALK_LIMIT = 200_000  # directory entries the copy_env source walk reads
+ENV_WALK_LIMIT = 2_000_000  # directory entries the copy_env source walk reads (docs/design.md)
 ENV_WALK_DEPTH = 255  # directory levels the copy_env source walk enters
 ENV_BATCH_BYTES = 8 * 1024 * 1024  # content one copy_env read child returns (it may exceed it by
 # one file, at most ENV_FILE_MAX_BYTES: a batch ends after the first file that reaches the cap)
@@ -532,7 +532,10 @@ def env_match_op(args: dict[str, Any]) -> dict[str, Any]:
             for comps in plans:
                 _match(anchor, anchor.fd, comps, matches, budget, warn)
         except (fsafe.FsafeError, OSError, RecursionError) as exc:
+            # A walk that does not finish copies nothing: its matches would be an arbitrary
+            # prefix of the tree (interface: Bootstrap step 2).
             warn(f"copy_env: the source walk stopped early ({getattr(exc, 'kind', 'io')})")
+            matches.clear()
         kept: list[list[str]] = []
         used = 0
         for m in sorted(matches):

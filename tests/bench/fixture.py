@@ -241,7 +241,8 @@ def build_remote(remote: Path, home: Path, d: Dims, *, stale_at: int | None = No
 
 def finish_remote(remote: Path, home: Path, d: Dims, stale_at: int) -> None:
     """Complete a remote built with ``stale_at``: the rest of main, the branches and the tags."""
-    extend_main(remote, home, d, stale_at, d.commits)
+    if stale_at < d.commits:
+        extend_main(remote, home, d, stale_at, d.commits)
     add_refs(remote, home, d)
 
 

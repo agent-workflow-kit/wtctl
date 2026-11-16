@@ -71,15 +71,55 @@ def test_large_repository_timings() -> None:
             shutil.rmtree(base / "small", ignore_errors=True)
 
 
+def phases() -> set[str]:
+    return set(os.environ.get("BENCH_PHASES", "main,throwaway,many,stress").split(","))
+
+
+def outcome(run: Timed) -> str:
+    """One line on what a ``status``/``remove --dry-run``/``reconcile`` run decided."""
+    try:
+        j = run.json()
+    except ValueError:
+        return f"exit {run.code}"
+    if "checks" in j:
+        bad = sorted(k for k, v in j["checks"].items() if v["status"] != "pass")
+        return f"exit {run.code}; would_remove={j.get('would_remove')}; not pass: {bad or 'none'}"
+    if "reports" in j:
+        kinds: dict[str, int] = {}
+        for r in j["reports"]:
+            kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+        return f"exit {run.code}; changes={len(j['changes'])}; reports={kinds or 'none'}"
+    return f"exit {run.code}"
+
+
 def _scenario(base: Path, res: Results, repeats: int, ignored_files: int) -> None:
     d = fx.MONOREPO
     w = World(base, d)
     w.top["extract"] = {"max_file_bytes": 16 * MIB}
     w.build(stale_at=STALE_AT)
     print("fixture build (s):", {k: round(v, 1) for k, v in w.timeline.items()}, flush=True)
+    # The clone's main worktree also holds installed dependencies, as a real one does.
+    fx.populate_ignored(w.clone, ignored_files // 100, 100)
+    res.add(
+        "nested_repos walk in process, clone main worktree (~365k entries)", _scan_walk(w.clone)
+    )
+    res.add("copy_env walk in process, clone main worktree (~365k entries)", _env_walk(w.clone))
     w.git("config", "user.email", "bench@example.invalid")
     w.git("config", "user.name", "Bench")
 
+    if "main" in phases():
+        _main(w, res, d, repeats, ignored_files)
+    if "throwaway" in phases():
+        _throwaways(w, res, repeats)
+    if "many" in phases():
+        _many_records(base, res)
+    if "stress" in phases():
+        _stress(w, res)
+    res.add("reconcile (big clone, no live records)", ok(w.run("reconcile")))
+
+
+def _main(w: World, res: Results, d: fx.Dims, repeats: int, ignored_files: int) -> None:
+    base = w.base
     # Reference: what plain git costs for the same transfer (the floor for a mirror refresh).
     t = time.monotonic()
     w._git(base, "clone", "-q", "--bare", f"file://{w.remote}", str(base / "ref.git"))
@@ -139,11 +179,39 @@ def _scenario(base: Path, res: Results, repeats: int, ignored_files: int) -> Non
             "remove --yes (350k-entry tree, pushed branch tip)", ok(w.run("remove", rid, "--yes"))
         )
 
-    _throwaways(w, res, repeats)
-    _many_records(base, res)
-    if os.environ.get("BENCH_STRESS", "1") == "1":
-        _stress(w, res, ignored_files)
-    res.add("reconcile (big clone, no live records)", ok(w.run("reconcile")))
+
+def _scan_walk(root: Path) -> Timed:
+    """The ``nested_repos`` walk (``op_nested_scan``) alone, in this process, with no limit: the
+    time one 60 s-deadline walk needs for this tree. ``out`` holds the entry count."""
+    import resource
+
+    from wtctl import fsafe_child
+
+    t = time.monotonic()
+    out = fsafe_child.op_nested_scan(
+        {"anchor": {"path": str(root), "identity": None}, "limit": 50_000_000}
+    )
+    wall = time.monotonic() - t
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return Timed(["op_nested_scan"], 0, wall, rss, str(out["count"]), "")
+
+
+def _env_walk(root: Path) -> Timed:
+    """The ``copy_env`` source walk (``env_match_op``) alone, in this process, with no entry
+    limit, so its rate is measured past ``ENV_WALK_LIMIT``."""
+    import resource
+
+    from wtctl import bootstrapper
+
+    comps = bootstrapper._valid_pattern("**/.env.local")  # pyright: ignore[reportPrivateUsage]
+    assert comps is not None
+    t = time.monotonic()
+    out = bootstrapper.env_match_op(
+        {"anchor": {"path": str(root)}, "plans": [comps], "limit": 50_000_000}
+    )
+    wall = time.monotonic() - t
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return Timed(["env_match_op"], 0, wall, rss, json.dumps(out["warnings"]), "")
 
 
 def _plain(wall: float) -> Timed:
@@ -195,12 +263,14 @@ def _many_records(base: Path, res: Results) -> None:
     sw.top["lease_wait"] = "30s"
     sha = sw.git("rev-parse", "HEAD")
     many = int(os.environ.get("BENCH_RECORDS", "300"))
+    ok(sw.run("create", "--repo", REPO, "--no-bootstrap"))  # makes the clone known to reconcile
     for _ in range(many):
         ok(sw.run("create", "--throwaway", "--repo", REPO, "--ref", sha, "--source", "local"))
     r = res.add(f"list ({many} throwaway records)", ok(sw.run("list")))
     assert len(r.json()["records"]) == many
     res.add(f"list --all ({many} records)", ok(sw.run("list", "--all")))
-    res.add(f"reconcile ({many} live throwaways)", ok(sw.run("reconcile")))
+    run = res.add(f"reconcile ({many} live throwaways)", ok(sw.run("reconcile")))
+    res.notes[f"reconcile ({many} live throwaways)"] = outcome(run)
     time.sleep(2)
     res.add(
         f"prune --throwaways ({many}, serial)",
@@ -213,13 +283,13 @@ def _many_records(base: Path, res: Results) -> None:
             e = admin / f"fake{k:05d}"
             e.mkdir(exist_ok=True)
             (e / "gitdir").write_text(f"/nonexistent/bench/{k}/.git\n")
-        res.add(
-            f"reconcile (clone with {count} fake admin entries)", sw.run("reconcile", "--dry-run")
-        )
+        name = f"reconcile --dry-run (clone with {count} fake admin entries)"
+        run = res.add(name, sw.run("reconcile", "--dry-run"))
+        res.notes[name] = outcome(run)
     shutil.rmtree(small)
 
 
-def _stress(w: World, res: Results, ignored_files: int) -> None:
+def _stress(w: World, res: Results) -> None:
     """Scale the nested scan toward and past ``remove.nested_scan_limit`` (2,000,000 entries)."""
     c = ok(w.run("create", "--repo", REPO, "--no-bootstrap"))
     rec = record_of(c)
@@ -238,7 +308,12 @@ def _stress(w: World, res: Results, ignored_files: int) -> None:
         entries = target
         print(f"stress populate to {target}: {time.monotonic() - t:.1f}s (+{need})", flush=True)
         label = f"~{target / 1e6:.1f}M entries"
+        scan = res.add(f"nested_repos walk in process, {label}", _scan_walk(wt))
+        res.notes[f"nested_repos walk in process, {label}"] = f"{scan.out} entries walked"
+        walk = res.add(f"copy_env walk in process, {label}", _env_walk(wt))
+        res.notes[f"copy_env walk in process, {label}"] = f"warnings: {walk.out}"
         run = res.add(f"status, {label}", w.run("status", rid))
-        res.notes[f"status, {label}"] = f"exit {run.code}"
-        res.add(f"remove --dry-run, {label}", w.run("remove", rid, "--dry-run"))
+        res.notes[f"status, {label}"] = outcome(run)
+        run = res.add(f"remove --dry-run, {label}", w.run("remove", rid, "--dry-run"))
+        res.notes[f"remove --dry-run, {label}"] = outcome(run)
     res.add("remove --yes --force, ~2.2M entries", w.run("remove", rid, "--yes", "--force"))

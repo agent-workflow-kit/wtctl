@@ -197,6 +197,26 @@ def test_env_match_op_reports_the_root_identity_and_sorted_matches(tmp_path: Pat
     assert res.value["refuse"] is None
 
 
+def test_env_match_op_copies_nothing_when_the_walk_stops_at_its_limit(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("1")  # found before the walk runs out of budget
+    for i in range(20):
+        (tmp_path / f"d{i:02d}").mkdir()
+        (tmp_path / f"d{i:02d}" / "f").write_text("x")
+    res = fsafe_child.run_op(
+        "env_match", {**anchor_args(tmp_path), "plans": [[".env"], ["**", ".env"]], "limit": 10}
+    )
+    assert res.ok and res.value is not None
+    assert res.value["matches"] == []
+    assert any("stopped early (limit)" in w for w in res.value["warnings"])
+
+
+def test_env_walk_limit_covers_a_monorepo_with_installed_dependencies() -> None:
+    # Measured in docs/design.md (Large-repository timing): the walk reads about a million
+    # entries a second, and a 200,000 limit stopped a 215,000-entry checkout short. It matches the
+    # default remove.nested_scan_limit: a tree past that cannot be removed without --force anyway.
+    assert b.ENV_WALK_LIMIT == 2_000_000
+
+
 def test_env_match_op_refuses_a_foreign_git_identity(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     res = fsafe_child.run_op(
