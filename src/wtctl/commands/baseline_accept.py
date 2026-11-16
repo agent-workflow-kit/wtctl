@@ -6,7 +6,9 @@ identity that differs is shown and re-recorded, everything else still refuses), 
 the changed items, ask (unless ``--yes``), recompute and refuse if the digest moved while the human
 decided, then write the rows, the digest and any re-recorded identities.
 
-TODO(#23): ``clone_missing`` records (a moved clone is re-attached here as Reconcile does).
+A ``clone_missing`` record whose re-resolved clone names its worktree is re-attached here (a moved
+clone, ``_reattach``): the record and the clone's row follow the clone and the two pointers are
+rewritten as Reconcile does it.
 TODO(#5): audit the ``baseline_accept`` event (items and anchors).
 """
 
@@ -17,12 +19,21 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .. import baselinesvc, hooks, linkcheck, repobaseline
+from .. import (
+    baselinesvc,
+    fsafe_child,
+    hooks,
+    linkcheck,
+    reconcile_probe,
+    removal_integrity,
+    repobaseline,
+)
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
+from ..gitsetup import open_git
 from ..locate import is_fuse
 from ..output import escape_control
-from ..state import record_lease
+from ..state import clone_lease, record_lease
 from . import clone as clone_cmd
 from .create import record_object
 
@@ -139,9 +150,107 @@ def _question(record: dict[str, Any], snap: Snapshot) -> str:
 
 
 def _check_state(record: dict[str, Any]) -> None:
-    # TODO(#23): a clone_missing record is re-attached here (moved clone); until then it is
-    # refused like every other state that is not active.
+    if record["state"] == "clone_missing" and record["object_type"] == "worktree":
+        return
     baselinesvc.require_worktree(record, "baseline accept")
+
+
+def _refused(message: str) -> WtctlError:
+    return WtctlError("refused", message, reason="unlinked")
+
+
+def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
+    """A moved clone: re-resolve it (no auto-clone), apply the same test as Reconcile, and on
+    acceptance rewrite the pointers under the per-clone lease, re-run integrity and record the
+    new clone, identities and baseline in one transaction."""
+    config, state = ctx.config, ctx.state
+    git = open_git(config, ctx.gateway)
+    budget = fsafe_child.Budget()
+    moved = reconcile_probe.moved_candidate(config, state, git, record, budget)
+    if moved is None:
+        raise _refused(
+            f"no re-resolved clone names {record['path']}; {record['id']} stays clone_missing"
+        )
+    old_admin = record["admin_dir"]
+    new = {
+        **record,
+        "clone_path": moved.clone_path,
+        "common_dir": moved.common_dir,
+        "common_id": moved.common_id,
+        "admin_dir": None
+        if old_admin is None
+        else os.path.join(moved.common_dir, "worktrees", os.path.basename(old_admin)),
+    }
+    anchor = _anchor("common_dir", moved.common_dir, record["common_id"], moved.common_id)
+    note = f"{record['clone_path']} -> {moved.clone_path}"
+    if dry:
+        out = {**new, "state": "active"}
+        digest = record["baseline_digest"] or "0" * 64
+        anchors = [anchor] if anchor else []
+        old = baselinesvc.recorded_digest(record)
+        return _result(ctx, out, old, digest, [], anchors, dry=True, note=note)
+    # the baseline of the worktree against the candidate clone, before anything is asked or
+    # written: a baseline that cannot be recorded refuses with the pointers untouched
+    recorded = baselinesvc.recorded_items(state, record["id"])
+    preview = baselinesvc.compute(
+        baselinesvc.spec_for(
+            config,
+            new,
+            common_id=moved.common_id,
+            dir_id=record["dir_id"],
+            hooks_id=baselinesvc.hooks_identity(recorded),
+            hooks_path=baselinesvc.hooks_recorded_path(recorded),
+            rebind_hooks=True,
+        )  # fmt: skip
+    )
+    if preview.has_detail():
+        raise baselinesvc.refusal(record, preview, repobaseline.compare(recorded, preview.items))
+    question = (
+        f"{escape_control(record['name'] or record['id'])}: re-attach to the moved clone "
+        f"{escape_control(moved.clone_path)} (was {escape_control(record['clone_path'] or '')})?"
+    )
+    if not ctx.yes and not clone_cmd.confirm(question, tty=ctx.runtime.stdin_isatty):
+        raise WtctlError(
+            "confirmation_required", "re-attaching a moved clone needs confirmation (--yes)"
+        )
+    with state.lease(clone_lease(moved.clone_path), wait=config.lease_wait_s):
+        if old_admin is not None:
+            why = reconcile_probe.repair_pointers(
+                state, new, budget, write=True, accept_dotgit=old_admin, allow_adopted=True
+            )
+            if why is not None:
+                raise _refused(why)
+        snap = _snapshot(ctx, new)
+        check, _ = removal_integrity.integrity_check(state, new, git)
+        if check["status"] != "pass":
+            raise _refused(f"{record['path']} does not match the moved clone after the rewrite")
+        if snap.current.has_detail():
+            raise baselinesvc.refusal(record, snap.current, snap.rows)
+        updates: dict[str, Any] = {
+            "clone_path": moved.clone_path,
+            "common_dir": moved.common_dir,
+            "common_id": snap.links.common_id,
+            "admin_dir": new["admin_dir"],
+            "dir_id": snap.links.dir_id,
+            "move_clone": (
+                record["repo"], record["common_dir"], moved.clone_path, moved.common_dir,
+                snap.links.common_id,
+            ),
+        }  # fmt: skip
+        root = snap.links.root
+        if root is not None and root[1] != root[2]:
+            updates["rerecord_anchor"] = (root[0], root[2])
+        done = state.transition(
+            record["id"], "clone_missing", "active",
+            baseline_digest=snap.current.digest,
+            baseline_items=baselinesvc.item_rows(snap.current), **updates,
+        )  # fmt: skip
+    result = _result(
+        ctx, done, baselinesvc.recorded_digest(record), snap.current.digest, snap.rows,
+        snap.anchors, dry=False, note=note,
+    )  # fmt: skip
+    _post_hook(ctx, config, done, snap.rows, result)
+    return result
 
 
 def run(ctx: Context) -> Result:
@@ -151,12 +260,17 @@ def run(ctx: Context) -> Result:
         raise UsageError("--expect-digest must be 64 lowercase hex digits")
     record = state.resolve(a.target)
     if ctx.dry_run:
+        _check_state(record)
+        if record["state"] == "clone_missing":
+            return _reattach(ctx, record, dry=True)
         return _decide(ctx, record, None)
     with state.lease(record_lease(record["id"]), wait=config.lease_wait_s):
         record = state.get_record(record["id"])
         if record is None:
             raise WtctlError("not_found", f"no record for {a.target}")
         _check_state(record)
+        if record["state"] == "clone_missing":
+            return _reattach(ctx, record, dry=False)
         return _decide(ctx, record, state)
 
 
@@ -255,6 +369,7 @@ def _result(
     anchors: list[dict[str, Any]],
     *,
     dry: bool,
+    note: str | None = None,
 ) -> Result:
     out = record_object(record, ctx.state.bootstrap_summary(record["id"]))
     if dry and out["baseline_digest"] != new:
@@ -269,4 +384,6 @@ def _result(
     }
     verb = "would accept" if dry else "accepted"
     summary = f"{verb} the baseline of {record['name']} ({len(rows)} changed items)"
+    if note:
+        summary += f"; moved clone {note}"
     return Result(data, human=record["id"], stderr=summary)

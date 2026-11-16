@@ -1,0 +1,12 @@
+{
+ "changes": [],
+ "reports": [
+  {
+   "kind": "stray",
+   "path": "<tmp>/wt/throwaway/wt-orphan1",
+   "kind_of": "throwaway"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

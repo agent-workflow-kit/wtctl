@@ -1,0 +1,19 @@
+{
+ "changes": [
+  {
+   "id": "<id>",
+   "from": "missing",
+   "to": "gone",
+   "action": "mark_gone"
+  }
+ ],
+ "reports": [
+  {
+   "kind": "adopted_gone",
+   "id": "<id>",
+   "path": "<tmp>/adopted"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

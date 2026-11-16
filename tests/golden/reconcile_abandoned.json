@@ -1,0 +1,12 @@
+{
+ "changes": [],
+ "reports": [
+  {
+   "kind": "abandoned",
+   "id": "<id>",
+   "path": "<tmp>/wt/worktrees/example.test/org/repo/one"
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}
