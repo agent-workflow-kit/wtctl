@@ -20,6 +20,7 @@ import contextlib
 import dataclasses
 import fnmatch
 import hashlib
+import heapq
 import os
 import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -316,6 +317,35 @@ def _list_dir(dirfd: int, budget: list[int]) -> tuple[list[str], list[str]]:
 _Task = tuple["str | None", tuple[str, ...]]
 
 
+class BoundedMatches(set[tuple[str, ...]]):
+    """The walk's matches, bounded: past ``2 * keep`` entries it drops all but the ``keep``
+    smallest (sorted order) and remembers that it did (``cut``). The smallest ``keep`` of the
+    whole walk are always among those kept, so the result equals sorting the full set and taking
+    its first ``keep``, without holding every match of a huge tree."""
+
+    def __init__(self, keep: int) -> None:
+        super().__init__()
+        self.keep = max(keep, 1)
+        self.cut = False
+
+    def add(self, item: tuple[str, ...]) -> None:
+        super().add(item)
+        if len(self) > 2 * self.keep:
+            kept = heapq.nsmallest(self.keep, self)
+            super().clear()
+            super().update(kept)
+            self.cut = True
+
+    def update(self, *others: Any) -> None:
+        for other in others:
+            for item in other:
+                self.add(item)
+
+    def clear(self) -> None:
+        super().clear()
+        self.cut = False
+
+
 def _match(
     anchor: fsafe.Anchor,
     root_fd: int,
@@ -526,7 +556,7 @@ def env_match_op(args: dict[str, Any]) -> dict[str, Any]:
                     "copy_env: the clone's main worktree is not the recorded clone; nothing copied"
                 )
                 return out
-        matches: set[tuple[str, ...]] = set()
+        matches = BoundedMatches(return_max)
         budget = [limit]
         try:
             for comps in plans:
@@ -538,13 +568,17 @@ def env_match_op(args: dict[str, Any]) -> dict[str, Any]:
             matches.clear()
         kept: list[list[str]] = []
         used = 0
+        warned = False
         for m in sorted(matches):
             size = sum(len(os.fsencode(c)) + 1 for c in m)
             if len(kept) >= return_max or used + size > return_bytes:
                 warn(f"copy_env: only the first {len(kept)} matches are considered")
+                warned = True
                 break
             kept.append(list(m))
             used += size
+        if matches.cut and not warned:  # more matches were dropped during the walk
+            warn(f"copy_env: only the first {len(kept)} matches are considered")
         if dropped[0]:
             warnings.append(f"copy_env: {dropped[0]} more warnings were suppressed")
         out["matches"] = kept

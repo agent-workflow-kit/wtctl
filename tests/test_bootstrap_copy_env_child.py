@@ -210,11 +210,69 @@ def test_env_match_op_copies_nothing_when_the_walk_stops_at_its_limit(tmp_path: 
     assert any("stopped early (limit)" in w for w in res.value["warnings"])
 
 
-def test_env_walk_limit_covers_a_monorepo_with_installed_dependencies() -> None:
-    # Measured in docs/design.md (Large-repository timing): the walk reads about a million
-    # entries a second, and a 200,000 limit stopped a 215,000-entry checkout short. It matches the
-    # default remove.nested_scan_limit: a tree past that cannot be removed without --force anyway.
-    assert b.ENV_WALK_LIMIT == 2_000_000
+def test_env_walk_limit_covers_a_monorepo_with_installed_dependencies(
+    r: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Measured in docs/design.md (Large-repository timing): a 200,000 limit stopped a 215,000-entry
+    # checkout short, and a 365,000-entry checkout is walked in about a second. The limit the
+    # parent hands the walk child must stay above that and match the nested-scan default.
+    seen: list[dict[str, object]] = []
+    real = fsafe_child.run_op
+
+    def run_op(op: str, args: dict[str, object], **kw: Any) -> Any:
+        if op == "env_match":
+            seen.append(args)
+        return real(op, args, **kw)
+
+    monkeypatch.setattr(fsafe_child, "run_op", run_op)
+    r.write(".env", "A=1\n", root=r.main)
+    copy(r, [".env"])
+    assert len(seen) == 1
+    limit = seen[0]["limit"]
+    assert limit == b.ENV_WALK_LIMIT
+    assert isinstance(limit, int) and limit > 365_000
+
+
+def test_env_match_op_returns_the_same_prefix_and_warning_with_a_bounded_walk(
+    tmp_path: Path,
+) -> None:
+    for i in range(12):
+        (tmp_path / f"f{i:02d}").write_text("x")
+    res = fsafe_child.run_op(
+        "env_match",
+        {**anchor_args(tmp_path), "plans": [["**", "*"]], "limit": 1000, "return_max": 3},
+    )
+    assert res.ok and res.value is not None
+    assert res.value["matches"] == [["f00"], ["f01"], ["f02"]]
+    assert [w for w in res.value["warnings"] if "only the first" in w] == [
+        "copy_env: only the first 3 matches are considered"
+    ]
+
+
+def test_env_match_op_without_a_cut_has_no_warning(tmp_path: Path) -> None:
+    root = tmp_path / "w"
+    root.mkdir()
+    for i in range(3):
+        (root / f"f{i}").write_text("x")
+    res = fsafe_child.run_op(
+        "env_match", {**anchor_args(root), "plans": [["*"]], "limit": 1000, "return_max": 3}
+    )
+    assert res.ok and res.value is not None
+    assert len(res.value["matches"]) == 3 and res.value["warnings"] == []
+
+
+def test_bounded_matches_keep_the_smallest_and_stay_small() -> None:
+    m = b.BoundedMatches(keep=4)
+    peak = 0
+    for i in reversed(range(100)):
+        m.add((f"f{i:03d}",))
+        peak = max(peak, len(m))
+    m.update([("a",), ("b",)])
+    assert peak <= 2 * 4 + 1
+    assert m.cut
+    assert sorted(m)[:4] == [("a",), ("b",), ("f000",), ("f001",)]
+    m.clear()
+    assert len(m) == 0 and not m.cut
 
 
 def test_env_match_op_refuses_a_foreign_git_identity(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ The unit tests use tiny dimensions; the ``bench`` tests use ``MONOREPO``.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import subprocess
@@ -168,11 +169,19 @@ def _fast_import(repo: Path, home: Path, stream: Iterator[bytes]) -> None:
         stdin=subprocess.PIPE,
     )
     assert proc.stdin is not None
-    for chunk in stream:
-        proc.stdin.write(chunk)
-    proc.stdin.write(b"done\n")
-    proc.stdin.close()
-    if proc.wait() != 0:
+    try:
+        for chunk in stream:
+            proc.stdin.write(chunk)
+        proc.stdin.write(b"done\n")
+        proc.stdin.close()
+        code = proc.wait()
+    finally:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+        if proc.poll() is None:  # the exact process we started, never a pattern
+            proc.terminate()
+            proc.wait()
+    if code != 0:
         raise RuntimeError("git fast-import failed")
 
 

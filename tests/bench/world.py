@@ -3,9 +3,11 @@ child process (real git children, real fd-based deletion), timed with wall clock
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -14,10 +16,84 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tests.bench import fixture as fx
 
 REPO = "example.test/org/repo"
 ACTOR = "human:bench"
+ROOT = Path(__file__).resolve().parents[2]
+MARKER = ".wtctl-bench"
+MIN_FREE_GIB = 15
+_FORBIDDEN_TREES = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"), Path("/run"))
+
+
+def _within(path: Path, tree: Path) -> bool:
+    return path == tree or tree in path.parents
+
+
+def bench_dir() -> Path:
+    """The benchmark directory from ``BENCH_DIR`` (default ``.bench`` at the repository root),
+    resolved. Refuses ``/``, the home directory, the repository root, any ancestor of those,
+    and anything in or equal to a temporary file system; the data is deleted, so a typo must
+    never reach a real directory."""
+    raw = os.environ.get("BENCH_DIR", str(ROOT / ".bench"))
+    if not raw.strip():
+        pytest.fail("BENCH_DIR is empty; set it to a dedicated directory on a large disk")
+    path = Path(raw).expanduser().resolve()
+    home = Path.home().resolve()
+    for keep in (ROOT, home):
+        if path == keep or path in keep.parents:
+            pytest.fail(f"BENCH_DIR {path} is, or contains, {keep}; use a dedicated directory")
+    if path == Path("/"):
+        pytest.fail("BENCH_DIR resolves to /")
+    for tree in _FORBIDDEN_TREES:
+        if _within(path, tree):
+            pytest.fail(
+                f"BENCH_DIR {path} is under {tree}; use a dedicated directory on a large disk"
+            )
+    return path
+
+
+def prepare_bench_dir(base: Path, *, min_free_gib: float = MIN_FREE_GIB) -> None:
+    """Make ``base`` an empty benchmark directory holding only the marker. An existing directory
+    is cleared only when it is empty or already carries the marker; anything else fails without
+    deleting. The free-space check runs first, on the nearest existing parent."""
+    probe = base
+    while not probe.exists():
+        probe = probe.parent
+    free_gib = shutil.disk_usage(probe).free / 1024**3
+    if free_gib < min_free_gib:
+        pytest.skip(f"only {free_gib:.0f} GiB free under {probe}")
+    if base.exists():
+        if not base.is_dir():
+            pytest.fail(f"BENCH_DIR {base} exists and is not a directory")
+        if any(base.iterdir()) and not (base / MARKER).exists():
+            pytest.fail(f"BENCH_DIR {base} is not empty and has no {MARKER} marker; not deleting")
+        shutil.rmtree(base)
+    base.mkdir(parents=True)
+    (base / MARKER).write_text("created by tests/bench; safe to delete\n")
+
+
+def cleanup_bench_dir(base: Path) -> None:
+    """Remove everything under ``base`` except ``results.json`` and the marker."""
+    for entry in base.iterdir():
+        if entry.name in ("results.json", MARKER):
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                entry.unlink()
+
+
+def kill_group(proc: subprocess.Popen[bytes]) -> None:
+    """Kill the process group of a child started with ``start_new_session=True`` (its pgid is
+    the exact pid we started) if the child is still running, and reap it."""
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
 
 
 @dataclass
@@ -100,6 +176,7 @@ class World:
         self.top: dict[str, Any] = {"root": str(self.root), "lease_wait": "5s"}
         self.repo_cfg: dict[str, Any] = {}
         self.timeline: dict[str, float] = {}
+        self.env_files = 0  # .env.local files the build wrote into the clone
 
     # -- construction ---------------------------------------------------------------------
 
@@ -117,6 +194,7 @@ class World:
         for k in range(copy_env_files):
             env = self.clone / fx.file_path(d, k * (d.files // max(copy_env_files, 1)))
             (env.parent / ".env.local").write_text(f"KEY={k}\n")
+        self.env_files = copy_env_files
         self.repo_cfg = {
             "clone": str(self.clone),
             "clone_url": str(self.remote),
@@ -152,6 +230,7 @@ class World:
             "XDG_CACHE_HOME": str(h / ".cache"),
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
             "LC_ALL": "C",
         }
 
@@ -187,17 +266,26 @@ class World:
         with open(out_path, "wb") as out, open(err_path, "wb") as err:
             start = time.monotonic()
             proc = subprocess.Popen(
-                full, env=self.env(), stdin=subprocess.DEVNULL, stdout=out, stderr=err
+                full,
+                env=self.env(),
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,  # its own group: a kill reaches git children too
             )
-            while True:
-                done, status, usage = os.wait4(proc.pid, os.WNOHANG)
-                if done:
-                    break
-                if time.monotonic() - start > timeout:
-                    proc.kill()  # the exact child we started, never a pattern
-                    os.wait4(proc.pid, 0)
-                    raise TimeoutError(f"{full} exceeded {timeout}s")
-                time.sleep(0.02)
+            reaped = False
+            try:
+                while True:
+                    done, status, usage = os.wait4(proc.pid, os.WNOHANG)
+                    if done:
+                        reaped = True
+                        break
+                    if time.monotonic() - start > timeout:
+                        raise TimeoutError(f"{full} exceeded {timeout}s")
+                    time.sleep(0.02)
+            finally:
+                if not reaped:  # timeout, KeyboardInterrupt or any error: the exact group we made
+                    kill_group(proc)
             wall = time.monotonic() - start
         proc.returncode = os.waitstatus_to_exitcode(status)
         return Timed(
@@ -276,10 +364,24 @@ def machine_info(path: Path) -> dict[str, str]:
         )
     except (OSError, ValueError, IndexError):
         pass
-    git = subprocess.run(["git", "--version"], capture_output=True, text=True, check=False)
+    scrub = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(path),
+        "XDG_CONFIG_HOME": str(path),
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "LC_ALL": "C",
+    }
+    git = subprocess.run(
+        ["git", "--version"], capture_output=True, text=True, check=False, env=scrub
+    )
     info["git"] = git.stdout.strip().removeprefix("git version ")
     fs = subprocess.run(
-        ["stat", "-f", "-c", "%T", str(path)], capture_output=True, text=True, check=False
+        ["stat", "-f", "-c", "%T", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=scrub,
     )
     info["filesystem"] = fs.stdout.strip()
     try:
