@@ -62,9 +62,14 @@ def intact(w: TW) -> None:
     assert os.listdir(w.tmp / "markers") == []
 
 
-def refused_and_clean(w: TW, sha: str, source: str) -> None:
+# the outcome of a refused object: the fetch's fsck refuses it for a remote source, the local
+# pack's strict index refuses it for a local one
+REFUSED_AS = {"remote": "fetch_failed", "local": "create_failed"}
+
+
+def refused_and_clean(w: TW, sha: str, source: str, code: str | None = None) -> None:
     err = w.failed(w.throw("--source", source, ref=sha), 12)
-    assert err["code"] in ("create_failed", "fetch_failed", "ref_not_found")
+    assert err["code"] == (code or REFUSED_AS[source])
     assert leaks(w.troot) == [] and w.records() == [] and w.leases() == []
     intact(w)
 
@@ -346,3 +351,68 @@ def test_a_source_commit_with_a_missing_object_fails_closed(w: TW) -> None:
     err = w.failed(w.throw("--source", "local", ref=sha), 12)
     assert err["code"] == "create_failed"
     assert leaks(w.troot) == [] and w.records() == []
+
+
+# -- trees that expand to more than they should ------------------------------------------------
+
+
+def bomb(git_dir: Path, depth: int) -> str:
+    """A tree DAG with two entries per level: ``2 ** depth`` files from a few objects."""
+    node = write_object(git_dir, "tree", tree_body([("100644", "f", blob(git_dir, b"x"))]))
+    for _ in range(depth):
+        node = write_object(
+            git_dir, "tree", tree_body([("40000", "a", node), ("40000", "b", node)])
+        )
+    return node
+
+
+def plant_tree(w: TW, make: Any) -> str:
+    sha = ""
+    for gd in (w.remote, w.clone / ".git"):
+        sha = commit_of(gd, make(gd), parent=w.shas["c3"])
+        ref(gd, "refs/heads/evil", sha)
+    return sha
+
+
+def tree_too_large(w: TW, sha: str, source: str) -> None:
+    err = w.failed(w.throw("--source", source, ref=sha), 12)
+    assert err["code"] == "create_failed" and err["details"] == {"cause": "tree_too_large"}
+    assert leaks(w.troot) == [] and w.records() == [] and w.leases() == []
+    intact(w)
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_tree_dag_with_too_many_entries_is_refused_before_anything_is_written(
+    w: TW, source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import packs
+
+    monkeypatch.setattr(packs, "MAX_TREE_ENTRIES", 50)
+    tree_too_large(w, plant_tree(w, lambda gd: bomb(gd, 6)), source)  # 64 files
+    ok = plant_tree(w, lambda gd: bomb(gd, 5))  # 32 files: within the bound
+    assert w.made("--source", source, ref=ok)["state"] == "active"
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_blobs_summing_past_the_byte_bound_are_refused(
+    w: TW, source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import packs
+
+    monkeypatch.setattr(packs, "MAX_TREE_BYTES", 1000)
+
+    def big(gd: Path) -> str:
+        items = [("100644", f"f{i}", blob(gd, bytes([i]) * 400)) for i in range(3)]
+        return write_object(gd, "tree", tree_body(items))
+
+    tree_too_large(w, plant_tree(w, big), source)
+
+
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_listing_past_the_output_cap_is_refused(
+    w: TW, source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import packs
+
+    monkeypatch.setattr(packs, "MAX_TREE_LIST_BYTES", 200)
+    tree_too_large(w, plant_tree(w, lambda gd: bomb(gd, 6)), source)

@@ -49,6 +49,7 @@ class Pruner:
         self.skipped: list[dict[str, Any]] = []
         self.journal = audit.journal_for(ctx)
         self.warnings: list[str] = []
+        self.cutoff: str | None = None
 
     # -- usage --------------------------------------------------------------------------------
 
@@ -72,8 +73,9 @@ class Pruner:
     def candidates(self, age: int | None) -> list[Record]:
         """Throwaways to try, oldest first: every ``partial`` one, and the ``active`` ones older
         than ``age``. ``creating`` ones belong to a live (or dead) creator, which reconcile
-        settles; nothing here touches them."""
-        cutoff = None if age is None else self.state.timestamp_before(age)
+        settles (TODO(#23): until it lands, a killed creator's record stays); nothing here
+        touches them."""
+        cutoff = self.cutoff = None if age is None else self.state.timestamp_before(age)
         found = self.state.records(
             object_type="throwaway", states=("active", "partial"), labels=self.ctx.args.label
         )
@@ -103,6 +105,8 @@ class Pruner:
             self.skipped.append(_skip(rid, "busy"))
             return
         try:
+            if not self.still_due(rid):
+                return
             opts = RemoveOptions(hook_flags={}, override_escalation=False)
             ThrowawayRemover(self.ctx, rid, opts).remove(lease)
             self.removed.append(rid)
@@ -113,6 +117,22 @@ class Pruner:
             self.skipped.append(_skip(rid, "failed"))
         finally:
             lease.release()
+
+    def still_due(self, rid: str) -> bool:
+        """The selection was made before the lease: under the lease, re-read the record. One that
+        was removed (or went missing) meanwhile is skipped silently, and one that is no longer
+        old enough or became protected is left alone."""
+        cur = self.state.get_record(rid)
+        if cur is None or cur["object_type"] != "throwaway":
+            return False
+        if cur["state"] not in ("active", "partial"):
+            return False
+        if protected(cur["labels"], self.config.prune.protect_labels):
+            self.skipped.append(_skip(rid, "protected"))
+            return False
+        return not (
+            cur["state"] == "active" and (self.cutoff is None or cur["created"] >= self.cutoff)
+        )
 
     def dry(self, rec: Record) -> None:
         st = Status(self.ctx, rec)

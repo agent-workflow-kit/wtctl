@@ -103,7 +103,7 @@
         },
         "details": {
           "type": "object",
-          "description": "Command-specific context: extract_invalid {paths}; io_error {path, written, deleted}; bootstrap_failed {record, step}; partial {remaining_path, remaining (after an fd-based deletion)}; held {holders}; remote_mismatch without the remote {cause: no_remote}; repo_config_changed {digest, recorded_digest, changed_classes}, or, when only a recorded anchor identity moved and there are no items, {digest, recorded_digest, anchors}, or, when the recorded digest disagrees with the rows and no item or anchor differs, {digest, recorded_digest} alone; branch_exists {tip}; locked {lock_reason}; unsafe_repo_config {keys (empty when the cause is not a key, e.g. a non-regular .lfsconfig)}; not_found on a tombstone {state, removed_at}; a network timeout {cause: timeout}; fetch_failed after an incomplete prune {cause: prune_incomplete}; create_failed after git created the worktree {record, branch, path} (the record stays creating); create_failed for a SHA-256 repository {cause: object_format} or a changed anchor identity {cause: anchor_changed, anchors}; refused unlinked from baseline accept or clone for an anchor on a FUSE file system {cause: fuse_anchor, anchors}."
+          "description": "Command-specific context: extract_invalid {paths}; io_error {path, written, deleted}; bootstrap_failed {record, step}; partial {remaining_path, remaining (after an fd-based deletion)}; held {holders}; remote_mismatch without the remote {cause: no_remote}; repo_config_changed {digest, recorded_digest, changed_classes}, or, when only a recorded anchor identity moved and there are no items, {digest, recorded_digest, anchors}, or, when the recorded digest disagrees with the rows and no item or anchor differs, {digest, recorded_digest} alone; branch_exists {tip}; locked {lock_reason}; unsafe_repo_config {keys (empty when the cause is not a key, e.g. a non-regular .lfsconfig)}; not_found on a tombstone {state, removed_at}; a network timeout {cause: timeout}; fetch_failed after an incomplete prune {cause: prune_incomplete}; create_failed after git created the worktree {record, branch, path} (the record stays creating); create_failed for a SHA-256 repository {cause: object_format}, a changed anchor identity {cause: anchor_changed, anchors} or a throwaway tree beyond the size bounds {cause: tree_too_large}; refused unlinked from baseline accept or clone for an anchor on a FUSE file system {cause: fuse_anchor, anchors}."
         }
       },
       "additionalProperties": false,
@@ -830,7 +830,8 @@
                   "cause": {
                     "enum": [
                       "object_format",
-                      "anchor_changed"
+                      "anchor_changed",
+                      "tree_too_large"
                     ]
                   }
                 }

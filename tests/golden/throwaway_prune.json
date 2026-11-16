@@ -1,0 +1,21 @@
+{
+ "removed": [
+  "<id1>"
+ ],
+ "skipped": [
+  {
+   "id": "<id2>",
+   "reason": "in_use",
+   "processes": [
+    {
+     "pid": 9,
+     "command": "vim",
+     "path": "<tmp>/wt/throwaway/<id2>"
+    }
+   ],
+   "paths": []
+  }
+ ],
+ "already_running": false,
+ "dry_run": false
+}

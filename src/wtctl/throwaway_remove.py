@@ -77,6 +77,8 @@ class ThrowawayRemover:
         self._pre_hooks(rec)
         rec = self._fresh()
         self.rec = rec
+        if rec["state"] not in ("active", "partial"):  # the hooks took time: nothing may differ
+            raise WtctlError("busy", f"record {self.rid} changed while it was being removed")
         self._in_use(rec)  # the hooks and the wait for them took time
         gone = self._probe(rec)
         if gone:

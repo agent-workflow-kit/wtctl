@@ -264,6 +264,18 @@ def test_usage_errors(w: TW, argv: list[str]) -> None:
     assert w.records() == [] and not w.troot.exists()
 
 
+@pytest.mark.parametrize("bad", ["bad id", "../x", "a\nb", "Example.test/Org/Repo", ""])
+@pytest.mark.parametrize("dry", [[], ["--dry-run"]])
+def test_an_invalid_repo_id_is_a_usage_error(w: TW, bad: str, dry: list[str]) -> None:
+    r = w.run("create", "--throwaway", "--repo", bad, "--ref", w.shas["c3"], *dry)
+    w.failed(r, 2)
+    nothing_left_but_ids(w)
+
+
+def nothing_left_but_ids(w: TW) -> None:
+    assert leaks(w.troot) == [] and w.records() == []
+
+
 def test_ref_is_required_and_must_be_a_full_sha(w: TW) -> None:
     r = w.run("create", "--throwaway", "--repo", REPO)
     w.failed(r, 2)
@@ -383,6 +395,45 @@ def test_an_interrupt_deletes_the_directory_and_the_record_too(w: TW) -> None:
     nothing_left(w)
 
 
+def test_a_failure_before_the_identity_is_recorded_leaves_no_directory_and_no_record(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl.errors import WtctlError
+    from wtctl.state import State
+
+    real = State.transition
+
+    def transition(self: State, rid: str, frm: Any, to: str, **fields: Any) -> Any:
+        if "dir_id" in fields:
+            raise WtctlError("internal", "injected: the identity could not be recorded")
+        return real(self, rid, frm, to, **fields)
+
+    monkeypatch.setattr(State, "transition", transition)
+    w.failed(w.throw("--source", "remote"), 1)
+    nothing_left(w)
+
+
+def test_a_new_directory_that_is_not_private_is_deleted_with_its_record(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import fsafe
+
+    real = fsafe.open_dir
+    once: list[bool] = []
+
+    def loose(anchor: Any, parent_fd: int, name: str, **kw: Any) -> int:
+        fd = real(anchor, parent_fd, name, **kw)
+        if name.startswith("wt-") and not once:  # the new throwaway directory
+            once.append(True)
+            os.fchmod(fd, 0o777)
+        return fd
+
+    monkeypatch.setattr(fsafe, "open_dir", loose)
+    err = w.failed(w.throw("--source", "remote"), 12)
+    assert err["code"] == "create_failed" and "not private" in err["message"]
+    nothing_left(w)
+
+
 # -- the record and its leases while it is created ---------------------------------------------
 
 
@@ -435,6 +486,24 @@ def test_the_root_is_recorded_once_and_a_replaced_root_is_refused(w: TW) -> None
     assert [r["state"] for r in w.records()] == ["active", "active"]
 
 
+def test_a_root_that_became_a_mount_point_is_anchor_changed_without_a_changed_identity(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import fsafe
+
+    first = w.made("--source", "remote")
+
+    def mounted(*a: Any, **kw: Any) -> Any:
+        raise fsafe.FsafeError("mount_point", "is a mount point")
+
+    monkeypatch.setattr(fsafe, "open_anchor", mounted)
+    err = w.failed(w.throw("--source", "remote"), 12)
+    assert err["details"]["cause"] == "anchor_changed"
+    (anchor,) = err["details"]["anchors"]
+    assert anchor["recorded"] == anchor["current"] == first["root_id"]
+    assert anchor["changed"] is False
+
+
 def test_an_existing_root_is_recorded_at_its_first_use(w: TW) -> None:
     w.troot.mkdir(parents=True, mode=0o700)
     rec = w.made("--source", "remote")
@@ -463,6 +532,53 @@ def test_a_symlinked_root_is_resolved_once(w: TW, tmp_path: Path) -> None:
     anc.symlink_to(tmp_path)
     w.top["throwaway_root"] = str(anc / "real-throwaways")
     assert w.made("--source", "remote")["base_dir"] == str(real)
+
+
+def test_a_root_swapped_for_a_link_to_another_directory_is_refused(w: TW, tmp_path: Path) -> None:
+    w.made("--source", "remote")
+    other = tmp_path / "attacker-dir"
+    other.mkdir(mode=0o700)
+    os.rename(w.troot, tmp_path / "old-root")
+    os.symlink(other, w.troot)
+    for extra in ([], ["--dry-run"]):
+        err = w.failed(w.throw("--source", "remote", *extra), 12)
+        assert err["details"]["cause"] == "anchor_changed"
+        (anchor,) = err["details"]["anchors"]
+        assert anchor["path"] == str(w.troot) and anchor["changed"] is True
+    assert os.listdir(other) == [] and w.records() != []  # nothing was written there
+
+
+def test_a_symlinked_root_retargeted_to_another_directory_is_refused(w: TW, tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(mode=0o700)
+    second.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(first)
+    w.top["throwaway_root"] = str(link)
+    w.made("--source", "remote")
+    link.unlink()
+    link.symlink_to(second)
+    err = w.failed(w.throw("--source", "remote"), 12)
+    assert err["details"]["cause"] == "anchor_changed"
+    assert os.listdir(second) == []
+
+
+@pytest.mark.parametrize("dry", [[], ["--dry-run"]])
+def test_a_root_inside_another_throwaway_is_a_usage_error(w: TW, dry: list[str]) -> None:
+    outer = w.made("--source", "remote")
+    w.top["throwaway_root"] = str(Path(outer["path"]) / "nested-root")
+    w.failed(w.throw("--source", "remote", *dry), 2)
+    assert not (Path(outer["path"]) / "nested-root").exists()
+    assert [r["id"] for r in w.records()] == [outer["id"]]
+
+
+@pytest.mark.parametrize("where", ["clone", "inside-clone"])
+def test_a_root_in_a_clone_is_a_usage_error(w: TW, where: str) -> None:
+    root = w.clone if where == "clone" else w.clone / "sub" / "root"
+    w.top["throwaway_root"] = str(root)
+    w.failed(w.throw("--source", "remote"), 2)
+    assert w.records() == []
+    assert not (w.clone / "sub").exists()
 
 
 def claude_session_unsafe(

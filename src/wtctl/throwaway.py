@@ -20,7 +20,7 @@ import dataclasses
 import os
 from typing import Any
 
-from . import audit, fsafe, fsafe_child, hooks, removal_delete
+from . import audit, fsafe, fsafe_child, hooks, removal_delete, urls, worktrees
 from . import labels as labelmod
 from .context import Context, Result
 from .credentials import (
@@ -34,7 +34,7 @@ from .gitsetup import open_git, private_dir
 from .hardgit import Git, classify_fetch, outcome_error
 from .locate import Resolution, Resolver, describe_mount, identity_str
 from .mirror import mirror_url
-from .packs import clone_has_commit, fill_local_throwaway, is_shallow
+from .packs import check_tree_size, clone_has_commit, fill_local_throwaway, is_shallow
 from .record_view import FIELDS as RECORD_FIELDS
 from .record_view import record_object
 from .state import Conflict, Lease, Record, State
@@ -87,6 +87,7 @@ def parse_options(ctx: Context) -> Options:
     ):
         if value not in (None, False):
             raise UsageError(f"{flag} is not accepted with --throwaway")
+    urls.validate_repo_id(a.repo)
     if a.ref is None:
         raise UsageError("--throwaway needs --ref <40-hex commit id>")
     if not SHA.fullmatch(a.ref):
@@ -188,6 +189,7 @@ class ThrowawayCreator:
         self.res = self._resolve_clone()
         self.root = os.path.realpath(self.config.effective_throwaway_root)
         self.path = os.path.join(self.root, self.rid)
+        self._check_location()
         if self.dry:
             self._check_root(write=False)
             return self._result_dry()
@@ -237,6 +239,22 @@ class ThrowawayCreator:
             self.warnings += res.warnings
         return res
 
+    def _check_location(self) -> None:
+        """The throwaway root must not lie in (or be) the directory of any live record, or a
+        clone or worktree wtctl knows (Locations, path rules; exit 2)."""
+        known = [r["path"] for r in self.state.records() if r["path"]]
+        if self.res is not None:
+            known.append(self.res.clone_path)
+            try:
+                known += [e.path for e in worktrees.worktree_entries(self.git, self.res.common_dir)]
+            except WtctlError:
+                pass  # no list of the clone's worktrees: the records and the clone path remain
+        known += [c.clone for c in map(self.config.repo, self.config.repos) if c.clone]
+        for d in known:
+            real = os.path.realpath(d)
+            if self.root == real or self.root.startswith(real.rstrip("/") + "/"):
+                raise UsageError(f"the throwaway root {self.root} lies inside {d}")
+
     # -- step 5: hooks ------------------------------------------------------------------------
 
     def _pre_create(self) -> list[str]:
@@ -276,13 +294,17 @@ class ThrowawayCreator:
             override_escalation=o.override_escalation,
             decision_ids=self.ctx.decision_ids,
         )
+        # TODO(#5): log the hook runs (also those carried by a veto: err.hook_runs), mirroring
+        # the TODO(#5) in commands/create.py; deferred until the log writer's hook events land.
         self.warnings += out.warnings
         self.decision_ids = list(out.decision_ids)
         return self.decision_ids
 
     # -- step 6: the root and the record ------------------------------------------------------
 
-    def _root_error(self, recorded: str | None, exc: fsafe.FsafeError | None = None) -> WtctlError:
+    def _root_error(
+        self, recorded: str | None, exc: fsafe.FsafeError | None = None, *, shown: str | None = None
+    ) -> WtctlError:
         if exc is not None and exc.kind not in ("identity", "mount_point"):
             return WtctlError(
                 "create_failed", f"cannot open the throwaway root {self.root}: {exc.message}"
@@ -292,17 +314,18 @@ class ThrowawayCreator:
             st = os.stat(self.root)
             current = identity_str(st)
             info = describe_mount(self.root, st)
+        recorded_shown = recorded or ("0:0" if current != "0:0" else "0:1")
         entry = {
             "anchor": "throwaway_root",
-            "path": fsafe.escape_for_details(self.root),
-            "recorded": recorded or ("0:0" if current != "0:0" else "0:1"),
+            "path": fsafe.escape_for_details(shown or self.root),
+            "recorded": recorded_shown,
             "current": current,
-            "changed": True,
+            "changed": recorded_shown != current,
             **info,
         }
         return WtctlError(
             "create_failed",
-            f"the throwaway root {self.root} is not the directory wtctl recorded for it",
+            f"the throwaway root {shown or self.root} is not the directory wtctl recorded for it",
             details={"cause": "anchor_changed", "anchors": [entry]},
         )
 
@@ -351,11 +374,27 @@ class ThrowawayCreator:
         recorded = self.state.anchor_identity(self.root)
         with self._open_root(recorded) as anchor:
             current = f"{anchor.identity.dev}:{anchor.identity.ino}"
+            self._check_configured(current, write=write)
             if recorded is None and write:
                 recorded = self.state.record_anchor(self.root, current)
             if recorded is not None and recorded != current:
                 raise self._root_error(recorded)
         return recorded
+
+    def _check_configured(self, current: str, *, write: bool) -> None:
+        """The root is keyed by its resolved path, so a configured path that is swapped for a
+        link to another (empty, private) directory would resolve to a root with no history. The
+        configured path itself is therefore recorded as well, and must still lead to the same
+        directory it did."""
+        configured = os.path.normpath(os.path.abspath(self.config.effective_throwaway_root))
+        if configured == self.root:
+            return  # the resolved path is the configured one: its own record is the check
+        recorded = self.state.anchor_identity(configured)
+        if recorded is None:
+            if write:
+                self.state.record_anchor(configured, current)
+        elif recorded != current:
+            raise self._root_error(recorded, shown=configured)
 
     def _requested_depth(self) -> int:
         d = self.o.depth
@@ -378,6 +417,8 @@ class ThrowawayCreator:
 
     def _insert(self, root_id: str | None) -> tuple[Record, Lease]:
         assert root_id is not None
+        # TODO(#23): a creator killed outright after this insert leaves a `creating` record and
+        # possibly a directory; `reconcile` settles it (prune never touches `creating` records).
         try:
             return self.state.insert_record_leased(self._fields(root_id), labels=self.o.labels)
         except Conflict as exc:
@@ -388,6 +429,14 @@ class ThrowawayCreator:
     # -- steps 7 to 9: the directory and its contents -----------------------------------------
 
     def _build(self, record: Record, rlease: Lease) -> Record:
+        try:
+            return self._build_steps(record, rlease)
+        except OSError as exc:  # e.g. the directory git was to run in vanished: fail closed
+            raise WtctlError(
+                "create_failed", f"cannot create the throwaway {self.path}: {exc.strerror or exc}"
+            ) from None
+
+    def _build_steps(self, record: Record, rlease: Lease) -> Record:
         self._make_dir(record)
         self._init_repository()
         plan = self._choose()
@@ -457,7 +506,10 @@ class ThrowawayCreator:
 
     def _verify(self) -> None:
         """The directory at the path is still the one created: reached from the root's fd without
-        following a link, with the recorded identity, and its ``.git`` is a real directory."""
+        following a link, with the recorded identity. It checks the throwaway directory's identity
+        only; that ``.git`` is a real directory is checked where ``.git`` is opened
+        (``_git_fd``). The git commands themselves still address the directory by path (a
+        residual race, documented in docs/interface.md)."""
         dev, _, ino = self.dir_id.partition(":")
         try:
             with self._anchor() as anchor:
@@ -513,6 +565,7 @@ class ThrowawayCreator:
             finally:
                 os.close(gfd)
         for key, value in (("core.logAllRefUpdates", "false"), ("fetch.fsckObjects", "true")):
+            self._verify()
             r = self._git(["config", "--local", key, value])
             self._checked(r, f"git config {key}")
 
@@ -617,6 +670,7 @@ class ThrowawayCreator:
             if err.code == "fetch_failed" and any(m in result.err for m in NOT_OUR_REF):
                 raise WtctlError("ref_not_found", f"the remote does not have commit {ref}")
             raise err
+        self._verify()
         self._delete_fetch_head()
         if not clone_has_commit(self.git, self.tgit, ref):
             raise WtctlError("ref_not_found", f"the fetch did not supply the commit {ref}")
@@ -625,6 +679,8 @@ class ThrowawayCreator:
         self._checked(update, "git update-ref")
         self._verify()
         limit = float(min(self.config.clone_timeout_s, 24 * 86400))
+        check_tree_size(self.git, self.tgit, timeout=limit)
+        self._verify()
         self._checked(
             self._git(["read-tree", "-u", "--reset", "HEAD"], timeout=limit, work_tree=True),
             "git read-tree",
@@ -666,23 +722,33 @@ class ThrowawayCreator:
         self._close_dir()
         notes: list[str] = []
         try:
-            current = self.state.get_record(record["id"]) or record
-            if current["dir_id"] is None:
-                self.state.delete_record(record["id"], expected="creating")
-                return
+            current = dict(self.state.get_record(record["id"]) or record)
+            opened = getattr(self, "dir_id", None)
+            stored = current["dir_id"]
+            if stored is None:
+                if opened is None:  # the directory was never created (or never opened)
+                    self.state.delete_record(record["id"], expected="creating")
+                    return
+                # created and opened, but its identity was not recorded (a failed transition, the
+                # mode check, an interrupt): delete it by the identity this process saw
+                current["dir_id"] = opened
+            extra = {"dir_id": opened} if stored is None else {}
             outcome = removal_delete.delete_throwaway(current, fsafe_child.Budget())
             if outcome.status == "deleted":
                 self.state.delete_record(record["id"], expected="creating")
             elif outcome.status == "partial":
+                # TODO(#23): `reconcile` reports a `partial`/`gone` leftover of a failed create.
                 self.state.transition(
                     record["id"], "creating", "partial",
                     last_error="creation failed and the directory could not be fully deleted",
+                    **extra,
                 )  # fmt: skip
                 notes.append(f"{self.path} could not be fully deleted; the record is partial")
             else:
                 self.state.transition(
                     record["id"], "creating", "gone",
                     last_error="creation failed and the directory is not the recorded one",
+                    **extra,
                 )  # fmt: skip
                 notes.append(f"{self.path} was left: it is not the directory that was created")
         except Exception as cleanup:  # noqa: BLE001 - cleanup must not mask the original error
@@ -714,6 +780,7 @@ class ThrowawayCreator:
         post = hooks.run_post_hooks(
             "post-create", specs, payload, env=env, decision_ids=decision_ids
         )
+        # TODO(#5): log the post-create hook runs (post.runs) with the `hook` event.
         self.warnings += post.warnings
         self._log(
             "throwaway_create",

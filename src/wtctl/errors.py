@@ -76,7 +76,7 @@ REFUSAL_REASONS = frozenset(
 _CAUSES = {
     "remote_mismatch": {"no_remote"},
     "clone_failed": {"timeout"},
-    "create_failed": {"object_format", "anchor_changed"},
+    "create_failed": {"object_format", "anchor_changed", "tree_too_large"},
     "fetch_failed": {"timeout", "prune_incomplete"},
 }
 

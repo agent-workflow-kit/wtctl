@@ -385,6 +385,8 @@ class State:
             then = self.gateway.clock.now() - dt.timedelta(seconds=seconds)
         except OverflowError:
             return "0000-01-01T00:00:00.000Z"
+        if then.year < 1000:  # %Y is not zero padded there; nothing is older than year 1000
+            return "0000-01-01T00:00:00.000Z"
         return then.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
     # -- ids ------------------------------------------------------------------------------

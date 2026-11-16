@@ -95,6 +95,14 @@ def test_a_duration_too_large_for_a_date_removes_nothing(w: TW) -> None:
     assert w.pruned("--older-than", "99999999999w")["removed"] == []
 
 
+@pytest.mark.parametrize("age", ["57000w", "56000w", "60000w"])
+def test_an_age_reaching_before_year_1000_removes_nothing(w: TW, age: str) -> None:
+    # %Y is not zero padded below year 1000: a text comparison must still say "nothing is older"
+    rec = mk(w, 0)
+    assert w.pruned("--older-than", age)["removed"] == []
+    assert w.state_of(rec["id"]) == "active"
+
+
 def test_prune_requires_throwaways(w: TW) -> None:
     w.failed(w.run("prune", "--older-than", "1d"), 2)
 
@@ -351,3 +359,66 @@ def test_prune_does_not_remove_a_throwaway_that_is_being_created(w: TW) -> None:
     assert rec["id"] not in out["removed"] and out["removed"] == [old["id"]]
     assert Path(rec["path"]).is_dir() and w.state_of(rec["id"]) == "active"
     _ = os
+
+
+# -- the record is re-read under the lease -------------------------------------------------------
+
+
+def changed_before_lease(mp: pytest.MonkeyPatch, w: TW, rid: str, sql: str) -> None:
+    """Run ``sql`` against the database right before prune takes the lease on ``rid``."""
+    import sqlite3
+
+    real = State.try_lease
+    done: list[bool] = []
+
+    def patched(self: State, name: str, *a: Any, **kw: Any) -> Any:
+        if name == record_lease(rid) and not done:
+            done.append(True)
+            conn = sqlite3.connect(w.db)
+            conn.execute(sql, (rid,))
+            conn.commit()
+            conn.close()
+        return real(self, name, *a, **kw)
+
+    mp.setattr(State, "try_lease", patched)
+
+
+def test_a_record_removed_between_selection_and_lease_is_skipped_silently(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone, other = mk(w, 10), mk(w, 10)
+    changed_before_lease(
+        monkeypatch, w, gone["id"], "UPDATE records SET state = 'removed' WHERE id = ?"
+    )
+    r = w.prune("--older-than", "1d")
+    data = json.loads(r.out)
+    assert data["removed"] == [other["id"]] and data["skipped"] == []
+    assert "warning" not in r.err.lower() and gone["id"] not in r.err
+
+
+def test_a_record_that_is_no_longer_old_enough_is_left_alone(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = mk(w, 10)
+    changed_before_lease(
+        monkeypatch, w, rec["id"],
+        "UPDATE records SET created = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )  # fmt: skip
+    data = w.pruned("--older-than", "1d")
+    assert data["removed"] == [] and data["skipped"] == []
+    assert w.state_of(rec["id"]) == "active" and Path(rec["path"]).is_dir()
+
+
+def test_a_record_that_became_protected_is_skipped_under_the_lease(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w.top["prune"] = {"protect_labels": ["keep"]}
+    rec = mk(w, 10)
+    changed_before_lease(
+        monkeypatch, w, rec["id"],
+        "INSERT INTO labels(record_id, \"key\", value) VALUES (?, 'keep', 'yes')",
+    )  # fmt: skip
+    data = w.pruned("--older-than", "1d")
+    assert data["removed"] == []
+    assert [s["reason"] for s in data["skipped"]] == ["protected"]
+    assert w.state_of(rec["id"]) == "active"

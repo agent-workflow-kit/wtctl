@@ -54,6 +54,11 @@ MAX_PACK_BYTES = 8 * 1024**3
 # Bound on the commits one transfer names and on the size of the object lists written to files.
 MAX_RANGE_COMMITS = 2_000_000
 MAX_LIST_BYTES = 1024**3
+# What a commit's tree may expand to in a throwaway's work tree (a few bytes of pack can name
+# gigabytes or an exponential number of files): constants, not configuration.
+MAX_TREE_ENTRIES = 500_000
+MAX_TREE_BYTES = 4 * 1024**3
+MAX_TREE_LIST_BYTES = 256 * 1024**2
 # How many of the clone's ref tips bound the range. The list is untrusted and only shrinks the
 # pack, so a clone with more refs than this just gets a larger pack.
 MAX_PRESENT_TIPS = 1000
@@ -606,6 +611,54 @@ def is_shallow(git_dir: str) -> bool:
         return False
 
 
+def check_tree_size(git: Git, git_dir: str, *, timeout: float = 600) -> None:
+    """Fail closed (``create_failed``, ``details.cause: tree_too_large``) when ``HEAD``'s tree in
+    ``git_dir`` has more than ``MAX_TREE_ENTRIES`` file entries or its blobs sum to more than
+    ``MAX_TREE_BYTES``, or when the listing itself exceeds ``MAX_TREE_LIST_BYTES``. The listing
+    (``ls-tree -r -l -z``) goes to a file and is read in chunks, so a hostile tree never sits in
+    memory; it runs before ``read-tree`` writes anything into the work tree."""
+    too_large = {"cause": "tree_too_large"}
+    with private_dir() as p:
+        listing = os.path.join(p, "tree")
+        r = git.run(
+            ["ls-tree", "-r", "-l", "-z", "HEAD"], git_dir=git_dir, cwd=git_dir,
+            allow_shallow=True, stdout_path=listing, max_stdout_bytes=MAX_TREE_LIST_BYTES,
+            timeout=timeout,
+        )  # fmt: skip
+        if r.output_limit:
+            raise _fail("the commit's tree is too large to check out", details=too_large)
+        _checked(r, "git ls-tree in the throwaway")
+        entries = total = 0
+        rest = b""
+        with open(listing, "rb") as f:
+            while chunk := f.read(1 << 20):
+                parts = (rest + chunk).split(b"\0")
+                rest = parts.pop()
+                for rec in parts:
+                    entries += 1
+                    size = rec.partition(b"\t")[0].split()[-1:]
+                    total += int(size[0]) if size and size[0].isdigit() else 0
+                    if entries > MAX_TREE_ENTRIES or total > MAX_TREE_BYTES:
+                        raise _fail(
+                            "the commit's tree is too large to check out", details=too_large
+                        )
+
+
+def _require_prepared(throwaway: str) -> None:
+    """The target is a real directory (not a link) holding only the repository the caller
+    initialized: nothing is checked out into anything else."""
+    try:
+        st = os.lstat(throwaway)
+        if not stat.S_ISDIR(st.st_mode):
+            raise _fail(f"{throwaway} is not a directory")
+        if os.listdir(throwaway) != [".git"] or not stat.S_ISDIR(
+            os.lstat(os.path.join(throwaway, ".git")).st_mode
+        ):
+            raise _fail(f"{throwaway} is not an initialized, otherwise empty directory")
+    except OSError as exc:
+        raise _fail(f"cannot use {throwaway}: {exc.strerror}") from None
+
+
 def fill_local_throwaway(
     git: Git,
     cfg: Config,
@@ -616,7 +669,7 @@ def fill_local_throwaway(
     depth: int = 0,
     honor_filters: bool = False,
     max_pack_bytes: int = MAX_PACK_BYTES,
-    verify: Callable[[], None] | None = None,
+    verify: Callable[[], None],
 ) -> None:
     """Fill the throwaway directory ``throwaway`` with commit ``sha`` of the clone (``local``).
 
@@ -625,7 +678,8 @@ def fill_local_throwaway(
     throwaway's directory and repository: it created the directory, recorded its identity and ran
     ``init --template=`` with the attributes and config of interface.md "Throwaway create order"
     step 7 (``wtctl.throwaway``); this function only fills it. ``verify`` is the caller's
-    re-check that the directory is still the one it created (its recorded identity); it runs
+    re-check that the directory is still the one it created (its recorded identity); it is required
+    and runs
     before every step that writes into the throwaway by path (the shallow file, the index
     install, the work tree) and once at the end. Every command that
     reads the clone runs with protocols ``none`` (the clone is never fetched from): the object
@@ -634,12 +688,13 @@ def fill_local_throwaway(
     ``--strict`` in the throwaway. Failures are ``create_failed``; the caller removes the
     throwaway.
     """
-    check = verify or (lambda: None)
+    check = verify
     if not _SHA.fullmatch(sha):
         raise ValueError("sha must be a full 40-hex commit id")
     if depth not in (0, 1):
         raise ValueError("a local source copies the full history (0) or depth 1")
     t = os.fspath(throwaway)
+    _require_prepared(t)
     timeout = _local_timeout(cfg)
     if not clone_has_commit(git, clone_dir, sha):
         raise _fail(f"the clone does not hold commit {sha}")
@@ -685,6 +740,7 @@ def fill_local_throwaway(
             ),
             "git index-pack in the throwaway",
         )  # fmt: skip
+        check()
         _checked(
             git.run(
                 ["update-ref", "--no-deref", "HEAD", sha],
@@ -695,6 +751,7 @@ def fill_local_throwaway(
             ),
             "git update-ref in the throwaway",
         )
+        check_tree_size(git, tgit, timeout=timeout)
         check()
         _checked(
             git.run(
@@ -717,6 +774,7 @@ __all__ = [
     "MAX_PACK_BYTES",
     "Installed",
     "Transfer",
+    "check_tree_size",
     "clone_has_commit",
     "fill_local_throwaway",
     "is_shallow",
