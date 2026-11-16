@@ -95,14 +95,10 @@ def push_world(base: Path, forge: Forge, *, environ: Mapping[str, str] | None = 
 
 
 def lfs_world(base: Path, *, environ: Mapping[str, str] | None = None) -> LiveWorld:
+    """The public git-lfs repository. No token: the smudge during ``git worktree add`` is
+    anonymous, and the host is one of the two forges (``valid_repo_id``)."""
     repo = liveenv.getenv("WTCTL_LIVE_LFS_REPO", environ)
     if repo is None or not liveenv.valid_repo_id(repo):
         raise KeyError("WTCTL_LIVE_LFS_REPO is unset or malformed")
     host, _, project = repo.partition("/")
-    name = liveenv.token_env_name("WTCTL_LIVE_LFS_TOKEN_ENV", environ)
-    value = liveenv.token_value("WTCTL_LIVE_LFS_TOKEN_ENV", environ)
-    tokens = {name: value} if name and value else {}
-    return LiveWorld(
-        base, host=host, project=project, token_env=name if tokens else None,
-        tokens=tokens, allow_filters=["lfs"],
-    )  # fmt: skip
+    return LiveWorld(base, host=host, project=project, allow_filters=["lfs"])

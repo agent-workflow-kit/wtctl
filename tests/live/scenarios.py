@@ -16,9 +16,11 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from tests.live.harness import FRESH_KEYS, LiveWorld, Out
+from tests.live import liveenv
+from tests.live.harness import FRESH_KEYS, LiveWorld, Out, Record
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+UNADVERTISED_CANDIDATES = 5
 LFS_POINTER = b"version https://git-lfs.github.com/spec/v1"
 MAX_SCAN_BYTES = 8 * 1024 * 1024
 
@@ -77,26 +79,40 @@ def tip_by_sha(w: LiveWorld, depth: int = 1) -> str:
     return tip
 
 
-def unadvertised_sha(w: LiveWorld, skip: int = 5) -> str:
-    """A commit that is no branch tip, fetched by sha at depth 1 and depth 50.
+class NoUnadvertisedCommit(Exception):
+    """Every candidate commit is advertised by the forge (a branch or PR head): nothing to test."""
 
-    The commit is found in a shallow throwaway of the tip (``skip`` commits back), then asked for
-    from the forge by full sha: servers differ in whether they serve a sha they do not advertise.
+
+def unadvertised_sha(w: LiveWorld, skip: int = 5) -> str:
+    """A commit that no ref of the forge advertises, fetched by sha at depth 1 and depth 50.
+
+    The candidates are found in a shallow throwaway of the tip (``skip`` commits back and the few
+    after), checked against every advertised ref (``ls-remote`` with no pattern), then the first
+    unadvertised one is asked for from the forge by full sha: servers differ in whether they serve
+    a sha they do not advertise. Raises :class:`NoUnadvertisedCommit` when all are advertised.
     """
     tip = w.tip("HEAD")
-    with throwaway(w, tip, depth=skip + 5) as rec:
+    advertised = {sha for sha, _ in w.ls_remote(None)}
+    with throwaway(w, tip, depth=skip + UNADVERTISED_CANDIDATES) as rec:
         path = Path(rec["path"])
         res = w.git.run(
-            ["rev-list", "--max-count=1", f"--skip={skip}", "HEAD"],
+            ["rev-list", f"--max-count={UNADVERTISED_CANDIDATES}", f"--skip={skip}", "HEAD"],
             git_dir=path / ".git",
             work_tree=path,
             cwd=path,
             allow_shallow=True,
             timeout=60,
         )
-        old = res.out.strip()
-    assert SHA_RE.fullmatch(old), f"the public repository needs more than {skip + 1} commits"
-    assert old != tip
+        candidates = res.out.split()
+    assert candidates and all(SHA_RE.fullmatch(c) for c in candidates), (
+        f"the public repository needs more than {skip + 1} commits"
+    )
+    old = next((c for c in candidates if c not in advertised and c != tip), None)
+    if old is None:
+        raise NoUnadvertisedCommit(
+            f"the {len(candidates)} commits {skip} to {skip + len(candidates) - 1} back from the "
+            "tip are all advertised refs; choose a repository with more history or branches"
+        )
     for depth in (1, 50):
         with throwaway(w, old, depth=depth) as rec:
             assert head_of(rec) == old, f"depth {depth}: HEAD is not the requested old sha"
@@ -154,7 +170,8 @@ def ssh_batchmode(w: LiveWorld, sha: str, expect: str | None = None) -> str:
 
 def redirect_outcome(w: LiveWorld, sha: str) -> str:
     """Fetch through a URL the forge redirects (no ``.git`` suffix): with ``http.followRedirects``
-    off wtctl must either fetch directly or fail; it must not hang and never leak a token."""
+    off wtctl must either fetch directly or fail with exit 12; it must not hang. Returns the
+    outcome (``fetched`` or ``refused:<code>``) for the report."""
     out = create_throwaway(w, sha, depth=1, timeout=300.0)
     assert not out.timed_out, out.describe()[:1500]
     if out.code == 0:
@@ -167,12 +184,15 @@ def redirect_outcome(w: LiveWorld, sha: str) -> str:
 # -- tokens ----------------------------------------------------------------------------------
 
 
-def assert_secret_absent(w: LiveWorld) -> None:
-    """No credential value is in any file wtctl or git wrote under the world (mirror and clone
-    config, ``FETCH_HEAD``, state, logs)."""
-    needles = [s.encode() for s in w.secrets]
-    if not needles:
-        return
+def _find_leak(w: LiveWorld) -> str | None:
+    """The first file under the world holding any form of a credential, else ``None``.
+
+    The comparison lives here, not in the asserting function: a failing assert shows its frame's
+    locals under ``pytest -l``, and only the path of the leak may be in them.
+    """
+    forms = [f.encode() for f in w.secret_forms()]
+    if not forms:
+        return None
     for path in w.base.rglob("*"):
         if path.is_symlink() or not path.is_file():
             continue
@@ -182,18 +202,51 @@ def assert_secret_absent(w: LiveWorld) -> None:
             data = path.read_bytes()
         except OSError:
             continue
-        for needle in needles:
-            assert needle not in data, f"a credential was written to {path.relative_to(w.base)}"
+        if any(form in data for form in forms):
+            return str(path.relative_to(w.base))
+    return None
+
+
+def assert_secret_absent(w: LiveWorld) -> None:
+    """No credential value (raw, base64, or as a Basic ``user:token`` payload) is in any file
+    wtctl or git wrote under the world (mirror and clone config, ``FETCH_HEAD``, state, logs)."""
+    w.prime_token_command()
+    leak = _find_leak(w)
+    assert leak is None, f"a credential was written to {leak}"
 
 
 def token_fetch(w: LiveWorld, *, depth: int = 1) -> str:
     """The token reaches the private repository (``token_env`` or ``token_command``, whatever the
-    world configures) and is stored nowhere."""
+    world configures) and is stored nowhere, neither while the throwaway exists nor after."""
     tip = w.tip("HEAD")
     with throwaway(w, tip, depth=depth) as rec:
         assert head_of(rec) == tip
+        assert_secret_absent(w)
     assert_secret_absent(w)
     return tip
+
+
+class TokenCommandSilent(Exception):
+    """The world's token command printed nothing under the scratch environment."""
+
+
+def token_command_fetch(w: LiveWorld, config_var: str, *, depth: int = 1) -> str:
+    """:func:`token_fetch` for a world with a ``token_command``, after running the command once
+    in the child's environment: a command that prints nothing there (a keyring, ``GH_TOKEN``,
+    a session bus the scratch environment lacks) would otherwise fall back to an anonymous
+    request and fail with a misleading ``auth_required``."""
+    if not w.prime_token_command():
+        raise TokenCommandSilent(
+            "the token command printed nothing under the suite's scratch environment (only HOME "
+            "and the config directory are set; gh or glab may keep the token in a keyring or "
+            f"GH_TOKEN): set {config_var} to a config directory that holds the token. "
+            + w.token_command_note
+        )
+    try:
+        return token_fetch(w, depth=depth)
+    except AssertionError as e:
+        e.add_note(f"credential warnings: {w.diagnostics() or 'none'}")
+        raise
 
 
 def no_token_is_refused(w: LiveWorld, sha: str) -> None:
@@ -202,8 +255,8 @@ def no_token_is_refused(w: LiveWorld, sha: str) -> None:
 
 
 def bad_token_message(w: LiveWorld, sha: str) -> str:
-    """401 after a header was sent: ``auth_required`` naming the rejected token, not its
-    absence, and no anonymous fallback."""
+    """A made-up token is refused with ``auth_required`` and the message says the configured
+    token was rejected (the 401 after a header was sent), not that no token was given."""
     out = create_throwaway(w, sha, depth=1, timeout=300.0)
     assert out.code == 12 and error_code(out) == "auth_required", out.describe()[:2000]
     message = out.error().get("message", "")
@@ -216,8 +269,9 @@ def bad_token_message(w: LiveWorld, sha: str) -> str:
 
 def mirror_flow(w: LiveWorld) -> dict[str, str]:
     """Clone, a first (treeless) mirror refresh through ``create``, default-branch detection,
-    an incremental refresh, the pushed check at removal, and a strict local full-history
-    throwaway from the clone."""
+    a second ``create`` (a second refresh; upstream does not change between them), the pushed
+    check at removal, a strict local full-history throwaway from the clone, and a check that the
+    mirror is partial and holds no tree or blob objects."""
     default = w.default_branch()
     cloned = ok(w.wtctl("clone", w.repo_id), "clone").json()
     assert cloned["cloned"] is True
@@ -234,7 +288,7 @@ def mirror_flow(w: LiveWorld) -> dict[str, str]:
         assert located["default_branch"] == default, located["default_branch"]
         second = ok(
             w.wtctl("create", "--repo", w.repo_id, "--name", "live-two", "--no-bootstrap"),
-            "create (incremental refresh)",
+            "create (second refresh)",
         ).json()["record"]
         ids.append(second["id"])
         status = ok(w.wtctl("status", first["id"]), "status").json()
@@ -242,6 +296,7 @@ def mirror_flow(w: LiveWorld) -> dict[str, str]:
         assert status["would_remove"] is True, status
         with throwaway(w, first["base_sha"], depth=0, source="local") as rec:
             assert head_of(rec) == first["base_sha"]
+        assert_mirror_is_treeless(w)
     finally:
         for rid in ids:
             w.wtctl("remove", rid, "--yes", timeout=300)
@@ -249,13 +304,45 @@ def mirror_flow(w: LiveWorld) -> dict[str, str]:
     return {"default_branch": default, "base_sha": first["base_sha"]}
 
 
+def assert_mirror_is_treeless(w: LiveWorld) -> None:
+    """The mirror is a partial clone (``extensions.partialclone``, a promisor remote) and holds no
+    tree or blob object: the claim of ``fetch --filter=tree:0`` and ``GIT_NO_LAZY_FETCH=1``."""
+    mirrors = sorted((w.home / ".local" / "state" / "wtctl" / "mirrors").glob("*.git"))
+    assert len(mirrors) == 1, f"expected one mirror, found {[m.name for m in mirrors]}"
+    mirror = mirrors[0]
+    cfg = w.plain([w.git_bin, "config", "--file", str(mirror / "config"), "--list"])
+    ok(cfg, "read the mirror config")
+    lines = [ln.lower() for ln in cfg.out.splitlines()]
+    assert any(ln.startswith("extensions.partialclone=") for ln in lines), (
+        "the mirror is not a partial clone (no extensions.partialclone); record its config "
+        f"keys: {sorted(ln.partition('=')[0] for ln in lines)}"
+    )
+    assert any(ln.startswith("remote.") and ln.endswith(".promisor=true") for ln in lines), (
+        "the mirror's remote is not a promisor remote"
+    )
+    objs = w.plain(
+        [w.git_bin, "--git-dir", str(mirror), "cat-file", "--batch-all-objects", "--batch-check"]
+    )
+    ok(objs, "list the mirror's objects")
+    kinds: dict[str, int] = {}
+    for line in objs.out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            kinds[parts[1]] = kinds.get(parts[1], 0) + 1
+    assert kinds.get("commit", 0) > 0, f"the mirror holds no commit: {kinds}"
+    assert not (kinds.keys() & {"tree", "blob"}), (
+        f"the treeless mirror holds trees or blobs {kinds}; record the counts and check whether a "
+        "base-commit copy legitimately fetched trees into it"
+    )
+
+
 # -- push ------------------------------------------------------------------------------------
 
 
 def safe_branch(prefix: str, suffix: str, default_branch: str) -> str:
-    """A disposable branch name: never empty-prefixed, never the default branch."""
-    if not prefix or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", prefix):
-        raise ValueError("the branch prefix must be a non-empty plain name")
+    """A disposable branch name: a plain, valid ref name that is never a real branch's."""
+    if not liveenv.valid_branch_prefix(prefix):
+        raise ValueError("the branch prefix must be a plain, valid ref name prefix")
     if not re.fullmatch(r"[0-9a-f]{8,32}", suffix):
         raise ValueError("the branch suffix must be random hex")
     name = f"{prefix}{suffix}"
@@ -268,15 +355,40 @@ def _porcelain(out: str) -> list[str]:
     return [ln for ln in out.splitlines() if ln and ln[0] in " +-*=!"]
 
 
-def push_fast_forward(w: LiveWorld, depth: int, prefix: str) -> str:
+def _delete_branch(w: LiveWorld, url: str, ref: str, branch: str) -> None:
+    """Delete the disposable branch. The deletion needs no objects: a bare empty repository is
+    enough, and it works even when the throwaway could not be created. A failure names the
+    branch (to delete by hand) unless the branch turns out not to exist."""
+    res = w.net_git(["push", "--porcelain", "--", url, f":{ref}"], url=url, git_dir=w.scratch())
+    if res.returncode == 0:
+        return
+    try:
+        still_there = any(r[1] == ref for r in w.ls_remote(ref))
+    except AssertionError:
+        still_there = True
+    if still_there:
+        raise AssertionError(
+            f"could not delete the disposable branch {branch} (exit {res.returncode}); delete it "
+            f"by hand: {w.scrub(res.err)[:600]}"
+        )
+
+
+def push_fast_forward(w: LiveWorld, depth: int, prefix: str, record: Record | None = None) -> str:
     """Create a disposable branch from a shallow throwaway, then fast-forward it from the same
-    shallow throwaway; the branch is deleted in ``finally``. Never forces, never touches the
-    default branch."""
+    shallow throwaway; the branch is deleted afterwards, also when a step fails, and only when
+    this call may have created it. Never forces, never touches the default branch, and refuses a
+    branch name that already exists on the remote."""
     default = w.default_branch()
     branch = safe_branch(prefix, secrets.token_hex(6), default)
     ref = f"refs/heads/{branch}"
     url = w.fetch_url
+    if record is not None:
+        record("push_branch", branch)
+        record("push_ref", ref)
+    if any(r[1] == ref for r in w.ls_remote(ref)):
+        raise AssertionError(f"refusing to push: the branch {branch} already exists on the remote")
     base_tip = w.tip(f"refs/heads/{default}")
+    created = False
     try:
         with throwaway(w, base_tip, depth=depth) as rec:
             path = Path(rec["path"])
@@ -301,6 +413,7 @@ def push_fast_forward(w: LiveWorld, depth: int, prefix: str) -> str:
                 run(["add", "-A", "--", "."])
                 run(["commit", "-q", "-m", f"live test {step}"])
                 head = run(["rev-parse", "HEAD"])
+                created = True  # from here on the push may have reached the remote
                 res = w.net_git(
                     ["push", "--porcelain", "--", url, f"HEAD:{ref}"],
                     url=url, git_dir=gd, work_tree=path, owned_keys=owned,
@@ -310,12 +423,17 @@ def push_fast_forward(w: LiveWorld, depth: int, prefix: str) -> str:
                 assert w.tip(ref) == head, (
                     f"step {step}: the remote branch is not at the pushed commit"
                 )
-    finally:
-        # The deletion needs no objects: a bare empty repository is enough, and it works even
-        # when the throwaway could not be created.
-        w.net_git(["push", "--porcelain", "--", url, f":{ref}"], url=url, git_dir=w.scratch())
+    except BaseException as failure:
+        if created:
+            try:
+                _delete_branch(w, url, ref, branch)
+            except AssertionError as cleanup:
+                failure.add_note(f"cleanup also failed: {cleanup}")
+        raise
+    if created:
+        _delete_branch(w, url, ref, branch)
     assert [r for r in w.ls_remote(ref) if r[1] == ref] == [], (
-        "the disposable branch is still there"
+        f"the disposable branch {branch} is still there; delete it by hand"
     )
     return branch
 
@@ -334,24 +452,27 @@ def install_lfs_driver(w: LiveWorld) -> None:
     ok(w.plain([w.git_bin, "lfs", "install", "--skip-repo"]), "git lfs install")
 
 
-def lfs_content(w: LiveWorld, sha: str, rel_path: str) -> tuple[bytes, bytes]:
+def lfs_content(w: LiveWorld, sha: str, rel_path: str) -> tuple[bytes, bytes, str]:
     """The file at ``rel_path`` in a worktree of ``sha`` with git-lfs honored, and in one with
-    no honored driver."""
+    no honored driver, plus the ``create`` warnings of both (for an assertion message)."""
     got: list[bytes] = []
+    notes: list[str] = []
     for filters, name in ((["lfs"], "live-lfs-on"), ([], "live-lfs-off")):
         w.allow_filters = filters
-        rec = ok(
+        created = ok(
             w.wtctl(
                 "create", "--repo", w.repo_id, "--detach", "--ref", sha, "--name", name,
                 "--no-bootstrap",
             ),
             f"create worktree ({name})",
-        ).json()["record"]  # fmt: skip
+        ).json()  # fmt: skip
+        rec = created["record"]
+        notes.append(f"{name}: create warnings {created.get('warnings')}")
         try:
             got.append((Path(rec["path"]) / rel_path).read_bytes())
         finally:
             w.wtctl("remove", rec["id"], "--yes", "--force", timeout=300)
-    return got[0], got[1]
+    return got[0], got[1], "; ".join(notes)
 
 
 def lfs_planted_key_refused(w: LiveWorld, sha: str, key: str, value: str) -> None:

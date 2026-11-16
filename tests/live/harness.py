@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from tests.live import liveenv
+from tests.schemacheck import validate
 from wtctl.config import Config, HostConfig
 from wtctl.credentials import NetworkKind, prepare_network_auth, run_network_git
 from wtctl.gateway import Gateway, GitResult
@@ -30,6 +31,9 @@ from wtctl.hardgit import Git
 
 Record = Callable[[str, object], None]  # pytest's ``record_property`` fixture
 ACTOR = "human:live"
+DEFAULT_TOKEN_USER = "x-access-token"
+# Commands whose ``--json`` output has a schema in schemas/cli/ (checked on every parse).
+SCHEMA_COMMANDS = frozenset({"create", "locate", "status", "clone"})
 FRESH_KEYS = frozenset({"core.repositoryformatversion", "core.filemode", "core.bare"})
 # Token shapes of the common forge CLIs, scrubbed from output even when the value is not known
 # to the test (a ``token_command`` prints its own).
@@ -86,12 +90,21 @@ class Out:
     out: str
     err: str
     timed_out: bool = False
+    schema: str | None = None  # the schema id the output of a successful run must match
 
     def json(self) -> Any:
-        return json.loads(self.out)
+        data = json.loads(self.out)
+        if self.schema is not None and self.code == 0 and not self.timed_out:
+            try:
+                validate(self.schema, data)
+            except Exception as e:  # noqa: BLE001 - jsonschema.ValidationError and lookup errors
+                raise AssertionError(
+                    f"output does not match {self.schema}: {str(e)[:600]}"
+                ) from None
+        return data
 
     def error(self) -> dict[str, Any]:
-        data = self.json()
+        data = json.loads(self.out)
         return data["error"] if isinstance(data, dict) and "error" in data else {}
 
     def describe(self) -> str:
@@ -116,6 +129,7 @@ class LiveWorld:
         clone_url: str | None = None,
         token_env: str | None = None,
         token_command: list[str] | None = None,
+        token_user: str | None = None,
         tokens: dict[str, str] | None = None,
         child_env: dict[str, str] | None = None,
         allow_filters: list[str] | None = None,
@@ -130,12 +144,16 @@ class LiveWorld:
         self.clone_url_override = clone_url
         self.token_env = token_env
         self.token_command = token_command
+        self.token_user = token_user
         self.tokens = dict(tokens or {})
         self.extra_env = dict(child_env or {})
         self.allow_filters = allow_filters
         self.scheme = scheme
         self.network_timeout = network_timeout
         self.clone_timeout = clone_timeout
+        self.warnings: list[str] = []  # wtctl's own credential warnings, scrubbed
+        self._command_token: str | None = None  # the token command's output, once run
+        self.token_command_note = ""
         self.home = base / "home"
         self.root = base / "wt"
         self.config_path = base / "cfg" / "config.json"
@@ -153,15 +171,54 @@ class LiveWorld:
 
     @property
     def secrets(self) -> list[str]:
-        return sorted({v for v in self.tokens.values() if v}, key=len, reverse=True)
+        """Every credential value this world knows: configured tokens and, once the world's
+        ``token_command`` has been run (:meth:`prime_token_command`), its output."""
+        found = {v for v in self.tokens.values() if v}
+        if self._command_token:
+            found.add(self._command_token)
+        return sorted(found, key=len, reverse=True)
+
+    def secret_forms(self) -> list[str]:
+        """Every spelling of every credential that must appear in no output and no file: the raw
+        value, its base64 and the base64 of ``user:value`` for the configured ``token_user`` and
+        ``x-access-token`` (the ``Authorization: Basic`` payload), padded and unpadded."""
+        users = {DEFAULT_TOKEN_USER, self.token_user or DEFAULT_TOKEN_USER}
+        forms: set[str] = set()
+        for secret in self.secrets:
+            forms.add(secret)
+            for plain in [secret, *(f"{u}:{secret}" for u in sorted(users))]:
+                b64 = base64.b64encode(plain.encode()).decode()
+                forms |= {b64, b64.rstrip("=")}
+        return sorted(forms, key=len, reverse=True)
 
     def scrub(self, text: str) -> str:
         """Remove every known credential (and its base64 forms) and token-shaped strings."""
-        for secret in self.secrets:
-            b64 = base64.b64encode(secret.encode()).decode()
-            for form in (secret, b64, b64.rstrip("=")):
-                text = text.replace(form, "***")
+        for form in self.secret_forms():
+            text = text.replace(form, "***")
         return _TOKEN_SHAPES.sub("***", text)
+
+    def prime_token_command(self) -> str:
+        """Run the world's ``token_command`` once, with the child's own environment, and learn
+        its output as a secret (so it is scrubbed and scanned for). Returns the token, or ``""``
+        when the command printed nothing; ``token_command_note`` then says why."""
+        if self.token_command is None:
+            return ""
+        if self._command_token is None:
+            argv = [self.host if a == "{host}" else a for a in self.token_command]
+            raw = spawn(argv, env=self.env(), cwd=str(self.base), timeout=30.0)
+            text = raw.out.decode("utf-8", "replace").rstrip("\r\n")
+            self._command_token = text if raw.code == 0 and not raw.timed_out else ""
+            self.token_command_note = (
+                f"exit {raw.code}{' (timed out)' if raw.timed_out else ''}, stderr: "
+                + self.scrub(raw.err.decode("utf-8", "replace"))[:300].strip()
+            )
+            if self._command_token:
+                self._command_token = self._command_token.strip()
+        return self._command_token
+
+    def diagnostics(self) -> str:
+        """The credential warnings wtctl raised in :meth:`net_git`, for assertion messages."""
+        return "; ".join(dict.fromkeys(self.warnings))
 
     # -- configuration and environment -----------------------------------------------------
 
@@ -178,6 +235,8 @@ class LiveWorld:
             host["token_env"] = self.token_env
         if self.token_command:
             host["token_command"] = list(self.token_command)
+        if self.token_user:
+            host["token_user"] = self.token_user
         if host:
             data["hosts"] = {self.host: host}
         repo: dict[str, Any] = {}
@@ -195,7 +254,9 @@ class LiveWorld:
     def env(self) -> dict[str, str]:
         """The child's whole environment: nothing inherited except PATH (and what is named)."""
         h = self.home
+        # Tokens first: a token variable named like an isolation variable can never win.
         return {
+            **self.tokens,
             "PATH": liveenv.PATH_SNAPSHOT,
             "HOME": str(h),
             "XDG_CONFIG_HOME": str(h / ".config"),
@@ -206,22 +267,23 @@ class LiveWorld:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "LC_ALL": "C",
-            **self.tokens,
             **self.extra_env,
         }
 
     # -- running ---------------------------------------------------------------------------
 
-    def _out(self, raw: Raw) -> Out:
+    def _out(self, raw: Raw, schema: str | None = None) -> Out:
         return Out(
             raw.code,
             self.scrub(raw.out.decode("utf-8", "replace")),
             self.scrub(raw.err.decode("utf-8", "replace")),
             raw.timed_out,
+            schema,
         )
 
     def wtctl(self, *argv: str, timeout: float = 900.0, actor: str = ACTOR) -> Out:
         """``wtctl --json <argv>`` as a real child process."""
+        self.prime_token_command()
         self.write_config()
         full = [
             sys.executable,
@@ -234,7 +296,8 @@ class LiveWorld:
             actor,
             *argv,
         ]
-        return self._out(spawn(full, env=self.env(), cwd=str(self.base), timeout=timeout))
+        schema = f"wtctl/cli/{argv[0]}.json" if argv and argv[0] in SCHEMA_COMMANDS else None
+        return self._out(spawn(full, env=self.env(), cwd=str(self.base), timeout=timeout), schema)
 
     def plain(self, argv: list[str], *, cwd: Path | None = None, timeout: float = 120.0) -> Out:
         """A non-wtctl program (git, git-lfs) with the same private environment."""
@@ -247,7 +310,8 @@ class LiveWorld:
         return Git(make_gateway(), self.git_bin, str(self.home))
 
     def _config(self) -> Config:
-        host = HostConfig(token_env=self.token_env, token_command=self.token_command)
+        extra = {"token_user": self.token_user} if self.token_user else {}
+        host = HostConfig(token_env=self.token_env, token_command=self.token_command, **extra)
         return Config(
             hosts={self.host: host} if (self.token_env or self.token_command) else {},
             network_timeout=self.network_timeout,
@@ -265,9 +329,14 @@ class LiveWorld:
         kind: NetworkKind = NetworkKind.NETWORK,
     ) -> GitResult:
         """One network git call under wtctl's credential rules; the output is scrubbed."""
+        self.prime_token_command()
         cfg = self._config()
         auth = prepare_network_auth(
-            cfg, url, environ=self.env(), gateway=make_gateway(), warn=lambda m: None
+            cfg,
+            url,
+            environ=self.env(),
+            gateway=make_gateway(),
+            warn=lambda m: self.warnings.append(self.scrub(m)),
         )
         result = run_network_git(
             self.git,
@@ -299,15 +368,20 @@ class LiveWorld:
                 raise AssertionError(f"could not create the scratch repository: {out.err}")
         return path
 
-    def ls_remote(self, ref: str = "HEAD", *, symref: bool = False) -> list[tuple[str, str]]:
-        """``(object-or-target, ref)`` pairs; with ``symref`` the first row is the symref line."""
+    def ls_remote(self, ref: str | None = "HEAD", *, symref: bool = False) -> list[tuple[str, str]]:
+        """``(object-or-target, ref)`` pairs; with ``symref`` the first row is the symref line.
+        ``ref=None`` lists every advertised ref."""
         args = ["ls-remote"]
         if symref:
             args.append("--symref")
-        args += ["--", self.fetch_url, ref]
+        args += ["--", self.fetch_url]
+        if ref is not None:
+            args.append(ref)
         res = self.net_git(args, url=self.fetch_url, git_dir=self.scratch())
         if res.returncode != 0:
-            raise AssertionError(f"ls-remote failed ({res.returncode}): {res.err}")
+            raise AssertionError(
+                f"ls-remote failed ({res.returncode}): {res.err} [{self.diagnostics()}]"
+            )
         rows = []
         for line in res.out.splitlines():
             left, _, right = line.partition("\t")

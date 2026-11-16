@@ -41,7 +41,9 @@ def test_a_private_repository_without_a_token_is_auth_required(key: str, tmp_pat
 def test_a_rejected_token_says_so_and_does_not_fall_back(
     key: str, tmp_path: Path, record_property: Record
 ) -> None:
-    """A7: a bad token gets 401 and the message names the token, not its absence."""
+    """A7: a made-up token is refused with ``auth_required`` and the message says the configured
+    token was rejected, not that none was given. (Whether anonymous access was retried is not
+    checked.)"""
     sha = worlds.private_world(tmp_path / "ref", FORGES[key]).tip("HEAD")
     w = worlds.private_world(tmp_path / "bad", FORGES[key], mode="bad")
     record_property("message", sc.bad_token_message(w, sha))
@@ -49,7 +51,8 @@ def test_a_rejected_token_says_so_and_does_not_fall_back(
 
 @pytest.mark.parametrize("key", PRIVATE)
 def test_port_443_still_gets_the_token(key: str, tmp_path: Path) -> None:
-    """The header is scoped to the bare host; real git must match it for a ``:443`` URL."""
+    """The header is scoped to the bare host; the private repository is read through a ``:443``
+    URL, so real git matched it."""
     forge = FORGES[key]
     project = liveenv.project_path(forge, "PRIVATE_REPO")
     w = worlds.private_world(tmp_path, forge, clone_url=f"https://{forge.host}:443/{project}.git")
@@ -58,7 +61,12 @@ def test_port_443_still_gets_the_token(key: str, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("key", COMMAND)
 def test_token_command_with_the_forge_cli(key: str, tmp_path: Path) -> None:
-    """``token_command`` running the forge's own CLI (``gh`` or ``glab``) yields a token the
-    forge accepts."""
-    w = worlds.private_world(tmp_path, FORGES[key], mode="command")
-    sc.token_fetch(w)
+    """``token_command`` running the forge's own CLI (``gh`` or ``glab``, ``auth token`` only)
+    yields a token the forge accepts. The command runs with only HOME and the config directory
+    (no keyring, ``GH_TOKEN`` or session bus); one that prints nothing there skips the test."""
+    forge = FORGES[key]
+    w = worlds.private_world(tmp_path, forge, mode="command")
+    try:
+        sc.token_command_fetch(w, forge.var("CONFIG_DIR"))
+    except sc.TokenCommandSilent as e:
+        pytest.skip(str(e))

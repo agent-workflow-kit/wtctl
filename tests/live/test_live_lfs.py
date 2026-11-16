@@ -1,6 +1,7 @@
 """Real git-lfs with ``create.allow_filters: [lfs]`` (see docs/live-testing.md).
 
-Needs the ``git-lfs`` binary and a repository (``WTCTL_LIVE_LFS_REPO``) whose commit
+Needs the ``git-lfs`` binary and a public repository on github.com or gitlab.com
+(``WTCTL_LIVE_LFS_REPO``; the download is anonymous, no token is ever used) whose commit
 ``WTCTL_LIVE_LFS_REF`` tracks ``WTCTL_LIVE_LFS_PATH`` with git-lfs.
 """
 
@@ -29,9 +30,9 @@ def test_lfs_is_smudged_when_allowed_and_a_pointer_otherwise(tmp_path: Path) -> 
     sha = liveenv.getenv("WTCTL_LIVE_LFS_REF") or ""
     path = liveenv.getenv("WTCTL_LIVE_LFS_PATH") or ""
     sc.ok(w.wtctl("clone", w.repo_id), "clone")
-    smudged, pointer = sc.lfs_content(w, sha, path)
-    assert not smudged.startswith(sc.LFS_POINTER), "the honored driver left a pointer file"
-    assert pointer.startswith(sc.LFS_POINTER), "a blanked driver should leave the pointer file"
+    smudged, pointer, notes = sc.lfs_content(w, sha, path)
+    assert not smudged.startswith(sc.LFS_POINTER), f"the honored driver left a pointer: {notes}"
+    assert pointer.startswith(sc.LFS_POINTER), f"a blanked driver should leave a pointer: {notes}"
 
 
 @pytest.mark.parametrize(("key", "value"), sc.LFS_PLANTED_KEYS, ids=["lfs.url", "customtransfer"])
