@@ -73,6 +73,7 @@ class Extractor:
         self.rid: str = source["id"]
         self.journal = audit.journal_for(ctx)
         self.dest_rec: Record | None = None
+        self.invalid_total = 0
         self.dest_real = ""
         self.warnings: list[str] = []
         self._deleted: list[dict[str, str]] = []
@@ -159,6 +160,7 @@ class Extractor:
         bad = plan.errors()
         if bad:
             capped = len(bad) > extraction.MAX_ERRORS_SHOWN
+            self.invalid_total = len(bad)  # the log carries the true count, not the capped list
             raise WtctlError(
                 "extract_invalid",
                 f"{len(bad)} of {len(plan.entries)} entries cannot be extracted; nothing changed"
@@ -365,7 +367,7 @@ class Extractor:
         d = exc.fields.get("details") or {}
         details: dict[str, Any] = {"code": exc.code, "reason": exc.fields.get("reason")}
         if exc.code == "extract_invalid":
-            details["invalid"] = len(d.get("paths", []))
+            details["invalid"] = self.invalid_total
         if exc.code == "io_error":
             details["written"] = len(d.get("written", []))
             details["deleted"] = len(d.get("deleted", []))

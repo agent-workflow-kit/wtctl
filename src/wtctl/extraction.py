@@ -41,7 +41,9 @@ def parse_list(data: bytes) -> list[bytes]:
 
 # Characters a terminal or a reader may act on: C1 controls, bidirectional controls and the line
 # and paragraph separators. They stay valid in a path; only their display is escaped.
-_DISPLAY_ESCAPE = re.compile("[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+_DISPLAY_ESCAPE = re.compile(
+    "[\u0080-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]"
+)
 
 # At most this many per-path errors are listed in the error output.
 MAX_ERRORS_SHOWN = 100

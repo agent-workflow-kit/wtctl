@@ -743,6 +743,25 @@ def test_per_path_errors_in_the_output_are_capped(w: XW) -> None:
     assert len(e["details"]["paths"]) == 100 and len(r.out) < 64 * 1024
 
 
+def test_the_log_carries_the_true_invalid_count_beyond_the_output_cap(w: XW) -> None:
+    s = w.src()
+    r = w.ex(s, w.plain_dest(), [f"../x{i}" for i in range(250)])
+    e = w.failed(r, 12)
+    assert len(e["details"]["paths"]) == 100
+    ev = [x for x in w.log_events() if x["event"] == "extract"]
+    assert len(ev) == 1 and ev[0]["details"]["invalid"] == 250
+
+
+def test_directional_marks_are_escaped_in_the_error(w: XW) -> None:
+    s = w.src()
+    marks = [0x200E, 0x200F, 0x061C]
+    r = w.ex(s, w.plain_dest(), [f"a{chr(c)}b".encode() for c in marks], nul=True)
+    e = w.failed(r, 12)
+    shown = [p["path"] for p in e["details"]["paths"]]
+    assert shown == ["a\\u200eb", "a\\u200fb", "a\\u061cb"]
+    assert all(chr(c) not in r.out + r.err for c in marks)
+
+
 def test_c1_bidi_and_line_separator_characters_are_escaped_in_the_error(w: XW) -> None:
     s = w.src()
     bad = [0x85, 0x9F, 0x202A, 0x202E, 0x2066, 0x2069, 0x2028, 0x2029]
