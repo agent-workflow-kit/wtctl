@@ -470,6 +470,20 @@ def op_nested_scan(args: dict[str, object]) -> dict[str, object]:
     return {"count": count, "gits": gits, "mounts": mounts, "unreadable": unreadable}
 
 
+def op_env_match(args: dict[str, object]) -> dict[str, object]:
+    """The ``copy_env`` source walk (``wtctl.bootstrapper.env_match_op``)."""
+    from wtctl import bootstrapper
+
+    return bootstrapper.env_match_op(args)
+
+
+def op_env_read(args: dict[str, object]) -> dict[str, object]:
+    """The ``copy_env`` source reads (``wtctl.bootstrapper.env_read_op``)."""
+    from wtctl import bootstrapper
+
+    return bootstrapper.env_read_op(args)
+
+
 def op_baseline_git(args: dict[str, object]) -> dict[str, object]:
     """The ``git``-class repo-config baseline items (``wtctl.repobaseline``)."""
     from wtctl import repobaseline
@@ -738,6 +752,8 @@ OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "repair_pointers": op_repair_pointers,
     "dir_ids": op_dir_ids,
     "nested_scan": op_nested_scan,
+    "env_match": op_env_match,
+    "env_read": op_env_read,
     "baseline_git": op_baseline_git,
     "baseline_claude": op_baseline_claude,
 }

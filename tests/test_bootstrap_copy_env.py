@@ -316,7 +316,11 @@ def test_a_write_failure_removes_the_partial_file_and_warns(
 
     r.write(".env", "SECRET=1\n", root=r.main)
 
+    real_write = os.write
+
     def boom(fd: int, data: object) -> int:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):  # the pipes to the child processes still work
+            return real_write(fd, data)  # type: ignore[arg-type]
         raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
 
     with monkeypatch.context() as m:

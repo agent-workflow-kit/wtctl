@@ -17,7 +17,7 @@ from typing import Any
 from .. import baselinesvc, bootstrapper, fsafe, hooks, naming, repobaseline, worktrees
 from .. import labels as labelmod
 from ..context import Context, Result
-from ..errors import UsageError, WtctlError
+from ..errors import UsageError, WtctlError, bootstrap_failed_details
 from ..gitsetup import open_git, with_filters
 from ..hardgit import Git
 from ..locate import Resolver, describe_mount, identity_str
@@ -1044,7 +1044,7 @@ class Creator:
             err = WtctlError(
                 "bootstrap_failed",
                 f"bootstrap step {n} failed; the worktree {active['path']} was kept",
-                details={"record": out, "step": outcome.failed_step},
+                details=bootstrap_failed_details(out, outcome.failed_step, self.warnings),
             )
             err.stdout_text = active["path"]
             raise err

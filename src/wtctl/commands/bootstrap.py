@@ -13,7 +13,7 @@ from typing import Any
 
 from .. import baselinesvc, bootstrapper, fsafe, inuse, repobaseline
 from ..context import Context, Result
-from ..errors import UsageError, WtctlError
+from ..errors import UsageError, WtctlError, bootstrap_failed_details
 from ..gitsetup import open_git, with_filters
 from ..state import Record, record_lease
 from .create import record_object
@@ -105,7 +105,7 @@ def run(ctx: Context) -> Result:
             raise WtctlError(
                 "bootstrap_failed",
                 f"bootstrap step {len(outcome.steps)} failed in {record['path']}",
-                details={"record": out, "step": outcome.failed_step},
+                details=bootstrap_failed_details(out, outcome.failed_step, warnings),
             )
         record = _rerecord(ctx, record)
         out = record_object(record, summary)
