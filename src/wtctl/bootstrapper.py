@@ -724,7 +724,7 @@ def copy_env_files(
         skipped[0] += 1
 
     try:
-        _copy_matches(wt, matches, folded, results, fetch, skip, copied)
+        _copy_matches(wt, matches, folded, results, fetch, skip, copied, warn)
     finally:
         if skipped[0] > ENV_WARN_CAP:
             warn(f"copy_env: {skipped[0] - ENV_WARN_CAP} more warnings were suppressed")
@@ -739,7 +739,9 @@ def _copy_matches(
     fetch: Callable[[tuple[str, ...]], bool],
     warn: Warn,
     copied: list[Copied],
+    raw_warn: Warn,
 ) -> None:
+    """``warn`` is the capped per-file helper; ``raw_warn`` is for the once-only count cap."""
     for rel in matches:
         shown = _esc("/".join(rel))
         text = "/".join(rel)
@@ -747,7 +749,7 @@ def _copy_matches(
             warn(f"copy_env: {shown!r} is not valid UTF-8; skipped")
             continue
         if len(copied) >= ENV_FILE_MAX_COUNT:
-            warn(f"copy_env: more than {ENV_FILE_MAX_COUNT} matches; the rest are skipped")
+            raw_warn(f"copy_env: more than {ENV_FILE_MAX_COUNT} matches; the rest are skipped")
             break
         if _tracked_conflict(rel, folded):
             warn(f"copy_env: {shown!r} is tracked in the worktree; skipped")

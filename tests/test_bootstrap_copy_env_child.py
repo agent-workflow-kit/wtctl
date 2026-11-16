@@ -446,6 +446,35 @@ def test_per_file_skip_warnings_are_capped(r: Repo, monkeypatch: pytest.MonkeyPa
     assert warns[-1] == "copy_env: 30 more warnings were suppressed"
 
 
+def test_count_cap_warning_survives_the_suppression_cap(
+    r: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import removalfs
+
+    names = [f"bad\0{i}" for i in range(b.ENV_WARN_CAP + 10)] + ["ok"]
+
+    def runner(op: str, args: dict[str, Any], **kw: Any) -> Any:
+        return fsafe_child.OpResult(
+            True,
+            value={
+                "identity": [1, 2],
+                "matches": [[x] for x in names],
+                "warnings": [],
+                "refuse": None,
+            },
+        )
+
+    monkeypatch.setattr(removalfs, "RUNNER", runner)
+    monkeypatch.setattr(b, "ENV_FILE_MAX_COUNT", 0)
+    warns: list[str] = []
+    with r.open() as wt:
+        b.copy_env_files(
+            wt, source_root=str(r.main), patterns=["*"], tracked=set(), warn=warns.append
+        )
+    assert "copy_env: more than 0 matches; the rest are skipped" in warns
+    assert warns[-1] == "copy_env: 10 more warnings were suppressed"
+
+
 def test_per_file_skip_warnings_below_the_cap_are_all_kept(
     r: Repo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
