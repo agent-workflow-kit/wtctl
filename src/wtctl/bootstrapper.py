@@ -40,7 +40,10 @@ ENV_FILE_MAX_BYTES = 1024 * 1024  # an env file larger than this is not copied
 ENV_FILE_MAX_COUNT = 1000
 ENV_WALK_LIMIT = 200_000  # directory entries the copy_env source walk reads
 ENV_WALK_DEPTH = 255  # directory levels the copy_env source walk enters
-ENV_BATCH_BYTES = 8 * 1024 * 1024  # content one copy_env read child returns (it stops after this)
+ENV_BATCH_BYTES = 8 * 1024 * 1024  # content one copy_env read child returns (it may exceed it by
+# one file, at most ENV_FILE_MAX_BYTES: a batch ends after the first file that reaches the cap)
+ENV_MATCH_RETURN_MAX = 10_000  # matches the walk child returns (the first ones in sorted order)
+ENV_MATCH_RETURN_BYTES = 4 * 1024 * 1024  # bytes of paths the walk child returns
 ENV_WARN_CAP = 200  # warnings the copy_env walk child returns (the rest are counted in one)
 _CHUNK = 1 << 16
 
@@ -486,6 +489,8 @@ def env_match_op(args: dict[str, Any]) -> dict[str, Any]:
     plans = [[str(c) for c in plan] for plan in args["plans"]]
     limit = int(args["limit"])
     common_id = args.get("common_id")
+    return_max = int(args.get("return_max", ENV_MATCH_RETURN_MAX))
+    return_bytes = int(args.get("return_bytes", ENV_MATCH_RETURN_BYTES))
     anchor = fsafe.open_anchor(str(spec["path"]), expected=None)
     warnings: list[str] = []
     dropped = [0]
@@ -528,9 +533,18 @@ def env_match_op(args: dict[str, Any]) -> dict[str, Any]:
                 _match(anchor, anchor.fd, comps, matches, budget, warn)
         except (fsafe.FsafeError, OSError, RecursionError) as exc:
             warn(f"copy_env: the source walk stopped early ({getattr(exc, 'kind', 'io')})")
+        kept: list[list[str]] = []
+        used = 0
+        for m in sorted(matches):
+            size = sum(len(os.fsencode(c)) + 1 for c in m)
+            if len(kept) >= return_max or used + size > return_bytes:
+                warn(f"copy_env: only the first {len(kept)} matches are considered")
+                break
+            kept.append(list(m))
+            used += size
         if dropped[0]:
             warnings.append(f"copy_env: {dropped[0]} more warnings were suppressed")
-        out["matches"] = [list(m) for m in sorted(matches)]
+        out["matches"] = kept
         return out
     finally:
         anchor.close()
@@ -630,6 +644,8 @@ def copy_env_files(
             "anchor": {"path": source_root, "identity": None},
             "plans": plans,
             "limit": ENV_WALK_LIMIT,
+            "return_max": ENV_MATCH_RETURN_MAX,
+            "return_bytes": ENV_MATCH_RETURN_BYTES,
             "common_id": common_id if use_common else None,
         },
     )
@@ -652,7 +668,7 @@ def copy_env_files(
         warn(str(value["refuse"]))
         return []
     root_id = value["identity"]
-    matches = sorted(tuple(str(c) for c in m) for m in value["matches"])
+    matches = sorted(tuple(str(c) for c in m) for m in value["matches"][:ENV_MATCH_RETURN_MAX])
     folded = {t.casefold() for t in tracked}
     eligible = [
         rel
@@ -683,7 +699,9 @@ def copy_env_files(
         )
         files = got.value.get("files") if got.ok and got.value is not None else None
         if not files:
-            if got.timed_out:
+            if got.timed_out and got.pid is None:
+                warn("copy_env: the read time budget was used up; nothing more copied")
+            elif got.timed_out:
                 warn(
                     f"copy_env: reading the source exceeded its {fsafe_child.WALK_DEADLINE:g} s "
                     "deadline and was killed; nothing more copied"
@@ -697,6 +715,31 @@ def copy_env_files(
         return True
 
     copied: list[Copied] = []
+    skipped = [0]
+
+    def skip(text: str) -> None:
+        """A per-file warning, at most ``ENV_WARN_CAP`` of them (the rest are counted)."""
+        if skipped[0] < ENV_WARN_CAP:
+            warn(text)
+        skipped[0] += 1
+
+    try:
+        _copy_matches(wt, matches, folded, results, fetch, skip, copied)
+    finally:
+        if skipped[0] > ENV_WARN_CAP:
+            warn(f"copy_env: {skipped[0] - ENV_WARN_CAP} more warnings were suppressed")
+    return copied
+
+
+def _copy_matches(
+    wt: Worktree,
+    matches: list[tuple[str, ...]],
+    folded: set[str],
+    results: dict[tuple[str, ...], dict[str, Any]],
+    fetch: Callable[[tuple[str, ...]], bool],
+    warn: Warn,
+    copied: list[Copied],
+) -> None:
     for rel in matches:
         shown = _esc("/".join(rel))
         text = "/".join(rel)
@@ -736,7 +779,6 @@ def copy_env_files(
             warn(f"copy_env: {shown!r} not copied: {exc.strerror}")
             continue
         copied.append(Copied(text, hashlib.sha256(data).hexdigest()))
-    return copied
 
 
 def _entry_data(entry: Mapping[str, Any]) -> bytes | None:

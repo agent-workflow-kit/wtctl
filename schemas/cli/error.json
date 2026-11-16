@@ -114,7 +114,7 @@
                 "x-untrusted": true,
                 "description": "Untrusted: a warning of the run; it can carry agent-chosen file names (control characters escaped)."
               },
-              "description": "bootstrap_failed only: the warnings the failed run produced (copy_env skips, a stopped scan), at most 50, each at most 1024 characters. Absent when there were none."
+              "description": "bootstrap_failed only: every warning the failed run produced (copy_env skips, a stopped scan, hook output tails), at most 50, each at most 1024 characters; on overflow the first 49 and a last entry \"N more warnings omitted\". Untrusted text. Absent when there were none."
             }
           }
         }

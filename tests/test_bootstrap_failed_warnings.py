@@ -121,3 +121,64 @@ def test_the_limits_match_the_schema() -> None:
     )
     prop = schema["properties"]["error"]["properties"]["details"]["properties"]["warnings"]
     assert prop["maxItems"] == WARNINGS_MAX and prop["items"]["maxLength"] == WARNING_MAX_CHARS
+
+
+def test_the_copy_env_limits_are_documented() -> None:
+    from wtctl import bootstrapper as b
+
+    docs = Path(errors.__file__).parents[2].joinpath("docs/interface.md").read_text()
+    assert f"{b.ENV_WARN_CAP} warnings" in docs
+    assert f"{b.ENV_MATCH_RETURN_MAX} matches" in docs
+    assert f"{b.ENV_MATCH_RETURN_BYTES // (1024 * 1024)} MiB of paths" in docs
+    assert f"{b.ENV_BATCH_BYTES // (1024 * 1024)} MiB" in docs
+
+
+# -- overflow, escapes and truncation (R2, R7) ---------------------------------------------------
+
+
+def test_overflow_keeps_the_last_slot_for_an_omitted_count() -> None:
+    out = bounded_warnings([f"w{i}" for i in range(WARNINGS_MAX + 10)])
+    assert out is not None and len(out) == WARNINGS_MAX
+    assert out[: WARNINGS_MAX - 1] == [f"w{i}" for i in range(WARNINGS_MAX - 1)]
+    assert out[-1] == "11 more warnings omitted"
+
+
+def test_exactly_the_maximum_is_kept_whole() -> None:
+    out = bounded_warnings([f"w{i}" for i in range(WARNINGS_MAX)])
+    assert out == [f"w{i}" for i in range(WARNINGS_MAX)]
+
+
+@pytest.mark.parametrize(
+    ("char", "expected"),
+    [
+        ("\x80", "\\x80"),
+        ("\x9f", "\\x9f"),
+        ("\u2028", "\\u2028"),
+        ("\u2029", "\\u2029"),
+        ("\u202a", "\\u202a"),
+        ("\u202e", "\\u202e"),
+        ("\u2066", "\\u2066"),
+        ("\u2069", "\\u2069"),
+        ("\udcff", "\\udcff"),
+    ],
+)
+def test_invisible_and_bidi_characters_are_escaped(char: str, expected: str) -> None:
+    assert bounded_warnings([f"a{char}b"]) == [f"a{expected}b"]
+
+
+def test_ordinary_text_stays_as_is() -> None:
+    assert bounded_warnings(["café 中"]) == ["café 中"]
+
+
+@pytest.mark.parametrize("char", ["\x01", "\u202e", "\udcff"])
+def test_truncation_never_cuts_an_escape_in_half(char: str) -> None:
+    for pad in range(WARNING_MAX_CHARS - 12, WARNING_MAX_CHARS):
+        (out,) = bounded_warnings(["a" * pad + char * 5]) or [""]
+        assert len(out) <= WARNING_MAX_CHARS
+        body = out[:-3] if out.endswith("...") else out
+        assert body.startswith("a" * min(pad, len(body)))
+        tail = body[pad:]
+        # whatever remains of the run is whole escape sequences
+        assert tail == "" or all(
+            part in ("\\x01", "\\u202e", "\\udcff") for part in tail.replace("\\", " \\").split()
+        )

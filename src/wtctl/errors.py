@@ -76,20 +76,47 @@ REFUSAL_REASONS = frozenset(
 # `details.warnings` of bootstrap_failed (schemas/cli/error.json): bounded in count and length.
 WARNINGS_MAX = 50
 WARNING_MAX_CHARS = 1024
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def _escape_char(ch: str) -> str:
+    """One character as it appears in a warning: control, C1, line/paragraph separator and bidi
+    characters as ``\\xNN`` / ``\\uXXXX``, lone surrogates (names that are not UTF-8) as
+    ``\\udcXX``; anything else unchanged."""
+    code = ord(ch)
+    if 0xD800 <= code <= 0xDFFF or code > 0xFF and _CONTROL.match(ch):
+        return f"\\u{code:04x}"
+    if _CONTROL.match(ch):
+        return f"\\x{code:02x}"
+    return ch
+
+
+def _bounded_text(text: str) -> str:
+    """Escape ``text`` and cut it at ``WARNING_MAX_CHARS`` on an escape boundary."""
+    parts = [_escape_char(ch) for ch in text]
+    if sum(map(len, parts)) <= WARNING_MAX_CHARS:
+        return "".join(parts)
+    out: list[str] = []
+    used = 0
+    for part in parts:
+        if used + len(part) > WARNING_MAX_CHARS - 3:
+            break
+        out.append(part)
+        used += len(part)
+    return "".join(out) + "..."
 
 
 def bounded_warnings(warnings: Sequence[str]) -> list[str] | None:
-    """The run's warnings as ``details.warnings``: at most ``WARNINGS_MAX`` entries of at most
-    ``WARNING_MAX_CHARS`` characters, control characters escaped (``\\xNN``) and lone surrogates
-    (names that are not UTF-8) made printable; None when there are none."""
-    out: list[str] = []
-    for text in warnings[:WARNINGS_MAX]:
-        text = text.encode("utf-8", "backslashreplace").decode("utf-8")
-        text = _CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
-        if len(text) > WARNING_MAX_CHARS:
-            text = text[: WARNING_MAX_CHARS - 3] + "..."
-        out.append(text)
+    """The run's warnings as ``details.warnings``: at most ``WARNINGS_MAX`` entries (when there
+    are more, the first ``WARNINGS_MAX - 1`` and a last entry counting the rest) of at most
+    ``WARNING_MAX_CHARS`` characters, control, C1, separator and bidi characters escaped and lone
+    surrogates made printable, never cut inside an escape; None when there are none."""
+    if len(warnings) > WARNINGS_MAX:
+        kept = list(warnings[: WARNINGS_MAX - 1])
+        kept.append(f"{len(warnings) - len(kept)} more warnings omitted")
+    else:
+        kept = list(warnings)
+    out = [_bounded_text(text) for text in kept]
     return out or None
 
 
