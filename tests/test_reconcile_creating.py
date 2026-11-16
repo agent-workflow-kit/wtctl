@@ -35,7 +35,11 @@ def test_a_worktree_the_creator_left_intact_is_adopted_after_the_crash(w: RC) ->
     crash_after_add(w, rec)
     data = w.reconciled()
     assert w.actions(data) == [(rec["id"], "creating", "active", "adopt_after_crash")]
-    assert data["reports"][0] == {"kind": "adopted_after_crash", "id": rec["id"], "path": rec["path"]}
+    assert data["reports"][0] == {
+        "kind": "adopted_after_crash",
+        "id": rec["id"],
+        "path": rec["path"],
+    }
     row = w.row(rec["id"])
     assert row["state"] == "active" and row["admin_dir"] == rec["admin_dir"]
     assert row["dir_id"] == rec["dir_id"] and row["bootstrap_state"] == "interrupted"

@@ -73,7 +73,7 @@ class Pruner:
     def candidates(self, age: int | None) -> list[Record]:
         """Throwaways to try, oldest first: every ``partial`` one, and the ``active`` ones older
         than ``age``. ``creating`` ones belong to a live (or dead) creator, which reconcile
-        settles (TODO(#23): until it lands, a killed creator's record stays); nothing here
+        settles; nothing here
         touches them."""
         cutoff = self.cutoff = None if age is None else self.state.timestamp_before(age)
         found = self.state.records(

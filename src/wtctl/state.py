@@ -642,6 +642,7 @@ class State:
         baseline_items: Sequence[Mapping[str, Any]] | None = updates.pop("baseline_items", None)
         anchor: tuple[str, str] | None = updates.pop("rerecord_anchor", None)
         clone: tuple[str, str, str] | None = updates.pop("rebind_clone", None)
+        moved: tuple[str, str, str, str, str] | None = updates.pop("move_clone", None)
         exp = [expected] if isinstance(expected, str) else list(expected)
         for s in exp:
             _check_state(s)
@@ -685,6 +686,8 @@ class State:
                 self._write_anchor(c, *anchor)
             if clone is not None:
                 self._rebind_clone(c, *clone)
+            if moved is not None:
+                self._move_clone(c, *moved)
         got = self.get_record(record_id)
         assert got is not None
         return got
@@ -914,6 +917,10 @@ class State:
             )
             return cur.rowcount == 1
 
+    def clone_paths(self) -> list[str]:
+        """The path of every ``clones`` row."""
+        return [r[0] for r in self._conn.execute("SELECT path FROM clones WHERE path IS NOT NULL")]
+
     def mirror_paths(self) -> set[str]:
         """Every ``mirror_path`` some clone row names."""
         rows = self._conn.execute("SELECT mirror_path FROM clones WHERE mirror_path IS NOT NULL")
@@ -982,6 +989,23 @@ class State:
             "ON CONFLICT(path) DO UPDATE SET dev_ino = excluded.dev_ino, "
             "recorded_at = excluded.recorded_at",
             (path, dev_ino, self._now()),
+        )
+
+    def _move_clone(
+        self,
+        c: sqlite3.Connection,
+        repo: str,
+        old_common_dir: str,
+        path: str,
+        common_dir: str,
+        common_id: str,
+    ) -> None:
+        """Point the repo's ``clones`` row at a moved clone, only while it still names the old
+        one; the mirror path is derived anew by the next refresh (the old mirror is orphaned)."""
+        c.execute(
+            "UPDATE clones SET path = ?, common_dir = ?, common_id = ?, mirror_path = NULL, "
+            "verified_at = ? WHERE repo = ? AND common_dir = ?",
+            (path, common_dir, common_id, self._now(), repo, old_common_dir),
         )
 
     def _rebind_clone(

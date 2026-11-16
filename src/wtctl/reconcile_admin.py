@@ -33,7 +33,10 @@ class Verdict:
 
 def entry_args(rec: dict[str, Any]) -> dict[str, Any]:
     return {
-        "anchor": {"path": rec["common_dir"], "identity": removalfs.identity_list(rec["common_id"])},
+        "anchor": {
+            "path": rec["common_dir"],
+            "identity": removalfs.identity_list(rec["common_id"]),
+        },
         "chain": ["worktrees"],
         "name": os.path.basename(rec["admin_dir"]),
     }
@@ -46,9 +49,7 @@ def inspect(rec: dict[str, Any], budget: fsafe_child.Budget) -> dict[str, Any] |
     return res.error or fsafe.FsafeError("deadline", "admin_inspect did not finish")
 
 
-def another_entry_names(
-    rec: dict[str, Any], budget: fsafe_child.Budget
-) -> bool | fsafe.FsafeError:
+def another_entry_names(rec: dict[str, Any], budget: fsafe_child.Budget) -> bool | fsafe.FsafeError:
     """Whether some entry of the clone's ``worktrees`` directory names the record's path."""
     args = entry_args(rec)
     args.pop("name")
@@ -165,11 +166,11 @@ def decide(
 
     if not reachable_locally(git, common, head) and not pushed(head):
         return Verdict(
-            "kept_unpushed", head, "the HEAD of the admin entry is neither on a local branch nor pushed"
+            "kept_unpushed",
+            head,
+            "the HEAD of the admin entry is neither on a local branch nor pushed",
         )
-    inp = removal_content.Inputs(
-        git=git, state=state, record=rec, config=config, disposable=[]
-    )
+    inp = removal_content.Inputs(git=git, state=state, record=rec, config=config, disposable=[])
     entries = removal_content.read_reflog(inp)
     start = removal_content._epoch(rec["reflog_start_ts"] or "")
     seen = (

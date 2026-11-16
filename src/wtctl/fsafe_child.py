@@ -418,7 +418,9 @@ def op_extract_read(args: dict[str, object]) -> dict[str, object]:
     return extraction.read_op(args)
 
 
-def _read_small(anchor: fsafe.Anchor, dir_fd: int, name: str, limit: int = ADMIN_READ) -> str | None:
+def _read_small(
+    anchor: fsafe.Anchor, dir_fd: int, name: str, limit: int = ADMIN_READ
+) -> str | None:
     """A small regular file of ``dir_fd`` (no-follow), or None when it is absent or not one."""
     try:
         fd = fsafe.open_file(anchor, dir_fd, name)
@@ -486,6 +488,7 @@ def op_admin_inspect(args: dict[str, object]) -> dict[str, object]:
             return {"state": "absent"}
         fd = fsafe.open_dir(anchor, parent, name, owner_uid=os.geteuid())
         try:
+
             def exists(entry: str) -> bool:
                 try:
                     anchor.fs.lstat_at(fd, entry)
@@ -570,6 +573,7 @@ def op_repair_pointers(args: dict[str, object]) -> dict[str, object]:
         and isinstance(common, dict)
     ):
         raise fsafe.FsafeError("bad_request", "admin, path, admin_dir and common are required")
+    accept = args.get("accept_dotgit")
     uid = os.geteuid()
     want_dotgit = f"gitdir: {admin_dir}\n".encode()
     want_gitdir = f"{path}/.git\n".encode()
@@ -583,8 +587,9 @@ def op_repair_pointers(args: dict[str, object]) -> dict[str, object]:
                 canchor, canchor.fd, ["worktrees", name], owner_uid=uid, start_path=canchor.path
             )
             try:
+                ok_names = {admin_dir} | ({accept} if isinstance(accept, str) else set())
                 return _repair(wanchor, wfd, canchor, afd, want_dotgit, want_gitdir,
-                               admin_dir, bool(args.get("write", True)))  # fmt: skip
+                               ok_names, bool(args.get("write", True)))  # fmt: skip
             finally:
                 os.close(afd)
         finally:
@@ -601,7 +606,7 @@ def _repair(
     afd: int,
     want_dotgit: bytes,
     want_gitdir: bytes,
-    admin_dir: str,
+    ok_names: set[str],
     write: bool,
 ) -> dict[str, object]:
     try:
@@ -612,7 +617,7 @@ def _repair(
         if fsafe.kind_of_mode(st.mode) != "file":
             raise fsafe.FsafeError("not_regular", ".git is not a regular file", path=".git")
         text = _read_small(wanchor, wfd, ".git")
-        if text is None or _strip_nl(text) != f"gitdir: {admin_dir}":
+        if text is None or _strip_nl(text) not in {f"gitdir: {n}" for n in ok_names}:
             raise fsafe.FsafeError("identity", ".git names another git directory", path=".git")
         have_dotgit = text.encode("utf-8", "surrogateescape")
     have_gitdir = _read_small(canchor, afd, "gitdir")
@@ -626,7 +631,6 @@ def _repair(
             fsafe.write_file_atomic(afd, "gitdir", want_gitdir)
         wrote.append("gitdir")
     return {"state": "written" if write else "would_write", "wrote": wrote}
-
 
 
 OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {

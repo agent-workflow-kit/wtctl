@@ -64,7 +64,9 @@ class Reconciler:
         self.warnings: list[str] = []
         self.budget = fsafe_child.Budget()
         self._tips: dict[str, tuple[Mirror | None, Tips | None]] = {}
-        self.grace = parse_duration(self.config.reconcile.missing_grace, flag="reconcile.missing_grace")
+        self.grace = parse_duration(
+            self.config.reconcile.missing_grace, flag="reconcile.missing_grace"
+        )
 
     # -- output ---------------------------------------------------------------------------------
 
@@ -256,7 +258,11 @@ class Reconciler:
                 try:
                     pfd = fsafe.open_chain(anchor, anchor.fd, parts[:-1], start_path=anchor.path)
                 except fsafe.FsafeError as exc:
-                    return ("absent", None) if exc.kind in ("missing", "not_dir") else ("unknown", None)
+                    return (
+                        ("absent", None)
+                        if exc.kind in ("missing", "not_dir")
+                        else ("unknown", None)
+                    )
                 try:
                     try:
                         anchor.fs.lstat_at(pfd, parts[-1])
@@ -367,7 +373,7 @@ class Reconciler:
             self.config, self.state, self.git, rec, self.budget
         )
         if candidate is not None:
-            self.report("moved_clone", id=rec["id"], clone_path=candidate)
+            self.report("moved_clone", id=rec["id"], clone_path=candidate.clone_path)
         else:
             self.report("clone_missing", id=rec["id"], clone_path=rec["clone_path"] or "/")
 
@@ -399,9 +405,7 @@ class Reconciler:
             self.unlinked(rec, "the clone is busy; the pointers were not rewritten")
             return
         with lease:
-            why = reconcile_probe.repair_pointers(
-                self.state, rec, self.budget, write=not self.dry
-            )
+            why = reconcile_probe.repair_pointers(self.state, rec, self.budget, write=not self.dry)
             if why is not None:
                 self.unlinked(rec, why)
                 return
@@ -410,9 +414,7 @@ class Reconciler:
                 if after["status"] != "pass":
                     self.unlinked(rec, "still mismatched after the pointers were rewritten")
                     return
-        self.move(
-            rec, WORKTREE_STATES, "active", "repair", missing_since=None, missing_seen=None
-        )
+        self.move(rec, WORKTREE_STATES, "active", "repair", missing_since=None, missing_seen=None)
 
     # -- missing --------------------------------------------------------------------------------
 
@@ -563,7 +565,12 @@ class Reconciler:
         for rec in self.state.expired_tombstones(cutoff):
             if self.dry or self.state.delete_tombstone(rec["id"], cutoff=cutoff):
                 self.changes.append(
-                    {"id": rec["id"], "from": rec["state"], "to": None, "action": "tombstone_delete"}
+                    {
+                        "id": rec["id"],
+                        "from": rec["state"],
+                        "to": None,
+                        "action": "tombstone_delete",
+                    }
                 )
 
     def strays(self) -> None:
@@ -574,8 +581,5 @@ class Reconciler:
         clones = [
             c for c in (self.config.repo(r).clone for r in self.config.repos) if c is not None
         ]
-        self.reports += reconcile_strays.clone_tmp_strays(
-            self.config.effective_clone_root, clones
-        )
+        self.reports += reconcile_strays.clone_tmp_strays(self.config.effective_clone_root, clones)
         self.reports += reconcile_strays.mirror_strays(self.state)
-

@@ -7,5 +7,4 @@ Handlers still to come:
 
 - TODO(#11): locate, clone
 - TODO(#19): status
-- TODO(#23): reconcile
 """

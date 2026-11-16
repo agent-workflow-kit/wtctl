@@ -17,6 +17,15 @@ from .locate import Resolver
 
 
 @dataclass
+class Moved:
+    """A re-resolved clone whose admin entry names the record's worktree."""
+
+    clone_path: str
+    common_dir: str
+    common_id: str
+
+
+@dataclass
 class DirProbe:
     status: str  # present | absent | unknown
     detail: str = ""
@@ -76,8 +85,8 @@ def probe_clone(rec: dict[str, Any]) -> str:
 
 def moved_candidate(
     ctx_config: Any, state: Any, git: Any, rec: dict[str, Any], budget: fsafe_child.Budget
-) -> str | None:
-    """The clone path a re-resolution (no auto-clone) finds for the record's repo when that clone
+) -> Moved | None:
+    """The clone a re-resolution (no auto-clone) finds for the record's repo when that clone
     names the record's worktree; otherwise None. Nothing is recorded or changed."""
     try:
         res, _ = Resolver(ctx_config, state, git, readonly=True).find(rec["repo"])
@@ -86,7 +95,11 @@ def moved_candidate(
     if res is None or res.common_dir == rec["common_dir"]:
         return None
     if rec["admin_dir"] is None:
-        return res.clone_path if res.clone_path == rec["path"] else None
+        return (
+            Moved(res.clone_path, res.common_dir, res.common_id)
+            if res.clone_path == rec["path"]
+            else None
+        )
     args = {
         "anchor": {"path": res.common_dir, "identity": None},
         "chain": ["worktrees"],
@@ -96,15 +109,25 @@ def moved_candidate(
     if not got.ok or got.value is None or got.value.get("state") != "present":
         return None
     named = got.value.get("gitdir")
-    return res.clone_path if named == os.path.join(rec["path"], ".git") else None
+    if named != os.path.join(rec["path"], ".git"):
+        return None
+    return Moved(res.clone_path, res.common_dir, res.common_id)
 
 
-def repair_args(state: Any, rec: dict[str, Any], *, write: bool) -> dict[str, Any]:
+def repair_args(
+    state: Any,
+    rec: dict[str, Any],
+    *,
+    write: bool,
+    accept_dotgit: str | None = None,
+    allow_adopted: bool = False,
+) -> dict[str, Any]:
     """The ``repair_pointers`` request for an owned linked worktree: the worktree directory from
     its recorded root with the recorded ``dir_id``, the admin entry from the recorded common dir
     with the recorded ``common_id``."""
     base = rec.get("base_dir")
-    if not rec.get("owned") or not base or not rec.get("admin_dir") or not rec.get("dir_id"):
+    owned_ok = rec.get("owned") and base
+    if not (owned_ok or allow_adopted) or not rec.get("admin_dir") or not rec.get("dir_id"):
         raise fsafe.FsafeError("identity", f"{rec['id']} cannot be repaired by wtctl")
     walk = removalfs.walk_args(state, rec)
     admin = rec["admin_dir"]
@@ -120,15 +143,26 @@ def repair_args(state: Any, rec: dict[str, Any], *, write: bool) -> dict[str, An
         "admin_dir": admin,
         "path": rec["path"],
         "write": write,
+        "accept_dotgit": accept_dotgit,
     }
 
 
 def repair_pointers(
-    state: Any, rec: dict[str, Any], budget: fsafe_child.Budget, *, write: bool
+    state: Any,
+    rec: dict[str, Any],
+    budget: fsafe_child.Budget,
+    *,
+    write: bool,
+    accept_dotgit: str | None = None,
+    allow_adopted: bool = False,
 ) -> str | None:
-    """Rewrite the pointers; None on success, else why nothing (more) was written."""
+    """Rewrite the pointers; None on success, else why nothing (more) was written.
+    ``accept_dotgit`` is a previous admin directory a ``.git`` file may still name (a clone that
+    moved)."""
     try:
-        args = repair_args(state, rec, write=write)
+        args = repair_args(
+            state, rec, write=write, accept_dotgit=accept_dotgit, allow_adopted=allow_adopted
+        )
     except fsafe.FsafeError as exc:
         return exc.message
     res = removalfs.run("repair_pointers", args, budget)

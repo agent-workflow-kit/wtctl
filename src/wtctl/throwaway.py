@@ -10,7 +10,8 @@ recorded before anything is written into it, and every step that writes by path 
 
 A failure at any step deletes the directory (fd-based, as ``remove`` does) and the record; a
 directory that cannot be deleted leaves the record ``partial`` so ``prune`` retries it. A creator
-that is killed leaves a ``creating`` record for ``reconcile`` (TODO(#23)).
+that is killed leaves a ``creating`` record for
+``reconcile``, which deletes the directory fd-based or reports it.
 """
 
 from __future__ import annotations
@@ -417,8 +418,8 @@ class ThrowawayCreator:
 
     def _insert(self, root_id: str | None) -> tuple[Record, Lease]:
         assert root_id is not None
-        # TODO(#23): a creator killed outright after this insert leaves a `creating` record and
-        # possibly a directory; `reconcile` settles it (prune never touches `creating` records).
+        # A creator killed outright after this insert leaves a `creating` record and possibly a
+        # directory; `reconcile` settles it (prune never touches `creating` records).
         try:
             return self.state.insert_record_leased(self._fields(root_id), labels=self.o.labels)
         except Conflict as exc:
@@ -737,7 +738,8 @@ class ThrowawayCreator:
             if outcome.status == "deleted":
                 self.state.delete_record(record["id"], expected="creating")
             elif outcome.status == "partial":
-                # TODO(#23): `reconcile` reports a `partial`/`gone` leftover of a failed create.
+                # `prune` retries the `partial` record; a `gone` leftover is reported by `reconcile`
+                # as a stray.
                 self.state.transition(
                     record["id"], "creating", "partial",
                     last_error="creation failed and the directory could not be fully deleted",

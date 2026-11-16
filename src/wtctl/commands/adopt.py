@@ -7,7 +7,7 @@ like a worktree, or one of another clone, is refused). The baseline is recorded 
 in one transaction; git runs only through the hardened runner.
 
 TODO(#5): audit ``adopt`` (path, digest, holder) and log it.
-TODO(#23): reconcile settles ``missing`` and ``unlinked`` adopted records (``adopted_gone``).
+``reconcile`` settles ``missing`` and ``unlinked`` adopted records (``adopted_gone``).
 """
 
 from __future__ import annotations

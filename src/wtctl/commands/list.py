@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import re
 from typing import Any
 
 from ..context import Context, Result
 from ..duration import parse_duration
 from ..errors import UsageError
+from ..gitsetup import open_git
 from ..output import render_table
 from ..record_view import record_object
 from ..state import STATES, Record
@@ -18,6 +20,7 @@ _REPO_ID = re.compile(
     r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)+"
 )
 
+_SHA = re.compile(r"[0-9a-f]{40}")
 HEADERS = ("ID", "TYPE", "STATE", "REPO", "NAME/REF", "BRANCH", "AGE")
 
 
@@ -51,6 +54,55 @@ def _row(record: Record, now: dt.datetime) -> tuple[str, ...]:
     )
 
 
+def _clone_dirs(ctx: Context) -> list[str]:
+    """Clones wtctl has a row, a live record or a configured path for (existing directories)."""
+    found: set[str] = set()
+    for row in ctx.state.clone_paths():
+        found.add(row)
+    found.update(r["clone_path"] for r in ctx.state.records() if r["clone_path"])
+    for repo in ctx.config.repos:
+        configured = ctx.config.repo(repo).clone
+        if configured:
+            found.add(configured)
+    return sorted(p for p in found if os.path.isdir(os.path.join(p, ".git")))
+
+
+def foreign_worktrees(ctx: Context) -> list[dict[str, Any]]:
+    """Worktrees git lists for those clones that have no live record. Everything read from the
+    clone is untrusted; only hardened git runs there."""
+    git = open_git(ctx.config, ctx.gateway)
+    recorded = {r["path"] for r in ctx.state.records()}
+    out: list[dict[str, Any]] = []
+    for clone in _clone_dirs(ctx):
+        common = os.path.join(clone, ".git")
+        r = git.run(["worktree", "list", "--porcelain"], git_dir=common, cwd=common, timeout=60)
+        if r.returncode != 0 or r.timed_out:
+            continue
+        block: dict[str, str] = {}
+        for line in [*r.out.split("\n"), ""]:
+            if line:
+                key, _, value = line.partition(" ")
+                block[key] = value
+                continue
+            path = block.get("worktree", "")
+            if path.startswith("/") and "bare" not in block and path not in recorded:
+                ref = block.get("branch", "")
+                head = block.get("HEAD", "")
+                out.append(
+                    {
+                        "foreign": True,
+                        "path": path,
+                        "branch": ref[len("refs/heads/") :]
+                        if ref.startswith("refs/heads/")
+                        else None,
+                        "head": head if _SHA.fullmatch(head) else None,
+                        "clone_path": clone,
+                    }
+                )
+            block = {}
+    return out
+
+
 def run(ctx: Context) -> Result:
     args = ctx.args
     # Usage checks first (check order stage 1), before state.db is opened.
@@ -79,7 +131,6 @@ def run(ctx: Context) -> Result:
         newest_first=True,
     )
     records: list[dict[str, Any]] = [record_object(ctx.state, r) for r in found]
-    # TODO(#23): with --all, add the foreign worktrees reconcile discovers (empty until it lands).
-    foreign: list[dict[str, Any]] = []
+    foreign = foreign_worktrees(ctx) if args.all else []
     human = render_table(HEADERS, [_row(r, now) for r in found]) if found else ""
     return Result(data={"records": records, "foreign": foreign}, human=human)

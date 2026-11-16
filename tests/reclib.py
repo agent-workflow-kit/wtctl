@@ -1,4 +1,4 @@
-"""A world for the reconcile tests: worktrees and throwaways, a fake clock and a reconcile runner."""
+"""A world for the reconcile tests: worktrees, throwaways, a fake clock and a runner."""
 
 from __future__ import annotations
 

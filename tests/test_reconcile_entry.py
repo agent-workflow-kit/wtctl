@@ -107,7 +107,9 @@ def test_an_entry_that_is_already_gone(w: RC) -> None:
     data = w.reconciled()
     assert w.actions(data) == [(rec["id"], "missing", "gone", "mark_gone")]
     rep = data["reports"][0]
-    assert rep["kind"] == "gone" and rep["admin_entry"] == "absent" and rep["branch"] == rec["branch"]
+    assert (
+        rep["kind"] == "gone" and rep["admin_entry"] == "absent" and rep["branch"] == rec["branch"]
+    )
     assert f"refs/heads/{rec['branch']}" in w.refs()
 
 
@@ -134,10 +136,11 @@ def test_partial_records_are_left_for_a_human(w: RC) -> None:
     rec = w.wt()
     w.update("UPDATE records SET state='partial', last_error='x' WHERE id=?", rec["id"])
     w.vanish(rec)
+    changes = []
     for _ in range(3):
-        data = w.reconciled()
+        changes += w.reconciled()["changes"]
         w.clock.advance(3 * 3600)
-    assert data["changes"] == [] and Path(rec["admin_dir"]).is_dir()
+    assert changes == [] and Path(rec["admin_dir"]).is_dir()
     assert w.row(rec["id"])["state"] == "partial"
 
 
