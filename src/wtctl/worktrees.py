@@ -448,3 +448,26 @@ def _stash_ids(git: Git, common_dir: str) -> list[str]:
     if r.returncode != 0 or r.timed_out:
         raise create_failed("cannot read the clone's stash entries")
     return [ln for ln in r.out.split() if SHA.fullmatch(ln)]
+
+
+@dataclass(frozen=True)
+class Existing:
+    branch: str | None  # the checked-out local branch (None when detached)
+    head: str
+    reflog_start_sha: str | None
+    stash_ids: list[str]
+
+
+def inspect_existing(git: Git, common_dir: str, admin_dir: str | None) -> Existing:
+    """Read a worktree wtctl did not create (``adopt``): HEAD, the branch, the HEAD reflog's last
+    entry and the clone's stash entries. ``admin_dir`` is None for the main worktree, whose git
+    directory is the common dir. An unborn HEAD is refused (``create_failed``)."""
+    gdir = admin_dir or common_dir
+    h = git.run(["rev-parse", "--verify", "HEAD"], git_dir=gdir, cwd=gdir, timeout=60)
+    head = h.out.strip()
+    if h.returncode != 0 or not SHA.fullmatch(head):
+        raise create_failed("cannot read HEAD (an unborn branch cannot be adopted)")
+    s = git.run(["symbolic-ref", "-q", "HEAD"], git_dir=gdir, cwd=gdir, timeout=60)
+    ref = s.out.strip() if s.returncode == 0 else ""
+    branch = ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else None
+    return Existing(branch or None, head, _reflog_last(gdir), _stash_ids(git, common_dir))

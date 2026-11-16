@@ -75,12 +75,16 @@ def test_abbreviated_flags_are_not_accepted(capsys: pytest.CaptureFixture[str]) 
     assert run_cli(capsys, "remove", SID, "--forc", "--actor", "human:a").code == 2
 
 
-@pytest.mark.parametrize("key", sorted(MINIMAL))
+def _implemented(key: str) -> bool:
+    return importlib.util.find_spec(f"wtctl.commands.{key}") is not None
+
+
+@pytest.mark.parametrize("key", sorted(k for k in MINIMAL if not _implemented(k)))
 def test_unimplemented_commands_exit_1_internal(
     capsys: pytest.CaptureFixture[str], key: str
 ) -> None:
     if importlib.util.find_spec(f"wtctl.commands.{key}") is not None:
-        pytest.skip(f"{key} is implemented; its own tests cover it")
+        pytest.skip("implemented")
     r = run_cli(capsys, "--json", "--actor", "human:alice", *MINIMAL[key])
     assert r.code == 1
     obj = r.json()
@@ -208,9 +212,10 @@ def test_human_only_commands_exit_13_without_human_actor(
         assert obj["error"]["code"] == "confirmation_required"
 
 
-# `bootstrap` (#16) and `baseline accept` (#17) are implemented: their own tests cover the handlers.
+# `bootstrap` (#16), `baseline accept` (#17) and `forget` (#18) are implemented: their own tests
+# cover the handlers.
 @pytest.mark.parametrize(
-    "argv", [c for c in HUMAN_ONLY_COMMANDS if c[0] not in ("bootstrap", "baseline")]
+    "argv", [c for c in HUMAN_ONLY_COMMANDS if c[0] not in ("bootstrap", "baseline", "forget")]
 )
 @pytest.mark.parametrize(
     ("extra", "tty"), [(["--actor", "human:bob"], False), ([], True)], ids=["flag", "tty"]
@@ -225,7 +230,7 @@ def test_human_only_commands_reach_the_handler_with_a_human(
 
 def test_forget_with_holder_is_not_human_only(capsys: pytest.CaptureFixture[str]) -> None:
     r = run_cli(capsys, "--json", "forget", SID, "--holder", "h1")
-    assert r.code == 1  # reached the handler as an automated actor
+    assert r.code == 10  # reached the handler as an automated actor (no such record)
 
 
 def test_require_human_helper(
@@ -638,7 +643,7 @@ def test_default_config_seam_reads_the_private_config(
 def test_default_state_seam_raises_not_implemented_internal(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Behave as if the state module defined no seam function.
+    # Whatever modules exist now, behave as if state defined no seam function.
     monkeypatch.setattr("wtctl.context._seam", lambda module, attr: None)
     install_handler(monkeypatch, "list", lambda ctx: Result({"s": ctx.state}))
     r = run_cli(capsys, "--json", "list")
