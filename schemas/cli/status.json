@@ -16,7 +16,7 @@
         "boolean",
         "null"
       ],
-      "description": "What remove with the same flags, run by a human, would do: true, false (reason says why), or null when no refusal was found but the outcome could not be determined (the fetch failed; reason null)."
+      "description": "What remove with the same flags, run by a human, would do: true, false (reason says why), or null when no refusal was found but the outcome could not be determined (the fetch failed or was skipped, or no process scanner was available; reason null)."
     },
     "reason": {
       "enum": [

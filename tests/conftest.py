@@ -33,6 +33,16 @@ def no_dumpable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gateway, "disable_dumpable", lambda: True)
 
 
+@pytest.fixture
+def inproc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the baseline and removal-check child operations in this process (the real child path
+    has its own tests)."""
+    from wtctl import baselinesvc, removalfs, repobaseline
+
+    monkeypatch.setattr(baselinesvc, "RUNNER", repobaseline.inproc)
+    monkeypatch.setattr(removalfs, "RUNNER", repobaseline.inproc)
+
+
 @pytest.fixture(autouse=True)
 def no_real_crontab(monkeypatch: pytest.MonkeyPatch) -> None:
     """A default Gateway must never reach the user's real crontab; tests pass a fake."""

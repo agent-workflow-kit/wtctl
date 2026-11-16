@@ -958,9 +958,10 @@
                   "detail": {
                     "enum": [
                       "changed",
-                      "hidden_changes"
+                      "hidden_changes",
+                      "attributes"
                     ],
-                    "description": "changed: a staged, unstaged or conflicted change reported by git status; hidden_changes: the index entry has the assume-unchanged or skip-worktree bit (ls-files -v tag lowercase, S or s), which hides edits from git status (also every path outside a sparse-checkout cone; only a human --force removes such a worktree in v1)."
+                    "description": "attributes: the clone's info/attributes file (path info/attributes) is not empty; git applies it to every worktree and it can make an edit invisible to git status (only a human --force removes such a worktree in v1). changed: a staged, unstaged or conflicted change reported by git status, or a file, link or special file where a gitlink's directory belongs; hidden_changes: the index entry has the assume-unchanged or skip-worktree bit (ls-files -v tag lowercase, S or s), which hides edits from git status (also every path outside a sparse-checkout cone; only a human --force removes such a worktree in v1)."
                   }
                 },
                 "additionalProperties": false,
@@ -1159,7 +1160,7 @@
                       "mount_point",
                       "incomplete"
                     ],
-                    "description": "nested_repo: a .git found at path (not a recorded bootstrap_nested entry); submodule: the .git file of an initialized submodule (listed in .gitmodules at HEAD, pointing under <admin_dir>/modules/ or <common>/modules/; v1 has no recursive check, so only a human --force removes it); mount_point: a mount point below the worktree root (a directory on another device or, on Linux, another mount), which no walk crosses; incomplete: the walk exceeded remove.nested_scan_limit (path null)."
+                    "description": "nested_repo: a .git found at path (not a recorded bootstrap_nested entry); submodule: the .git file of an initialized submodule (listed in .gitmodules at HEAD, pointing under <admin_dir>/modules/ or <common>/modules/), files below a gitlink path that has no .git (path: the gitlink), or a git dir under <admin_dir>/modules or <common>/modules (path: its absolute path); v1 has no recursive check, so only a human --force removes it; mount_point: a mount point below the worktree root (a directory on another device or, on Linux, another mount), which no walk crosses; incomplete: the walk exceeded remove.nested_scan_limit (path null)."
                   },
                   "path": {
                     "type": [

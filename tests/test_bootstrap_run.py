@@ -253,24 +253,43 @@ def test_a_failed_nested_walk_still_charges_the_shared_budget(
     r: Repo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from wtctl import bootstrapper as b
-    from wtctl import fsafe
+    from wtctl import fsafe, fsafe_child, removalfs, repobaseline
 
     for d in ("a", "b"):
         for i in range(3):
             r.write(f"{d}/f{i}")
-    real = fsafe.walk_tree
-    calls = []
+    calls: list[int] = []
 
-    def flaky(*args, progress=None, **kw):  # noqa: ANN002, ANN003, ANN202
+    def flaky(op, args, **kw):  # noqa: ANN001, ANN003, ANN202
         calls.append(1)
         if len(calls) == 1:
-            assert progress is not None
-            progress[0] = 3
-            raise fsafe.FsafeError("io", "disk went away")
-        return real(*args, progress=progress, **kw)
+            return fsafe_child.OpResult(False, error=fsafe.FsafeError("io", "disk went away"))
+        return repobaseline.inproc(op, args)
 
-    monkeypatch.setattr(fsafe, "walk_tree", flaky)
+    monkeypatch.setattr(removalfs, "RUNNER", flaky)
     warns: list[str] = []
     with r.open() as wt:
         b.find_nested(wt, ["a", "b"], limit=5, warn=warns.append)
-    assert len(warns) == 2 and "(io)" in warns[0] and "(limit)" in warns[1]  # 3 + 3 > 5
+    # the failed walk used up the whole budget, so the second walk stops at once
+    assert len(warns) == 2 and "(io)" in warns[0] and "(limit)" in warns[1]
+
+
+def test_a_nested_walk_that_hits_its_deadline_warns_and_exempts_nothing(
+    r: Repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import bootstrapper as b
+    from wtctl import fsafe, fsafe_child, removalfs
+
+    r.write("a/f0")
+    (r.wt / "a" / "x" / ".git").mkdir(parents=True)
+    monkeypatch.setattr(
+        removalfs,
+        "RUNNER",
+        lambda op, args, **kw: fsafe_child.OpResult(
+            False, error=fsafe.FsafeError("deadline", "killed"), timed_out=True
+        ),
+    )
+    warns: list[str] = []
+    with r.open() as wt:
+        assert b.find_nested(wt, ["a"], limit=50, warn=warns.append) == []
+    assert len(warns) == 1 and "(deadline)" in warns[0]

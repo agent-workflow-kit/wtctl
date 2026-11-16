@@ -54,6 +54,7 @@ def test_env_is_built_from_scratch(monkeypatch: pytest.MonkeyPatch) -> None:
         "PATH", "HOME", "LC_ALL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
         "GIT_TERMINAL_PROMPT", "GIT_ALLOW_PROTOCOL", "GIT_NO_LAZY_FETCH",
         "GIT_NO_REPLACE_OBJECTS", "GIT_GRAFT_FILE", "GIT_SSH_VARIANT", "GIT_EDITOR",
+        "GIT_SHALLOW_FILE",
     }  # fmt: skip
     assert env["GIT_EDITOR"] == ":"
     assert env["PATH"] == "/opt/g/bin:/usr/bin:/bin"
@@ -61,6 +62,10 @@ def test_env_is_built_from_scratch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert env["GIT_NO_LAZY_FETCH"] == "1"
     assert env["GIT_CONFIG_GLOBAL"] == "/dev/null" and env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert env["GIT_GRAFT_FILE"] == "/dev/null/none" and env["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert env["GIT_SHALLOW_FILE"] == "/dev/null"
+    assert "GIT_SHALLOW_FILE" not in build_env(
+        git_bin="/opt/g/bin/git", home="/h", allow_shallow=True
+    )
     assert env["GIT_SSH_VARIANT"] == "ssh" and env["LC_ALL"] == "C"
 
 

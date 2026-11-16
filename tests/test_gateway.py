@@ -43,7 +43,7 @@ def test_fake_clock_and_scanner_can_be_substituted() -> None:
     proc = gateway.ProcessInfo(pid=7, command="sh", cwd="/w", open_paths=("/w/a",))
 
     class FakeScanner:
-        def scan(self) -> list[gateway.ProcessInfo]:
+        def scan(self, target: str | None = None) -> list[gateway.ProcessInfo]:
             return [proc]
 
     gw = gateway.Gateway(clock=FakeClock(), scanner=FakeScanner())
@@ -51,9 +51,15 @@ def test_fake_clock_and_scanner_can_be_substituted() -> None:
     assert gw.scanner.scan() == [proc]
 
 
-def test_default_scanner_reports_unavailable_until_implemented() -> None:
+def test_unavailable_scanner_fails_closed() -> None:
     with pytest.raises(gateway.ScannerUnavailable):
-        gateway.Gateway().scanner.scan()
+        gateway.UnavailableScanner().scan()
+
+
+def test_default_scanner_is_the_system_one() -> None:
+    from wtctl import procscan
+
+    assert isinstance(gateway.Gateway().scanner, procscan.ProcScanner | procscan.LsofScanner)
 
 
 def test_disable_dumpable_clears_the_flag_in_a_child_process() -> None:

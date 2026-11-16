@@ -650,7 +650,7 @@ def fill_local_throwaway(
         walk = ["rev-list", "--objects", *(["--no-walk"] if depth == 1 else []), sha]
         _checked(
             git.run(
-                walk, git_dir=clone_dir, cwd=clone_dir, stdout_path=listing,
+                walk, git_dir=clone_dir, cwd=clone_dir, allow_shallow=True, stdout_path=listing,
                 max_stdout_bytes=MAX_LIST_BYTES, timeout=timeout,
             ),
             "git rev-list in the clone",
@@ -659,6 +659,7 @@ def fill_local_throwaway(
         _checked(
             git.run(
                 ["pack-objects", "--stdout", "-q"], git_dir=clone_dir, cwd=clone_dir,
+                allow_shallow=True,
                 stdin_path=listing, stdout_path=pack, max_stdout_bytes=max_pack_bytes,
                 timeout=timeout,
             ),
@@ -675,24 +676,31 @@ def fill_local_throwaway(
                     os.close(fd)
         _checked(
             git.run(
-                ["index-pack", "--stdin", "--strict"], git_dir=tgit, cwd=tgit,
+                ["index-pack", "--stdin", "--strict"], git_dir=tgit, cwd=tgit, allow_shallow=True,
                 stdin_path=pack, timeout=timeout,
             ),
             "git index-pack in the throwaway",
         )  # fmt: skip
         _checked(
-            git.run(["update-ref", "--no-deref", "HEAD", sha], git_dir=tgit, cwd=tgit, timeout=60),
+            git.run(
+                ["update-ref", "--no-deref", "HEAD", sha],
+                git_dir=tgit,
+                cwd=tgit,
+                allow_shallow=True,
+                timeout=60,
+            ),
             "git update-ref in the throwaway",
         )
         _checked(
             git.run(
                 ["read-tree", "-u", "--reset", "HEAD"], git_dir=tgit, work_tree=t, cwd=t,
+                allow_shallow=True,
                 honor_filters=honor_filters, timeout=timeout,
             ),
             "git read-tree in the throwaway",
         )  # fmt: skip
         head = _checked(
-            git.run(["rev-parse", "HEAD"], git_dir=tgit, cwd=tgit, timeout=60),
+            git.run(["rev-parse", "HEAD"], git_dir=tgit, cwd=tgit, allow_shallow=True, timeout=60),
             "git rev-parse in the throwaway",
         )
         if head.out.strip() != sha:

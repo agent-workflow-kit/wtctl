@@ -543,6 +543,13 @@ class ProcessInfo:
     command: str
     cwd: str | None
     open_paths: tuple[str, ...] = ()
+    # What the in-use check needs beyond paths (Linux; None where the scanner cannot tell):
+    cwd_id: tuple[int, int] | None = None  # (st_dev, st_ino) of the cwd directory
+    ppid: int | None = None
+    start: str | None = None  # opaque start time, as ``ProcessIdentity.start_time`` reports it
+    inspected: bool = True  # False: other user or unreadable entries
+    other_user: bool = False  # not inspected because it belongs to another user (a process of
+    # the invoking user that could not be inspected is what makes the in-use check unavailable)
 
 
 class ScannerUnavailable(Exception):
@@ -550,15 +557,23 @@ class ScannerUnavailable(Exception):
 
 
 class ProcessScanner(Protocol):
-    def scan(self) -> list[ProcessInfo]: ...
+    def scan(self, target: str | None = None) -> list[ProcessInfo]:
+        """Every process of the invoking user (``target``: the directory the caller will match
+        open files against, for scanners that must be told, such as ``lsof +D``)."""
+        ...
 
 
 class UnavailableScanner:
-    """Placeholder until the in-use detection lands: scanning always fails closed."""
+    """A scanner that always fails closed (no ``/proc`` and no ``lsof``; tests)."""
 
-    # TODO(#19): read /proc (Linux) or run lsof (macOS) here.
-    def scan(self) -> list[ProcessInfo]:
-        raise ScannerUnavailable("process scanning is not implemented yet")
+    def scan(self, target: str | None = None) -> list[ProcessInfo]:
+        raise ScannerUnavailable("process scanning is not available")
+
+
+def _default_scanner() -> ProcessScanner:
+    from .procscan import system_scanner
+
+    return system_scanner()
 
 
 class ProcessUnreadable(Exception):
@@ -634,7 +649,7 @@ def system_process_identity() -> ProcessIdentity:
 class Gateway:
     clock: Clock = field(default_factory=SystemClock)
     procs: ProcessIdentity = field(default_factory=system_process_identity)
-    scanner: ProcessScanner = field(default_factory=UnavailableScanner)
+    scanner: ProcessScanner = field(default_factory=_default_scanner)
     runner: Callable[..., subprocess.CompletedProcess[str]] = run
     git_runner: Callable[..., GitResult] = run_git
     token_runner: Callable[..., TokenCommandResult] = run_token_command

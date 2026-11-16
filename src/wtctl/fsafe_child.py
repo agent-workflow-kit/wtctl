@@ -156,6 +156,103 @@ def op_delete_tree(args: dict[str, object]) -> dict[str, object]:
     }
 
 
+def op_dir_ids(args: dict[str, object]) -> dict[str, object]:
+    """``(st_dev, st_ino)`` of the walk root and every directory below it, as a flat list
+    ``[dev, ino, dev, ino, ...]`` (the in-use detection matches process cwds against them).
+
+    A walk that reaches ``limit`` stops with ``complete: false`` (what it listed still counts)."""
+    limit = args.get("limit", fsafe.DEFAULT_SCAN_LIMIT)
+    if not isinstance(limit, int):
+        raise fsafe.FsafeError("bad_request", "limit must be an integer")
+    anchor, root, root_path = _open_root(args, parent=False)
+    ids: list[int] = []
+    complete = True
+    mounts = 0
+    try:
+        st = anchor.fs.fstat(root)
+        ids += [st.dev, st.ino]
+        try:
+            for e in fsafe.walk_tree(
+                anchor, root, limit=limit, dirs_only=True, root_path=root_path
+            ):
+                if e.kind == "dir":
+                    ids += [e.dev, e.ino]
+                elif e.kind == "mount":
+                    mounts += 1
+                elif e.kind in ("unreadable", "changed"):
+                    complete = False
+        except fsafe.FsafeError as exc:
+            if exc.kind != "limit":
+                raise
+            complete = False
+    finally:
+        os.close(root)
+        anchor.close()
+    return {"ids": ids, "complete": complete, "mounts": mounts}
+
+
+NESTED_READ = 4096  # bytes of a nested ``.git`` file kept (a ``gitdir:`` pointer)
+
+
+def _read_pointer(
+    anchor: fsafe.Anchor, root: int, root_path: str, path: tuple[str, ...]
+) -> str | None:
+    try:
+        parent = fsafe.open_chain(anchor, root, list(path[:-1]), start_path=root_path)
+    except fsafe.FsafeError:
+        return None
+    try:
+        fd = fsafe.open_file(anchor, parent, path[-1])
+        try:
+            return os.read(fd, NESTED_READ).decode("utf-8", "surrogateescape")
+        finally:
+            os.close(fd)
+    except (fsafe.FsafeError, OSError):
+        return None
+    finally:
+        os.close(parent)
+
+
+def op_nested_scan(args: dict[str, object]) -> dict[str, object]:
+    """Every ``.git`` (or alias of that name) below the walk root, without descending into it.
+
+    Reports ``gits`` (path, kind, and for a regular file the start of its content), ``mounts``
+    (mount points below the root, never crossed) and ``unreadable`` (entries the walk could not
+    read: the scan is incomplete). More than ``limit`` entries raises ``FsafeError("limit")``."""
+    limit = args.get("limit", fsafe.DEFAULT_SCAN_LIMIT)
+    if not isinstance(limit, int):
+        raise fsafe.FsafeError("bad_request", "limit must be an integer")
+    anchor, root, root_path = _open_root(args, parent=False)
+    gits: list[dict[str, object]] = []
+    mounts: list[list[str]] = []
+    unreadable: list[list[str]] = []
+    count = 0
+    try:
+        for e in fsafe.walk_tree(
+            anchor,
+            root,
+            limit=limit,
+            descend=lambda ent: not fsafe.is_dotgit(ent.path[-1]),
+            root_path=root_path,
+        ):
+            count += 1
+            if e.kind == "mount":
+                mounts.append(list(e.path))
+            elif e.kind in ("unreadable", "changed"):
+                unreadable.append(list(e.path))
+            elif fsafe.is_dotgit(e.path[-1]):
+                content = (
+                    _read_pointer(anchor, root, root_path, e.path)
+                    if e.kind == "file" and len(e.path) > 1
+                    else None
+                )
+                gits.append({"path": list(e.path), "kind": e.kind, "content": content})
+    finally:
+        os.close(root)
+        anchor.close()
+    return {"count": count, "gits": gits, "mounts": mounts, "unreadable": unreadable}
+
+
 def op_baseline_git(args: dict[str, object]) -> dict[str, object]:
     """The ``git``-class repo-config baseline items (``wtctl.repobaseline``)."""
     from wtctl import repobaseline
@@ -173,6 +270,8 @@ def op_baseline_claude(args: dict[str, object]) -> dict[str, object]:
 OPS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "walk": op_walk,
     "delete_tree": op_delete_tree,
+    "dir_ids": op_dir_ids,
+    "nested_scan": op_nested_scan,
     "baseline_git": op_baseline_git,
     "baseline_claude": op_baseline_claude,
 }

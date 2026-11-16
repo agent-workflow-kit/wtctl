@@ -24,7 +24,7 @@ import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
-from . import fsafe, gateway
+from . import fsafe, gateway, removalfs
 from .errors import WtctlError
 from .hardgit import Git, PorcelainError, parse_status_v2
 
@@ -702,42 +702,36 @@ def run_steps(
 def find_nested(wt: Worktree, dirs: Sequence[str], *, limit: int, warn: Warn) -> list[str]:
     """Every ``.git`` file or directory inside the bootstrap-created directories ``dirs``
     (relative paths), found by a no-follow walk that crosses no mount point and never descends
-    into a ``.git``. A walk that reaches ``limit`` entries stops with a warning (fail safe: what
-    it did not list is not exempt)."""
+    into a ``.git``. Each walk runs in a child process under the 60 s walk deadline
+    (``fsafe_child`` ``nested_scan``). A walk that reaches ``limit`` entries, or fails, stops with
+    a warning and uses up the shared budget (fail safe: what it did not list is not exempt)."""
     found: list[str] = []
     left = limit  # one budget for all the directories
+    ident = wt.anchor.identity
     for rel in dirs:
-        parts = tuple(rel.split("/"))
-        try:
-            fd = fsafe.open_chain(wt.anchor, wt.fd, parts, start_path=wt.anchor.path)
-        except fsafe.FsafeError:
-            continue
-        root_path = wt.anchor.path.rstrip("/") + "/" + rel
-        read = [0]
-        try:
-            # TODO(#10): run the nested scan in fsafe_child with the 60 s deadline (add ops to fsafe_child.OPS)  # noqa: E501
-            for e in fsafe.walk_tree(
-                wt.anchor,
-                fd,
-                limit=left,
-                descend=lambda ent: ent.path[-1] != ".git",
-                root_path=root_path,
-                progress=read,
-            ):
-                if e.path[-1] == ".git" and e.kind in ("file", "dir"):
-                    text = _text("/".join((*parts, *e.path)))
-                    if text is not None:
-                        found.append(text)
-        except fsafe.FsafeError as exc:
-            if exc.kind == "limit":
-                read[0] = left
+        parts = rel.split("/")
+        args = {
+            "anchor": {"path": wt.anchor.path, "identity": [ident.dev, ident.ino]},
+            "chain": parts,
+            "limit": left,
+        }
+        res = removalfs.run("nested_scan", args)
+        if not res.ok or res.value is None:
+            kind = res.error.kind if res.error is not None else "failed"
+            if kind in ("missing", "not_dir", "symlink") and not res.timed_out:
+                continue  # the directory is gone or was swapped: nothing to list
+            left = 0
             warn(
-                f"nested-repository scan of {_esc(rel)!r} stopped ({exc.kind}); "
+                f"nested-repository scan of {_esc(rel)!r} stopped ({kind}); "
                 "entries it did not list are not exempt"
             )
-        finally:
-            left -= read[0]  # charged on every outcome
-            os.close(fd)
+            continue
+        left -= int(res.value["count"])
+        for g in res.value["gits"]:
+            if g["path"][-1] == ".git" and g["kind"] in ("file", "dir"):
+                text = _text("/".join((*parts, *g["path"])))
+                if text is not None:
+                    found.append(text)
     return sorted(set(found))
 
 
