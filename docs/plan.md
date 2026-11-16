@@ -151,7 +151,7 @@ Status: planned, 2026-10-30. Implements [interface.md](interface.md) (normative)
 
 - manual macOS and WSL checklists recorded in design.md (Live verification).
 - `live` suite re-run on the user's machines.
-- Large-repository timing: nested scan at the default limit and mirror refresh on a monorepo-sized remote.
+- Large-repository timing: nested scan at the default limit and mirror refresh on a monorepo-sized remote. The synthetic local run is recorded in design.md (Large-repository timing); the same measurement on the maintainer's real monorepo and forge remains.
 
 **Status**: Not Started
 
