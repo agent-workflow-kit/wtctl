@@ -387,16 +387,15 @@ class Adopter:
         return self._result(record, existing=False, human=f"adopted {name}")
 
     def _check_nesting(self, live: list[Record], res: Resolution) -> None:
-        """No adopted worktree lies inside, or around, another worktree: the clone's own
-        (``git worktree list``, cross-checked against the admin entries) or a recorded one."""
-        known: dict[str, bool] = {r["path"]: True for r in live}
+        """The candidate must be a listed, unlocked, non-prunable worktree of the clone and must
+        not lie inside, or around, the path of another live record. Worktrees git lists but wtctl
+        does not record (the main worktree's linked ones, ``.claude/worktrees`` layouts) do not
+        block: nothing wtctl holds depends on those paths, and the identity, pointer and
+        linkcheck steps still run for the candidate."""
         mine: worktrees.WorktreeEntry | None = None
         for e in worktrees.worktree_entries(self.git, res.common_dir):
-            real = os.path.realpath(e.path)
-            if real == self.path:
+            if os.path.realpath(e.path) == self.path:
                 mine = e
-            else:
-                known[real] = True
         if mine is None:
             raise _unlinked(f"git does not list {_shown(self.path)} as a worktree of the clone")
         if mine.locked is not None:
@@ -408,7 +407,7 @@ class Adopter:
             )
         if mine.prunable is not None:
             raise _unlinked(f"git considers {_shown(self.path)} prunable")
-        for other in known:
+        for other in (r["path"] for r in live):
             if _within(self.path, other):
                 raise UsageError(f"{_shown(self.path)} lies inside the worktree {_shown(other)}")
             if _within(other, self.path):
