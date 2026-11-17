@@ -90,3 +90,33 @@ def inproc_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
     from wtctl import baselinesvc, repobaseline
 
     monkeypatch.setattr(baselinesvc, "RUNNER", repobaseline.inproc)
+
+
+REPO2 = "example.test/org/repo2"
+
+
+def second_clone(w: CW) -> tuple[Path, str]:
+    """A second clone (its own remote, ``REPO2``) next to the world's; returns the clone and a
+    config file naming both repos."""
+    import json
+
+    remote2 = w.tmp / "remote2.git"
+    w.g(["clone", "-q", "--bare", str(w.remote), str(remote2)], w.tmp)
+    clone2 = w.tmp / "clone2"
+    w.g(["clone", "-q", "--branch", "main", str(remote2), str(clone2)], w.tmp)
+    cfg = {
+        **w.top,
+        "repos": {REPO: w.repo_cfg, REPO2: {"clone": str(clone2), "clone_url": str(remote2)}},
+    }
+    path = w.tmp / "config2.yaml"
+    path.write_text(json.dumps(cfg))
+    return clone2, str(path)
+
+
+def adopt_in(w: CW, capsys, cfg: str, repo: str, path: Path | str) -> Run:  # noqa: ANN001
+    from tests.helpers import run_cli
+
+    return run_cli(
+        capsys, "--config", cfg, "--json", "--actor", "auto:tester", "adopt", str(path),
+        "--repo", repo,
+    )  # fmt: skip

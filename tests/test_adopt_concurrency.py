@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.adoptlib import adopt, foreign, inproc_baseline, ok_adopt, world
+from tests.adoptlib import REPO2, adopt, foreign, inproc_baseline, ok_adopt, second_clone, world
 from tests.createlib import CW, REPO
 
 
@@ -125,3 +125,53 @@ def test_a_second_adopt_of_the_same_new_path_waits_for_the_clone_lease(w: CW, ca
         st.close()
     assert w.count("records") == 0
     ok_adopt(adopt(w, capsys, path))
+
+
+BARRIER = """
+import os, sys, time
+from wtctl import baselinesvc, repobaseline
+baselinesvc.RUNNER = repobaseline.inproc
+from wtctl.state import State
+
+orig = State.insert_record
+mine, theirs = sys.argv[1], sys.argv[2]
+
+
+def hooked(self, *a, **k):
+    # both adopts have passed their checks before either inserts
+    open(mine, "w").close()
+    deadline = time.time() + 20
+    while not os.path.exists(theirs) and time.time() < deadline:
+        time.sleep(0.02)
+    return orig(self, *a, **k)
+
+
+State.insert_record = hooked
+from wtctl.cli import main
+
+sys.exit(main(sys.argv[3:]))
+"""
+
+
+def test_adopts_of_nested_paths_in_two_clones_cannot_both_win(w: CW, tmp_path: Path) -> None:
+    clone2, cfg = second_clone(w)
+    outer = foreign(w, "outer")  # a worktree of the first clone
+    inner = outer / "inner"  # a worktree of the second clone, inside it
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)], clone2)
+    script = tmp_path / "barrier_adopt.py"
+    script.write_text(BARRIER)
+    env = {**os.environ, "HOME": str(w.home)}
+
+    def start(mine: str, theirs: str, path: Path, repo: str) -> subprocess.Popen[str]:
+        argv = ["--config", cfg, "--json", "--actor", "auto:t", "adopt", str(path), "--repo", repo]
+        return subprocess.Popen(
+            [sys.executable, str(script), str(tmp_path / mine), str(tmp_path / theirs), *argv],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    results = finish([start("a", "b", outer, REPO), start("b", "a", inner, REPO2)])
+    assert sorted(r[0] for r in results) == [0, 2], results
+    assert w.count("records") == 1
