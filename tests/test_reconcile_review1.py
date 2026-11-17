@@ -435,15 +435,17 @@ def test_the_scan_is_complete_only_when_every_entry_was_read(w: RC) -> None:
 # -- R11 and R12: reclaim --
 
 
-def test_a_reclaim_refused_for_its_baseline_leaves_the_record_as_it_was(w: RC) -> None:
+def test_a_reclaim_refused_for_its_baseline_settles_the_record_as_partial(w: RC) -> None:
     rec = w.wt()
     crash_after_add(w, rec)
     w.top["remove"] = {"nested_scan_limit": 5}
     data = w.reconciled()
-    assert data["changes"] == [] and w.kinds(data) == ["abandoned"]
+    assert w.actions(data) == [(rec["id"], "creating", "partial", "abandon_uncomputable_baseline")]
+    assert w.kinds(data) == ["abandoned"]
     row = w.row(rec["id"])
-    assert row["state"] == "creating" and row["admin_dir"] is None and row["dir_id"] is None
-    assert row["head_at_create"] is None and row["reflog_start_ts"] is None
+    assert row["state"] == "partial" and row["admin_dir"] and row["dir_id"]
+    assert row["baseline_digest"] is None and "nested_scan_limit" in row["last_error"]
+    assert w.reconciled()["changes"] == []
 
 
 @pytest.mark.usefixtures("inproc")

@@ -1677,7 +1677,7 @@
               "type": "null"
             }
           ],
-          "description": "Throwaway, or a worktree whose baseline is not recorded yet (creating): null."
+          "description": "Throwaway, or a worktree whose baseline is not recorded (creating, or a partial worktree whose create or reclaim could not compute it in full): null."
         },
         "bootstrap": {
           "oneOf": [
@@ -1934,11 +1934,34 @@
               "head_at_create": {
                 "$ref": "#/$defs/sha"
               },
-              "baseline_digest": {
-                "$ref": "#/$defs/digest"
-              },
               "dir_id": {
                 "$ref": "#/$defs/dev_ino"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "object_type": {
+                "const": "worktree"
+              },
+              "state": {
+                "not": {
+                  "enum": [
+                    "creating",
+                    "partial",
+                    "gone",
+                    "forgotten"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "baseline_digest": {
+                "$ref": "#/$defs/digest"
               }
             }
           }
@@ -2152,7 +2175,7 @@
             "null"
           ],
           "x-untrusted": true,
-          "description": "Untrusted: git's stderr, a pointer-rewrite failure message, or, for kept_unpushed, the condition that kept the admin entry."
+          "description": "Untrusted: git's stderr, a pointer-rewrite failure message, for kept_unpushed, the condition that kept the admin entry, or, for abandoned, a message wtctl composed (why a creating record was skipped, or the baseline positions that blocked it, which are paths from the worktree and untrusted)."
         },
         "kind_of": {
           "enum": [
@@ -2411,7 +2434,7 @@
           }
         }
       ],
-      "description": "A reconcile report. gone: id, path, admin_entry: absent, and branch when a created branch was kept (an owned missing record whose admin entry was already gone, marked gone after the grace period with nothing to delete); gone_with_unpushed: id, branch, tip (the record is gone, its unpushed branch kept); kept_unpushed: id, tip (null when the entry's HEAD cannot be read), message (an admin entry kept because its HEAD is neither reachable from a local branch nor pushed, it holds submodule git dirs or per-worktree refs, or its HEAD reflog names an unpushed commit since the recorded start; tip is the entry's HEAD or that commit); adopted_gone: id, path (an adopted record marked gone after the grace period); adopted_after_crash: id, path (a creating worktree whose creator died, found intact and made active); abandoned: id, path, and branch when a created branch was kept (a creating record whose creator died and that could not be reclaimed: gone if its path was absent, else left creating for a human forget, or skipped because a process is in its planned path; the changes list shows which); stray: path, kind_of (a throwaway directory with no live record, a leftover *.wtctl-tmp-* clone directory, or an orphaned mirror; never deleted); unlinked: id, path; clone_missing: id, clone_path (null when the record has none); moved_clone: id, clone_path (the record is clone_missing; a re-resolved clone at clone_path names the record's path; reconcile changes nothing else, and a human re-attaches the record with baseline accept); fetch_failed: clone_path, message."
+      "description": "A reconcile report. gone: id, path, admin_entry: absent, and branch when a created branch was kept (an owned missing record whose admin entry was already gone, marked gone after the grace period with nothing to delete); gone_with_unpushed: id, branch, tip (the record is gone, its unpushed branch kept); kept_unpushed: id, tip (null when the entry's HEAD cannot be read), message (an admin entry kept because its HEAD is neither reachable from a local branch nor pushed, it holds submodule git dirs or per-worktree refs, or its HEAD reflog names an unpushed commit since the recorded start; tip is the entry's HEAD or that commit); adopted_gone: id, path (an adopted record marked gone after the grace period); adopted_after_crash: id, path (a creating worktree whose creator died, found intact and made active); abandoned: id, path, and branch when a created branch was kept (a creating record whose creator died and that could not be reclaimed: gone if its path was absent, else left creating for a human forget, or skipped because a process is in its planned path; or made partial, with a message, when its worktree is intact but its baseline cannot be computed in full; the changes list shows which); stray: path, kind_of (a throwaway directory with no live record, a leftover *.wtctl-tmp-* clone directory, or an orphaned mirror; never deleted); unlinked: id, path; clone_missing: id, clone_path (null when the record has none); moved_clone: id, clone_path (the record is clone_missing; a re-resolved clone at clone_path names the record's path; reconcile changes nothing else, and a human re-attaches the record with baseline accept); fetch_failed: clone_path, message."
     },
     "pre_hook_entry": {
       "type": "object",

@@ -14,7 +14,7 @@ import sqlite3
 import stat
 from typing import Any
 
-from .. import baselinesvc, bootstrapper, fsafe, hooks, naming, repobaseline, worktrees
+from .. import baselinesvc, bootstrapper, fsafe, hooks, naming, repobaseline, unwind, worktrees
 from .. import labels as labelmod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError, bootstrap_failed_details
@@ -166,6 +166,8 @@ class Creator:
         self.dry = ctx.dry_run
         self.warnings: list[str] = []
         self.settings = self.config.repo(opts.repo)
+        self._created: list[str] = []
+        self._written: dict[str, worktrees.UpstreamKey] = {}
         self._waited: set[str] = set()  # creating records whose creator was already waited for
 
     # -- entry ---------------------------------------------------------------------------
@@ -757,6 +759,7 @@ class Creator:
         git, common = self.wgit, self.res.common_dir
         created: list[str] = []  # [start] once the branch ref is known to be ours
         written: dict[str, worktrees.UpstreamKey] = {}
+        self._created, self._written = created, written  # kept for the baseline step's unwind
         added = False
         try:
             start = plan.start
@@ -975,10 +978,12 @@ class Creator:
             raise kept from exc
         return outcome
 
-    def _baseline(self, record: Record, plan: Plan) -> repobaseline.Baseline:
+    def _baseline(self, record: Record, plan: Plan, rlease: Lease) -> repobaseline.Baseline:
         """Create order step 15: the repo-config baseline, after bootstrap. One that could not be
-        computed in full (a bound or a deadline) is not recorded: the worktree exists, so the
-        record stays `creating` for a human, like any failure after git created the worktree."""
+        computed in full (a refused position or a bound) is never recorded: the create unwinds
+        what it made, or leaves a `partial` record when a guard refuses (`_unwind_baseline`). A
+        failure of wtctl itself while computing it keeps the `creating` record and the worktree,
+        like any failure after git created the worktree."""
         current = self.state.get_record(record["id"])
         assert current is not None
         try:
@@ -989,17 +994,81 @@ class Creator:
                 raise
             raise kept from exc
         if baseline.has_detail():
-            bad = [i.path for i in baseline.items if i.detail][:5]
-            raise self._kept(
-                WtctlError(
-                    "create_failed",
-                    "the repo-config baseline could not be computed in full "
-                    f"(see remove.nested_scan_limit): {', '.join(bad)}",
-                ),
-                record,
-                plan,
-            )
+            raise self._unwind_baseline(record, baseline, rlease)
         return baseline
+
+    def _unwind_baseline(
+        self, record: Record, baseline: repobaseline.Baseline, rlease: Lease
+    ) -> WtctlError:
+        """Create order step 15, a baseline that cannot be recorded in full: the same refusal would
+        repeat on every retry and on reconcile, so what THIS create made is removed (the worktree
+        by its recorded identity, its admin entry, the branch only if this create made it, by
+        compare-and-swap) and the record is deleted, the id burned. If a guard refuses or a
+        deletion stops, the record becomes ``partial`` (the existing finishing path) instead of
+        staying ``creating``."""
+        if rlease.lost:
+            raise WtctlError(
+                "busy",
+                f"the lease on {record['id']} was lost before the baseline step; nothing unwound",
+            )
+        current = self.state.get_record(record["id"])
+        assert current is not None
+        shown = unwind.positions(baseline.items)
+        total = sum(1 for i in baseline.items if i.detail)
+        what = "the repo-config baseline could not be computed in full"
+        out = unwind.unwind_worktree(
+            self.ctx,
+            self.git,
+            dict(current),
+            lease_wait=self.config.lease_wait_s,
+            branch_sha=self._created[0] if self._created else None,
+            written=self._written,
+        )
+        details: dict[str, Any] = {
+            "cause": "baseline_incomplete",
+            "positions": shown,
+            "unwound": out.done,
+        }
+        notes = list(out.notes)
+        if out.done:
+            try:
+                if not self.state.delete_record(record["id"], expected="creating"):
+                    notes.append(f"record {record['id']} was not `creating` any more")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"record {record['id']} was left `creating` ({exc})")
+            msg = unwind.incomplete_message(
+                f"{what}; the worktree and what this create made were removed", shown, total=total
+            )
+        else:
+            left = out.remaining[:1] or [self.path]
+            last = f"{what}; could not remove {left[0]} ({out.reason})"
+            try:
+                self.state.transition(record["id"], "creating", "partial", last_error=last[:500])
+                settled = f"record {record['id']} is `partial`"
+            except Exception as exc:  # noqa: BLE001 - reported with the original error
+                notes.append(f"record {record['id']} could not be made `partial` ({exc})")
+                settled = f"record {record['id']} is still `creating`"
+            details.update({"record": record["id"], "branch": current["branch"], "path": self.path})
+            if out.remaining:
+                details["remaining"] = out.remaining[:100]
+            if out.status == unwind.REFUSED:
+                kept = f"the worktree was kept ({out.reason})"
+            elif out.tree_deleted:
+                kept = f"the directory was removed but its admin entry was left ({out.reason})"
+            else:
+                kept = f"the worktree was only partly removed ({out.reason})"
+            finish = f"finish it with `wtctl remove {record['id']}`"
+            if out.status == unwind.PARTIAL:
+                finish += (
+                    " (a human may need `--force` if its content check reports changes "
+                    "this unwind caused)"
+                )
+            msg = unwind.incomplete_message(
+                f"{what}; {kept} and {settled}; {finish}", shown, total=total
+            )
+        err = WtctlError("create_failed", msg, details=details)
+        self._annotate(err, notes)
+        return err
 
     def _finish(self, record: Record, plan: Plan, decision_ids: list[str], rlease: Lease) -> Result:
         o = self.o
@@ -1009,7 +1078,7 @@ class Creator:
         outcome: bootstrapper.Outcome | None = None
         if o.copy_env or run_the_steps:
             outcome = self._bootstrap(record, plan, rlease, run_the_steps)
-        baseline = self._baseline(record, plan)
+        baseline = self._baseline(record, plan, rlease)
         try:
             active = self.state.transition(
                 record["id"],

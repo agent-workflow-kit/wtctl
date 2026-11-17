@@ -29,6 +29,7 @@ from . import (
     reconcile_strays,
     removal_delete,
     removal_integrity,
+    unwind,
     worktrees,
 )
 from .context import Context, Result
@@ -308,20 +309,20 @@ class Reconciler:
             links = linkcheck.verify_links(probe, self.state)
         except WtctlError:
             return False
+        info = worktrees.inspect_existing(self.git, rec["common_dir"], admin)
+        # the baseline first (also in a dry run, which stays read-only and must report what a
+        # real run does): a record that cannot be adopted is left exactly as it was
+        baseline = baselinesvc.record_current(
+            self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}, git=self.git
+        )
+        if baseline.has_detail():
+            return self.uncomputable(rec, admin, links.dir_id, info, baseline)
         if self.dry:
             self.changes.append(
                 {"id": rec["id"], "from": "creating", "to": "active", "action": "adopt_after_crash"}
             )
             self.report("adopted_after_crash", id=rec["id"], path=rec["path"])
             return True
-        info = worktrees.inspect_existing(self.git, rec["common_dir"], admin)
-        # the baseline first: a record that cannot be adopted is left exactly as it was
-        baseline = baselinesvc.record_current(
-            self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}, git=self.git
-        )
-        if baseline.has_detail():
-            self.warnings.append(f"{rec['id']}: the repo-config baseline could not be recorded")
-            return False
         self.state.transition(
             rec["id"], "creating", "creating",
             admin_dir=admin, dir_id=links.dir_id, head_at_create=info.head,
@@ -341,6 +342,47 @@ class Reconciler:
         else:  # lost a race: reset what this call wrote, and only that (never an adopter's)
             self.state.unclaim_creating(rec["id"], admin_dir=admin, dir_id=links.dir_id)
         return done
+
+    def uncomputable(
+        self,
+        rec: Record,
+        admin: str,
+        dir_id: str | None,
+        info: worktrees.Existing,
+        baseline: Any,
+    ) -> bool:
+        """The worktree is intact but its baseline cannot be recorded in full (a refused position:
+        the same refusal repeats on every run). Reconcile deletes no file and no branch, so the
+        record becomes ``partial`` with the worktree's identities recorded: ``remove`` (human)
+        finishes it, and a fixed position lets the next ``create`` or ``adopt`` succeed. Never
+        left ``creating``. Returns True (the record is settled)."""
+        shown = unwind.positions(baseline.items)
+        total = sum(1 for i in baseline.items if i.detail)
+        crashed = rec["dir_id"] is None  # killed before create recorded the worktree
+        where = ", ".join(f"{i['path']} ({i['detail']})" for i in shown)
+        more = f" and {total - len(shown)} more" if total > len(shown) else ""
+        note = (
+            f"the repo-config baseline could not be recorded: {unwind.remedy(shown)}, or finish "
+            f"with `wtctl remove`; at {where}{more}"
+        )
+        updates: dict[str, Any] = {"admin_dir": admin, "dir_id": dir_id, "last_error": note[:500]}
+        if not rec["head_at_create"]:
+            updates["head_at_create"] = info.head
+        if not rec["reflog_start_ts"]:
+            updates.update(
+                reflog_start_ts=self.state.timestamp(), reflog_start_sha=info.reflog_start_sha
+            )
+        if crashed:
+            # one transaction with the move: a failure leaves no half-settled partial
+            updates.update(
+                bootstrap_state="interrupted",
+                stash_ids=info.stash_ids,
+                clear_bootstrap_sets=True,
+            )
+        done = self.move(rec, "creating", "partial", "abandon_uncomputable_baseline", **updates)
+        if done:
+            self.report("abandoned", id=rec["id"], path=rec["path"], message=note)
+        return True
 
     # -- worktree records -----------------------------------------------------------------------
 

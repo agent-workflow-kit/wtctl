@@ -445,7 +445,7 @@ def test_the_baseline_includes_what_bootstrap_made(w: CW, capsys) -> None:  # no
     good_check(check(w, capsys, rec["id"]))
 
 
-def test_a_create_whose_baseline_cannot_be_recorded_keeps_the_creating_record(
+def test_a_create_whose_baseline_cannot_be_recorded_unwinds_and_leaves_no_record(
     w: CW,
     capsys,  # noqa: ANN001
 ) -> None:
@@ -453,8 +453,12 @@ def test_a_create_whose_baseline_cannot_be_recorded_keeps_the_creating_record(
     r = w.create(capsys)
     assert r.code == 12, (r.out, r.err)
     e = r.json()["error"]
-    assert e["code"] == "create_failed" and e["details"]["record"]
-    assert w.records()[0]["state"] == "creating" and w.records()[0]["baseline_digest"] is None
+    d = e["details"]
+    assert e["code"] == "create_failed" and d["cause"] == "baseline_incomplete" and d["unwound"]
+    assert "nested_scan_limit" in e["message"]
+    assert w.records() == [] and w.admin_entries() == []
+    del w.top["remove"]
+    assert w.create(capsys).code == 0
 
 
 def test_bootstrap_rerun_refuses_on_a_changed_baseline_of_either_class(
