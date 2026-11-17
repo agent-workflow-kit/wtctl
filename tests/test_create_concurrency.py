@@ -274,3 +274,13 @@ def test_tombstone_paths_do_not_block(w: CW, capsys, planted) -> None:  # noqa: 
 def test_an_equal_path_is_the_unique_constraint_not_the_overlap(w: CW, capsys, planted) -> None:  # noqa: ANN001
     planted.append((_target(w), {}))
     refused(w.create(capsys, "--name", "t1"), 20, "path_exists")
+
+
+def test_sibling_names_sharing_a_string_prefix_do_not_block(w: CW, capsys, planted) -> None:  # noqa: ANN001
+    # `<parent>/t1x` and `<parent>/t` share a string prefix with the target `<parent>/t1` (one way
+    # or the other) but are neither inside nor around it; a plain startswith would refuse
+    parent = str(Path(_target(w)).parent)
+    planted.append((parent + "/t1x", {}))
+    planted.append((parent + "/t", {}))
+    r = w.create(capsys, "--name", "t1")
+    assert r.code == 0, (r.out, r.err)

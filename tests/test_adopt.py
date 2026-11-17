@@ -363,6 +363,22 @@ def test_inside_a_live_record_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
     assert w.count("records") == 1
 
 
+def test_a_creating_record_is_never_a_main_worktree_for_the_exemption(w: CW, capsys) -> None:  # noqa: ANN001
+    # a crashed create leaves a `creating` record with admin_dir still NULL; it looks like a main
+    # worktree but is a linked one in the making, so nothing of its clone may nest inside it
+    outer = foreign(w, "outer")
+    rid = rec_of(w, capsys, outer)["id"]
+    conn = sqlite3.connect(w.db)
+    conn.execute("UPDATE records SET state = 'creating', admin_dir = NULL WHERE id = ?", (rid,))
+    conn.commit()
+    conn.close()
+    inner = outer / "inner"
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
+    err = err_of(adopt(w, capsys, inner), 2)
+    assert "lies inside the path of the live record" in err["message"]
+    assert w.count("records") == 1
+
+
 def test_around_a_live_record_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
     outer = foreign(w, "outer")
     inner = outer / "inner"

@@ -11,7 +11,16 @@ from pathlib import Path
 
 import pytest
 
-from tests.adoptlib import REPO2, adopt, foreign, inproc_baseline, ok_adopt, second_clone, world
+from tests.adoptlib import (
+    REPO2,
+    adopt,
+    err_of,
+    foreign,
+    inproc_baseline,
+    ok_adopt,
+    second_clone,
+    world,
+)
 from tests.createlib import CW, REPO
 
 
@@ -175,3 +184,33 @@ def test_adopts_of_nested_paths_in_two_clones_cannot_both_win(w: CW, tmp_path: P
     results = finish([start("a", "b", outer, REPO), start("b", "a", inner, REPO2)])
     assert sorted(r[0] for r in results) == [0, 2], results
     assert w.count("records") == 1
+
+
+def test_a_create_committed_between_the_pre_check_and_the_insert_is_refused(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reverse race: a record a create committed after adopt's pre-check, inside the
+    candidate's path, is caught by the guard inside adopt's insert transaction."""
+    from wtctl import baselinesvc
+    from wtctl.gateway import Gateway
+    from wtctl.state import State
+
+    outer = foreign(w, "outer")
+    real = baselinesvc.record_current
+
+    def hooked(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        st = State(w.db, Gateway())
+        st.insert_record(
+            {"id": st.allocate_id(), "object_type": "worktree", "state": "active",
+             "repo": REPO2, "path": str(outer / "deeper"), "name": "deeper", "owned": True,
+             "clone_path": str(w.clone)}
+        )  # fmt: skip
+        st.close()
+        return real(*a, **k)
+
+    monkeypatch.setattr(baselinesvc, "record_current", hooked)
+    err = err_of(adopt(w, capsys, outer), 2)
+    assert "contains the path of the live record" in err["message"]
+    assert w.count("records") == 1  # only the planted one
