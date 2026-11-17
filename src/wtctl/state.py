@@ -576,10 +576,15 @@ class State:
         labels: Iterable[str] = (),
         holders: Iterable[str] = (),
         ttl: float = LEASE_TTL,
+        guard: Callable[[list[Record]], None] | None = None,
     ) -> tuple[Record, Lease]:
-        """Insert a record and take its per-record lease in the same transaction (create)."""
+        """Insert a record and take its per-record lease in the same transaction (create).
+        ``guard`` is called with the live records read inside that transaction, as in
+        :meth:`insert_record`; what it raises aborts the insert and takes no lease."""
         name = record_lease(fields["id"])
         with self._txn() as c:
+            if guard is not None:
+                guard(self.records())
             self._insert(c, fields, labels, holders)
             lease = self._insert_lease(c, name, ttl)
         lease._start_heartbeat()

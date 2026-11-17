@@ -427,7 +427,13 @@ class Adopter:
             other = r["path"]
             if other == self.path:
                 continue
-            rec_main = r["object_type"] == "worktree" and r["admin_dir"] is None
+            # a `creating` record has no admin_dir yet (create's _add transition sets it), so it
+            # is a linked worktree in the making, never a main one
+            rec_main = (
+                r["object_type"] == "worktree"
+                and r["admin_dir"] is None
+                and r["state"] != "creating"
+            )
             rec_linked = r["object_type"] == "worktree" and r["admin_dir"] is not None
             ident = f"the live record {_shown(other)} (id {r['id']})"
             hint = "; forget or remove that record first"

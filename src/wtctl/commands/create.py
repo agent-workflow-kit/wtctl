@@ -259,7 +259,10 @@ class Creator:
         # 12. the record and its lease, in one transaction
         try:
             record, rlease = self.state.insert_record_leased(
-                record_fields, labels=o.labels, holders=[o.holder] if o.holder else []
+                record_fields,
+                labels=o.labels,
+                holders=[o.holder] if o.holder else [],
+                guard=self._check_record_overlap,
             )
         except Conflict as exc:  # another actor took the name or path since step 7 and 10
             raise WtctlError(
@@ -556,14 +559,30 @@ class Creator:
             if occupied:
                 raise WtctlError("refused", f"{path} already exists", reason="path_exists")
         for known in self._known_dirs():
-            if _within(path, known):
-                raise UsageError(f"{path} lies inside the existing worktree {known}")
-            if _within(known, path):
-                raise UsageError(f"{path} contains the existing worktree {known}")
+            self._check_nesting(path, known)
         private = [str(state_path().parent), self.config.effective_throwaway_root]
         for d in private:
             if _within(path, os.path.realpath(d)):
                 raise UsageError(f"{path} lies inside {d}")
+
+    @staticmethod
+    def _check_nesting(path: str, known: str) -> None:
+        """The one nesting rule of step 10: ``path`` may not lie inside or around ``known``
+        (equal included). Create has no main/linked exemption (that is adopt's)."""
+        if _within(path, known):
+            raise UsageError(f"{path} lies inside the existing worktree {known}")
+        if _within(known, path):
+            raise UsageError(f"{path} contains the existing worktree {known}")
+
+    def _check_record_overlap(self, rows: list[Record]) -> None:
+        """Step 10's nesting rule against the live records of every repo and throwaways, run
+        inside the record-insert transaction so a racing create or adopt in another clone (which
+        the per-clone lease does not serialize) cannot slip in between check and insert. An equal
+        path is left to the insert's unique constraint (``path_exists``)."""
+        for r in rows:
+            known = os.path.realpath(r["path"])
+            if known != self.path:
+                self._check_nesting(self.path, known)
 
     def _prepare_root(self, *, write: bool) -> str:
         """The worktree root as an anchor (create order step 10); returns its realpath.
