@@ -1,8 +1,8 @@
 # wtctl: implementation plan
 
-Status: stages 0-5 implemented and released (v0.27.1 as of 2026-11-17); stage 6 is open and human-owned. Implements [interface.md](interface.md) (normative) using the decisions and internal architecture in [design.md](design.md). Work is tracked as GitHub issues in this repo; each issue names its stage below, and each stage's **Status** lists the issues that delivered it. The bite-sized, test-first steps for an issue are written when the issue is picked up.
+Status: stages 0-5 implemented and released (v0.27.1 as of 2026-11-17) except open #79 in stage 2; stage 6 is open and human-owned. Implements [interface.md](interface.md) (normative) using the decisions and internal architecture in [design.md](design.md). Work is tracked as GitHub issues in this repo; each issue names its stage below, and each stage's **Status** lists the issues that delivered it. The bite-sized, test-first steps for an issue are written when the issue is picked up.
 
-The stage numbers and the 0.1-0.5 labels below are plan milestones, not release numbers: the release job cuts a 0.x release per merged issue, so the shipped versions run v0.1.0 to v0.27.1 (see [CHANGELOG.md](../CHANGELOG.md)).
+The stage numbers and the 0.1-0.5 labels below are plan milestones, not release numbers: the release job cuts one release per merged change (PR), plus a few patch releases, so the shipped versions run v0.1.0 to v0.27.1 (see [CHANGELOG.md](../CHANGELOG.md)).
 
 ## Conventions for every stage
 
@@ -75,7 +75,7 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 - fsafe: no-follow opens (symlinked components, hard links, FIFOs, directories, `.git` variants incl. case folding and NTFS/HFS names), fd-based deletion with a concurrent symlink swap (SAFE-1), never crossing a mount point (`st_dev` and mount id; a FUSE or bind mount inside the tree is skipped and reported, SAFE2-1), `u+w` on owned read-only directories, atomic pointer rewrite through the no-follow fd chain.
 - `live`: anonymous fetch-by-sha and treeless refresh on github.com and gitlab.com; token header against a private repository on each forge; `token_command` with `gh`/`glab`.
 
-**Status**: Complete. Issues #9 (hardened git, vector suite), #10 (`fsafe`), #11 (URLs, `locate`, `clone`), #12 (credentials), #13 (mirror), #14 (pack transfer), plus the follow-ups #55 (`copy_env` walk under the child deadline) and #63 (SSH user kept in fetch and clone URLs). The `live` tests ([#25](https://github.com/agent-workflow-kit/wtctl/issues/25)) are written and merged, but the issue stays open until a maintainer runs `make live` with real credentials; see [live-testing.md](live-testing.md).
+**Status**: Complete. Issues #9 (hardened git, vector suite), #10 (`fsafe`), #11 (URLs, `locate`, `clone`), #12 (credentials), #13 (mirror), #14 (pack transfer), plus the follow-up #63 (SSH user kept in fetch and clone URLs). The `live` tests (`#25`, also tracked in stage 6) are written and merged, but the issue stays open until a maintainer runs `make live` with real credentials; see [live-testing.md](live-testing.md).
 
 ## Stage 2: Create, bootstrap, baseline, adopt (0.2)
 
@@ -91,7 +91,7 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 - adopt/forget: realpath, main worktree, `--holder` reference counting, `not_a_holder`, plain `forget` human-only, throwaways refused, lease and state rules.
 - `live`: git-lfs with `create.allow_filters: [lfs]` and the `unsafe_repo_config` refusal for planted LFS transfer keys.
 
-**Status**: Complete. Issues #15 (`create`), #16 (bootstrap), #17 (baseline), #18 (`adopt`, `forget`), plus the follow-ups #64 (baseline covers content behind symlinks), #65 (adopt nesting refusal only against live records), #68 (cross-device symlink targets are uncovered, not blocking), #70 (create re-checks path overlap inside the insert transaction), #71 (baseline skips verified linked worktrees beneath the main worktree) and #77 (a baseline that cannot be recorded leaves no stuck `creating` record). Open: #79 (`remove` cannot finish a partial worktree whose root is a mount point), found in review of #77.
+**Status**: Complete except #79. Issues #15 (`create`), #16 (bootstrap), #17 (baseline), #18 (`adopt`, `forget`), plus the follow-ups #64 (baseline covers content behind symlinks), #65 (adopt nesting refusal only against live records), #68 (cross-device symlink targets are uncovered, not blocking), #70 (create re-checks path overlap inside the insert transaction), #71 (baseline skips verified linked worktrees beneath the main worktree), #77 (a baseline that cannot be recorded leaves no stuck `creating` record) and #55 (`copy_env` walk under the child deadline). Open: #79 (`remove` cannot finish a partial worktree whose root is a mount point), found in review of #77.
 
 ## Stage 3: Removal (0.3)
 
@@ -159,7 +159,7 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 
 ## Version roadmap
 
-Done (0.x, shipped as v0.1.0 to v0.27.1; one release per merged issue):
+Done (0.x, shipped as v0.1.0 to v0.27.1; one release per merged change (PR), plus a few patch releases):
 
 - **0.1** (stage 1): hardened git, `locate`, `clone`, the mirror. Done.
 - **0.2** (stage 2): `create`, bootstrap, baseline, `adopt`/`forget`. Done. Labels and hooks shipped earlier, in stage 0.
@@ -169,6 +169,6 @@ Done (0.x, shipped as v0.1.0 to v0.27.1; one release per merged issue):
 
 Open:
 
-- **1.0** (stage 6, human-owned): the macOS and WSL checklists (#26, #27), the `live` run (#25), the real-monorepo timing (#28), and the consumers' integration with a deliberate breaking-change commit (#29, architecture §18.3). agent-spawn, review-run and review-respond must have used the interface without changes first. Also open before 1.0: #79 (`remove` of a partial worktree whose root is a mount point).
+- **1.0** (stage 6, human-owned): the macOS and WSL checklists (#26, #27), the `live` run (#25), the real-monorepo timing (#28), and the consumers' integration with a deliberate breaking-change commit (#29, architecture §18.3). agent-spawn and review-respond must have used the interface without changes first.
 - **1.x** (additive, not started): recursive submodule checks (#30, removing worktrees with initialized submodules without `--force`), sparse-checkout support (#31), a `browse` TUI (#32), more fetch-error classifications (#33).
 - **2.0**: reserved for a breaking interface change.
