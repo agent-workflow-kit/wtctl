@@ -119,6 +119,11 @@ class Status:
 
     def baseline(self) -> None:
         r = self.record
+        if r["state"] == "partial" and r["baseline_digest"] is None:
+            # a leftover of a create that could not record its baseline (never baselined):
+            # there is nothing to compare, and nothing else can ever settle it
+            self.checks["baseline"] = {"status": "skipped", "details": []}
+            return
         items = baselinesvc.recorded_items(self.state, r["id"])
         spec = baselinesvc.spec_for(
             self.config,

@@ -29,6 +29,7 @@ from . import (
     reconcile_strays,
     removal_delete,
     removal_integrity,
+    unwind,
     worktrees,
 )
 from .context import Context, Result
@@ -320,8 +321,7 @@ class Reconciler:
             self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}, git=self.git
         )
         if baseline.has_detail():
-            self.warnings.append(f"{rec['id']}: the repo-config baseline could not be recorded")
-            return False
+            return self.uncomputable(rec, admin, links.dir_id, info, baseline)
         self.state.transition(
             rec["id"], "creating", "creating",
             admin_dir=admin, dir_id=links.dir_id, head_at_create=info.head,
@@ -341,6 +341,45 @@ class Reconciler:
         else:  # lost a race: reset what this call wrote, and only that (never an adopter's)
             self.state.unclaim_creating(rec["id"], admin_dir=admin, dir_id=links.dir_id)
         return done
+
+    def uncomputable(
+        self,
+        rec: Record,
+        admin: str,
+        dir_id: str | None,
+        info: worktrees.Existing,
+        baseline: Any,
+    ) -> bool:
+        """The worktree is intact but its baseline cannot be recorded in full (a refused position:
+        the same refusal repeats on every run). Reconcile deletes no file and no branch, so the
+        record becomes ``partial`` with the worktree's identities recorded: ``remove`` (human)
+        finishes it, and a fixed position lets the next ``create`` or ``adopt`` succeed. Never
+        left ``creating``. Returns True (the record is settled)."""
+        shown = unwind.positions(baseline.items)
+        total = sum(1 for i in baseline.items if i.detail)
+        crashed = rec["dir_id"] is None  # killed before create recorded the worktree
+        where = ", ".join(f"{i['path']} ({i['detail']})" for i in shown)
+        more = f" and {total - len(shown)} more" if total > len(shown) else ""
+        note = (
+            f"the repo-config baseline could not be recorded: {unwind.remedy(shown)}, or finish "
+            f"with `wtctl remove`; at {where}{more}"
+        )
+        updates: dict[str, Any] = {"admin_dir": admin, "dir_id": dir_id, "last_error": note[:500]}
+        if not rec["head_at_create"]:
+            updates["head_at_create"] = info.head
+        if not rec["reflog_start_ts"]:
+            updates.update(
+                reflog_start_ts=self.state.timestamp(), reflog_start_sha=info.reflog_start_sha
+            )
+        if crashed:
+            updates["bootstrap_state"] = "interrupted"
+        if crashed:
+            self.state.set_stash_ids(rec["id"], info.stash_ids)
+            self.state.clear_bootstrap_sets(rec["id"], expected="creating")
+        done = self.move(rec, "creating", "partial", "abandon_uncomputable_baseline", **updates)
+        if done:
+            self.report("abandoned", id=rec["id"], path=rec["path"], message=note)
+        return True
 
     # -- worktree records -----------------------------------------------------------------------
 

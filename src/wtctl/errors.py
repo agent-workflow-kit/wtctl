@@ -134,7 +134,7 @@ def bootstrap_failed_details(record: Any, step: Any, warnings: Sequence[str]) ->
 _CAUSES = {
     "remote_mismatch": {"no_remote"},
     "clone_failed": {"timeout"},
-    "create_failed": {"object_format", "anchor_changed", "tree_too_large"},
+    "create_failed": {"object_format", "anchor_changed", "tree_too_large", "baseline_incomplete"},
     "fetch_failed": {"timeout", "prune_incomplete"},
 }
 

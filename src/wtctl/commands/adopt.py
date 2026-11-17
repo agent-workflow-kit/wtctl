@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .. import baselinesvc, fsafe, linkcheck, naming, urls, worktrees
+from .. import baselinesvc, fsafe, linkcheck, naming, unwind, urls, worktrees
 from .. import labels as labelmod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
@@ -339,11 +339,16 @@ class Adopter:
         pseudo["id"] = rid
         baseline = baselinesvc.record_current(self.config, pseudo, git=self.git)
         if baseline.has_detail():
-            bad = [i.path for i in baseline.items if i.detail][:5]
+            shown = unwind.positions(baseline.items)
+            total = sum(1 for i in baseline.items if i.detail)
             raise WtctlError(
                 "create_failed",
-                "the repo-config baseline could not be computed in full "
-                f"(see remove.nested_scan_limit): {', '.join(bad)}",
+                unwind.incomplete_message(
+                    "the repo-config baseline could not be computed in full; nothing was adopted",
+                    shown,
+                    total=total,
+                ),
+                details={"cause": "baseline_incomplete", "positions": shown},
             )
         fields: dict[str, Any] = {
             "id": rid,
