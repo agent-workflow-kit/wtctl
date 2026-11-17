@@ -586,3 +586,21 @@ def test_a_verified_worktree_at_a_claude_named_path_is_walked(w: World, rel: str
     before = cdigest(b)
     (wt / "CLAUDE.md").write_text("planted\n")
     assert cdigest(run(w)) != before
+
+
+def test_lazy_git_caches_a_failed_open() -> None:
+    from wtctl.errors import WtctlError
+
+    attempts: list[int] = []
+
+    def opener():
+        attempts.append(1)
+        raise WtctlError("internal", "no usable git")
+
+    lazy = baselinesvc.LazyGit(opener)
+    with pytest.raises(WtctlError) as first:
+        lazy.get()
+    with pytest.raises(WtctlError) as second:
+        lazy.get()
+    assert len(attempts) == 1
+    assert second.value is first.value

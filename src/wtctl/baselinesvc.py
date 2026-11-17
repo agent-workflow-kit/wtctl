@@ -75,10 +75,17 @@ class LazyGit:
     def __init__(self, opener: Callable[[], Git]) -> None:
         self._opener = opener
         self._git: Git | None = None
+        self._error: WtctlError | None = None
 
     def get(self) -> Git:
+        if self._error is not None:
+            raise self._error
         if self._git is None:
-            self._git = self._opener()
+            try:
+                self._git = self._opener()
+            except WtctlError as exc:
+                self._error = exc
+                raise
         return self._git
 
 
