@@ -10,6 +10,7 @@ from typing import Any
 
 from .. import baselinesvc
 from ..context import Context, Result
+from ..output import escape_control
 from ..state import LEGACY_BASELINE_FORMAT
 
 
@@ -34,4 +35,12 @@ def run(ctx: Context) -> Result:
                 f"\n{record['name']}: {len(added)} symlink-target items are not covered by this "
                 "baseline; run `baseline accept` to record them"
             )
+    blind = current.uncovered()
+    if blind:
+        # a documented, bounded gap, always shown: never part of a refusal
+        data["uncovered"] = blind
+        notice += (
+            f"\n{record['name']}: {len(blind)} symlink targets are on another device and their "
+            "content is not covered by the baseline: " + ", ".join(escape_control(p) for p in blind)
+        )
     return Result(data, human=record["id"], stderr=notice)

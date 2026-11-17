@@ -36,6 +36,9 @@ _SKIP_MODULE_DIRS = frozenset({"objects", "refs", "logs"})
 # The item recording what a collected symlink points at (docs/interface.md, Baseline, Symlinks).
 LINK_KEY = "symlink-target"  # never a config key: those always contain a dot
 LINK_TYPE = "symlink_target"
+# A link whose target is on another device or mount (``/dev/null`` excepted): recorded from the
+# hop strings and the final entry's path and type, nothing read, and never a refusal.
+UNCOVERED_TYPE = "symlink_uncovered"
 MAX_LINK_NEST = 4  # a followed directory holding links to directories holding links ...
 _LINK_VERSION = b"wtctl-link-v1\n"
 
@@ -103,6 +106,10 @@ class Baseline:
 
     def has_detail(self) -> bool:
         return any(i.detail for i in self.items)
+
+    def uncovered(self) -> list[str]:
+        """Paths of the links whose target is on another device (not blocking, not read)."""
+        return sorted({i.path for i in self.items if i.type == UNCOVERED_TYPE})
 
 
 # --- digest and comparison -----------------------------------------------------------------
@@ -361,8 +368,10 @@ class Tree:
 # --- following symlinks --------------------------------------------------------------------
 
 
-def _link_item(cls: str, display: str, sha: str, detail: str | None = None) -> Item:
-    return Item(cls, display, LINK_KEY, LINK_TYPE, sha, detail)
+def _link_item(
+    cls: str, display: str, sha: str, detail: str | None = None, type_: str = LINK_TYPE
+) -> Item:
+    return Item(cls, display, LINK_KEY, type_, sha, detail, None)
 
 
 def follow_link(
@@ -403,7 +412,10 @@ def follow_link(
             b = _enc(hop)
             h.update(b"hop:%d:" % len(b) + b + b"\n")
         inner: list[tuple[str, ...]] = []
-        if first.kind == "file":
+        if first.uncovered:
+            b = _enc(first.path)
+            h.update(f"uncovered|{first.kind}|".encode() + b"%d:" % len(b) + b + b"\n")
+        elif first.kind == "file":
             sha, data = _read_fd(first.fd, budget, keep)
             h.update(f"file|{sha}|{'x' if first.executable else ''}\n".encode())
         elif first.kind == "dir":
@@ -438,7 +450,10 @@ def follow_link(
         return bad(exc), None
     finally:
         first.close()
-    return [_link_item(cls, display, h.hexdigest(), status), *items], data
+    top = _link_item(
+        cls, display, h.hexdigest(), status, UNCOVERED_TYPE if first.uncovered else LINK_TYPE
+    )
+    return [top, *items], data
 
 
 def follow_inner(
@@ -560,6 +575,10 @@ class GitCollector:
                     if not self.spec.links:
                         return link, None
                     extra, data = follow_link("git", anchor, real, path, self.budget, keep=keep)
+                    if keep and extra[0].type == UNCOVERED_TYPE:
+                        # a config file is parsed (an include can set hooksPath): content that
+                        # is not read there is a refusal, not a notice
+                        extra[0] = _link_item("git", path, EMPTY, "mount_point")
                     self.items += extra
                     return link, data
                 if kind == "dir":
@@ -751,6 +770,9 @@ class GitCollector:
                 if first.kind != "dir":
                     return
                 self.items.append(Item("git", full, None, "symlink", _sha(_enc(target))))
+                if first.uncovered:  # its config and hooks would be read and run: a refusal
+                    self.items.append(_link_item("git", full, EMPTY, "mount_point"))
+                    return
                 if level >= MAX_LINK_NEST or first.ident in active or first.ident is None:
                     self.items.append(_link_item("git", full, EMPTY, "incomplete"))
                     return

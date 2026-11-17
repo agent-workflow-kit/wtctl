@@ -132,6 +132,12 @@ class Status:
         current = baselinesvc.compute(spec)
         self.baseline_current = current
         rows = repobaseline.compare(items, current.items)
+        blind = current.uncovered()
+        if blind:
+            self.warnings.append(
+                f"{len(blind)} symlink targets are on another device; their content is not "
+                "covered by the baseline: " + ", ".join(_escape(p) for p in blind[:10])
+            )
         git_rows = [x for x in rows if x["class"] == "git"]
         if git_rows or (not rows and baselinesvc.is_changed(r, current)):
             if not rows:  # only the recorded digest disagrees: nothing to point at but the clone

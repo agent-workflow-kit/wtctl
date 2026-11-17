@@ -144,6 +144,16 @@ def _question(record: dict[str, Any], snap: Snapshot) -> str:
         for a in moved
     )
     text = f"{esc(record['name'])}: accept the baseline change? " + ", ".join(parts) + more
+    blind = [
+        r["path"]
+        for r in snap.rows
+        if isinstance(r["after"], dict) and r["after"]["type"] == repobaseline.UNCOVERED_TYPE
+    ]
+    if blind:
+        text += esc(
+            " Symlink targets on another device are recorded by path only, their content is not "
+            "covered: " + ", ".join(blind[:20])
+        )
     if snap.clone_stale and not moved:
         text += " The clone's recorded identity is out of date."
     return text + (f" Anchors: {ids}." if ids else "")
