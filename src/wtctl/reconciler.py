@@ -373,17 +373,13 @@ class Reconciler:
                 reflog_start_ts=self.state.timestamp(), reflog_start_sha=info.reflog_start_sha
             )
         if crashed:
-            updates["bootstrap_state"] = "interrupted"
+            # one transaction with the move: a failure leaves no half-settled partial
+            updates.update(
+                bootstrap_state="interrupted",
+                stash_ids=info.stash_ids,
+                clear_bootstrap_sets=True,
+            )
         done = self.move(rec, "creating", "partial", "abandon_uncomputable_baseline", **updates)
-        if done and crashed and not self.dry:
-            # only after the move won: a lost race leaves the other actor's record untouched
-            try:
-                self.state.set_stash_ids(rec["id"], info.stash_ids)
-                self.state.clear_bootstrap_sets(rec["id"], expected="partial")
-            except WtctlError as exc:
-                if exc.code != "busy":
-                    raise
-                self.warnings.append(f"{rec['id']}: changed by another command; left alone")
         if done:
             self.report("abandoned", id=rec["id"], path=rec["path"], message=note)
         return True

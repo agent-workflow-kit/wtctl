@@ -670,6 +670,8 @@ class State:
         anchor: tuple[str, str] | None = updates.pop("rerecord_anchor", None)
         clone: tuple[str, str, str] | None = updates.pop("rebind_clone", None)
         moved: tuple[str, str, str, str, str] | None = updates.pop("move_clone", None)
+        stash: Iterable[str] | None = updates.pop("stash_ids", None)
+        clear_sets: bool = bool(updates.pop("clear_bootstrap_sets", False))
         exp = [expected] if isinstance(expected, str) else list(expected)
         for s in exp:
             _check_state(s)
@@ -715,6 +717,10 @@ class State:
                 self._rebind_clone(c, *clone)
             if moved is not None:
                 self._move_clone(c, *moved)
+            if stash is not None:
+                self._write_stash_ids(c, record_id, stash)
+            if clear_sets:
+                self._clear_bootstrap_sets(c, record_id)
         got = self.get_record(record_id)
         assert got is not None
         return got
@@ -936,8 +942,12 @@ class State:
             row = c.execute("SELECT state FROM records WHERE id = ?", (record_id,)).fetchone()
             if row is None or row[0] != expected:
                 raise WtctlError("busy", f"record {record_id} is not {expected}")
-            for table in ("bootstrap_paths", "bootstrap_nested"):
-                c.execute(f"DELETE FROM {table} WHERE record_id = ?", (record_id,))
+            self._clear_bootstrap_sets(c, record_id)
+
+    @staticmethod
+    def _clear_bootstrap_sets(c: sqlite3.Connection, record_id: str) -> None:
+        for table in ("bootstrap_paths", "bootstrap_nested"):
+            c.execute(f"DELETE FROM {table} WHERE record_id = ?", (record_id,))
 
     def unclaim_creating(self, record_id: str, *, admin_dir: str, dir_id: str | None) -> bool:
         """Undo a reclaim's claim on a ``creating`` record, only if the record still holds the
@@ -995,11 +1005,15 @@ class State:
     def set_stash_ids(self, record_id: str, oids: Iterable[str]) -> None:
         """Replace the stash entry ids recorded for a record."""
         with self._txn() as c:
-            c.execute("DELETE FROM stash_ids WHERE record_id = ?", (record_id,))
-            c.executemany(
-                "INSERT INTO stash_ids(record_id, oid) VALUES (?, ?)",
-                [(record_id, o) for o in sorted(set(oids))],
-            )
+            self._write_stash_ids(c, record_id, oids)
+
+    @staticmethod
+    def _write_stash_ids(c: sqlite3.Connection, record_id: str, oids: Iterable[str]) -> None:
+        c.execute("DELETE FROM stash_ids WHERE record_id = ?", (record_id,))
+        c.executemany(
+            "INSERT INTO stash_ids(record_id, oid) VALUES (?, ?)",
+            [(record_id, o) for o in sorted(set(oids))],
+        )
 
     def stash_ids(self, record_id: str) -> list[str]:
         rows = self._conn.execute(

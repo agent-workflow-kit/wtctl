@@ -79,14 +79,22 @@ def unwind_worktree(
     very command: nobody else has had its path (``reconcile`` never calls this, it deletes no
     file)."""
     started = [False]  # set once a deletion may have begun
+    deleted = [False]  # set once the worktree directory is gone
     try:
-        return _unwind(ctx, git, rec, lease_wait, branch_sha, written, started)
+        return _unwind(ctx, git, rec, lease_wait, branch_sha, written, started, deleted)
     except WtctlError as exc:
         if exc.code == "busy" and not started[0]:
             return Outcome(REFUSED, "the clone is busy")
         why = exc.message
     except Exception as exc:  # noqa: BLE001 - any failure must reach the ``partial`` fallback
         why = f"unexpected {type(exc).__name__}: {exc}"
+    if deleted[0]:  # only the admin entry (or the branch) can be left
+        return Outcome(
+            PARTIAL,
+            f"the deletion stopped ({why})",
+            remaining=[rec["admin_dir"]],
+            tree_deleted=True,
+        )
     if started[0]:
         return Outcome(PARTIAL, f"the deletion stopped ({why})", remaining=[rec["path"]])
     return Outcome(REFUSED, f"the unwind could not start ({why})")
@@ -100,6 +108,7 @@ def _unwind(
     branch_sha: str | None,
     written: dict[str, worktrees.UpstreamKey],
     started: list[bool],
+    deleted: list[bool],
 ) -> Outcome:
     state: State = ctx.state
     try:
@@ -130,6 +139,7 @@ def _unwind(
             return Outcome(REFUSED, f"the directory is not the recorded one ({why})")
         if tree.status == "partial":
             return Outcome(PARTIAL, "the deletion stopped part-way", remaining=tree.remaining)
+        deleted[0] = True
         entry, left = removal_delete.delete_admin(state, rec, del_budget)
         out = Outcome(UNWOUND, tree_deleted=True)
         if entry in ("partial", "failed"):

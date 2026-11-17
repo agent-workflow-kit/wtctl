@@ -297,6 +297,27 @@ def test_an_unexpected_failure_in_the_unwind_falls_back_to_partial(
     assert leases(w) == []
 
 
+def test_a_failure_after_the_tree_is_deleted_does_not_name_the_gone_path(
+    w: CW,
+    capsys,
+    shm: Path,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    bad_hook(w, shm)
+
+    def boom(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(removal_delete, "delete_admin", boom)
+    e = err(w.create(capsys, "--name", "one"))
+    rec = w.records()[0]
+    assert e["details"]["unwound"] is False and rec["state"] == "partial"
+    assert not Path(rec["path"]).exists()
+    assert e["details"]["remaining"] == [rec["admin_dir"]]
+    assert "the directory was removed but its admin entry was left" in e["message"]
+    assert f"could not remove {rec['path']}" not in e["message"]
+
+
 def test_a_failing_partial_transition_is_reported_not_raised(
     w: CW,
     capsys,

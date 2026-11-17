@@ -13,7 +13,7 @@ import pytest
 from tests.reclib import RC
 from tests.schemacheck import validate
 from tests.test_reconcile_creating import crash_after_add
-from wtctl import baselinesvc, repobaseline
+from wtctl import baselinesvc, repobaseline, worktrees
 
 pytestmark = pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs /dev/shm")
 
@@ -132,7 +132,9 @@ def test_a_dry_run_of_a_computable_crash_still_reports_the_adoption(w: RC) -> No
     assert w.row(rec["id"])["state"] == "creating"
 
 
-def test_a_crash_shape_settles_with_every_recorded_identity(w: RC, shm: Path) -> None:
+def test_a_crash_shape_settles_with_every_recorded_identity(
+    w: RC, shm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rec = w.wt()
     crash_after_add(w, rec)
     w.update(
@@ -140,11 +142,43 @@ def test_a_crash_shape_settles_with_every_recorded_identity(w: RC, shm: Path) ->
         rec["id"],
     )
     bad_hook(w, shm)
+    oid = "a" * 40
+    monkeypatch.setattr(worktrees, "_stash_ids", lambda git, common: [oid])
     w.reconciled()
     row = w.row(rec["id"])
     assert row["state"] == "partial" and row["bootstrap_state"] == "interrupted"
     assert row["reflog_start_ts"] and row["head_at_create"]
     assert w.rows("SELECT * FROM bootstrap_paths WHERE record_id=?", rec["id"]) == []
+    assert [r["oid"] for r in w.rows("SELECT oid FROM stash_ids WHERE record_id=?", rec["id"])] == [
+        oid
+    ]
+
+
+def test_a_failure_while_settling_a_crash_shape_leaves_no_half_settled_partial(
+    w: RC, shm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import state
+
+    rec = w.wt()
+    crash_after_add(w, rec)
+    w.update(
+        "INSERT INTO bootstrap_paths(record_id, path, kind, digest) VALUES (?, 'x', 'file', 'd')",
+        rec["id"],
+    )
+    bad_hook(w, shm)
+    monkeypatch.setattr(worktrees, "_stash_ids", lambda git, common: ["b" * 40])
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(state.State, "_write_stash_ids", staticmethod(boom))
+    try:
+        w.rc()
+    except RuntimeError:
+        pass
+    row = w.row(rec["id"])
+    assert row["state"] == "creating" and row["bootstrap_state"] != "interrupted"
+    assert len(w.rows("SELECT * FROM bootstrap_paths WHERE record_id=?", rec["id"])) == 1
     assert w.rows("SELECT * FROM stash_ids WHERE record_id=?", rec["id"]) == []
 
 
