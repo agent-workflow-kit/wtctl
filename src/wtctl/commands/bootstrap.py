@@ -15,7 +15,8 @@ from .. import baselinesvc, bootstrapper, fsafe, inuse, repobaseline
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError, bootstrap_failed_details
 from ..gitsetup import open_git, with_filters
-from ..state import BASELINE_FORMAT, LEGACY_BASELINE_FORMAT, Record, record_lease
+from ..hardgit import Git
+from ..state import Record, record_lease
 from .create import record_object
 
 BOOTSTRAPPABLE = "active"
@@ -53,7 +54,7 @@ def run(ctx: Context) -> Result:
     else:
         _check(record)
     if ctx.dry_run:
-        baselinesvc.verify_unchanged(config, state, record)
+        baselinesvc.verify_unchanged(config, state, record, git)
         inuse.require_unused(ctx.gateway, state, record, limit=config.remove.nested_scan_limit)
         return _dry(ctx, record)
     with state.lease(record_lease(record["id"]), wait=config.lease_wait_s) as lease:
@@ -61,7 +62,7 @@ def run(ctx: Context) -> Result:
         if record is None:
             raise WtctlError("not_found", f"no record for {a.target}")
         _check(record)
-        baselinesvc.verify_unchanged(config, state, record)
+        baselinesvc.verify_unchanged(config, state, record, git)
         warnings: list[str] = inuse.require_unused(
             ctx.gateway, state, record, limit=config.remove.nested_scan_limit
         )
@@ -107,21 +108,27 @@ def run(ctx: Context) -> Result:
                 f"bootstrap step {len(outcome.steps)} failed in {record['path']}",
                 details=bootstrap_failed_details(out, outcome.failed_step, warnings),
             )
-        record = _rerecord(ctx, record)
+        record = _rerecord(ctx, record, git)
         out = record_object(record, summary)
         boot = {**summary, "tracked_changes": outcome.tracked_changes}
     return _result(out, boot, warnings, dry=False, human=f"bootstrapped {record['name']}")
 
 
-def _rerecord(ctx: Context, record: Record) -> Record:
+def _rerecord(ctx: Context, record: Record, git: Git) -> Record:
     """After a successful run: the new baseline. One that cannot be computed in full is refused
     (``repo_config_changed``, exit 20; the bootstrap bounds are the baseline's) and the old
     baseline stays recorded; the refused items are the incomplete ones, each with its ``detail``
     and its recorded state as ``before``."""
     # a baseline recorded before symlink targets were covered stays in its format: only
     # `baseline accept` upgrades it, so a re-run cannot start to fail on the new items
-    legacy = not baselinesvc.follows_links(ctx.state, record["id"])
-    current = baselinesvc.record_current(ctx.config, record, links=not legacy)
+    fmt = ctx.state.baseline_format(record["id"])
+    current = baselinesvc.record_current(
+        ctx.config,
+        record,
+        links=baselinesvc.follows_links(ctx.state, record["id"]),
+        linked=baselinesvc.skips_linked(ctx.state, record["id"]),
+        git=git,
+    )
     if current.has_detail():
         recorded = baselinesvc.recorded_items(ctx.state, record["id"])
         rows = [r for r in repobaseline.compare(recorded, current.items) if r.get("detail")]
@@ -132,7 +139,7 @@ def _rerecord(ctx: Context, record: Record) -> Record:
         BOOTSTRAPPABLE,
         baseline_digest=current.digest,
         baseline_items=baselinesvc.item_rows(current),
-        baseline_format=LEGACY_BASELINE_FORMAT if legacy else BASELINE_FORMAT,
+        baseline_format=fmt,
     )
 
 

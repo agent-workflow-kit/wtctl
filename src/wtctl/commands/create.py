@@ -982,7 +982,7 @@ class Creator:
         current = self.state.get_record(record["id"])
         assert current is not None
         try:
-            baseline = baselinesvc.record_current(self.config, current)
+            baseline = baselinesvc.record_current(self.config, current, git=self.git)
         except BaseException as exc:
             kept = self._kept(exc, record, plan)
             if kept is exc:

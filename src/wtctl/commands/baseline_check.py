@@ -10,14 +10,15 @@ from typing import Any
 
 from .. import baselinesvc
 from ..context import Context, Result
+from ..gitsetup import open_git
 from ..output import escape_control
-from ..state import LEGACY_BASELINE_FORMAT
 
 
 def run(ctx: Context) -> Result:
     record = ctx.state.resolve(ctx.args.target)
     baselinesvc.require_worktree(record, "baseline check")
-    _links, current = baselinesvc.verify_unchanged(ctx.config, ctx.state, record)
+    git = baselinesvc.LazyGit(lambda: open_git(ctx.config, ctx.gateway))
+    _links, current = baselinesvc.verify_unchanged(ctx.config, ctx.state, record, git)
     data: dict[str, Any] = {
         "id": record["id"],
         "changed": False,
@@ -25,15 +26,15 @@ def run(ctx: Context) -> Result:
         "recorded_digest": baselinesvc.recorded_digest(record),
     }
     notice = f"{record['name']}: baseline unchanged"
-    if not baselinesvc.follows_links(ctx.state, record["id"]):
-        # a format 1 baseline: unchanged by its own rules; say what accept would newly cover
-        data["format"] = LEGACY_BASELINE_FORMAT
-        added = baselinesvc.new_coverage(ctx.config, ctx.state, record, current)
+    if not baselinesvc.skips_linked(ctx.state, record["id"]):
+        # a format 1 or 2 baseline: unchanged by its own rules; say what accept would newly cover
+        data["format"] = ctx.state.baseline_format(record["id"])
+        added = baselinesvc.new_coverage(ctx.config, ctx.state, record, current, git)
         if added:
             data["new_coverage"] = added
             notice += (
-                f"\n{record['name']}: {len(added)} symlink-target items are not covered by this "
-                "baseline; run `baseline accept` to record them"
+                f"\n{record['name']}: {len(added)} items would be added or changed by the current "
+                "baseline format; run `baseline accept` to record them"
             )
     blind = current.uncovered()
     if blind:

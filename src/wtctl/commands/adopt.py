@@ -337,7 +337,7 @@ class Adopter:
         settings = self.config.repo(repo)
         rid = state.preview_id() if self.dry else state.allocate_id()
         pseudo["id"] = rid
-        baseline = baselinesvc.record_current(self.config, pseudo)
+        baseline = baselinesvc.record_current(self.config, pseudo, git=self.git)
         if baseline.has_detail():
             bad = [i.path for i in baseline.items if i.detail][:5]
             raise WtctlError(

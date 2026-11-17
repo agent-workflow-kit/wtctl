@@ -128,6 +128,8 @@ class Status:
             hooks_id=baselinesvc.hooks_identity(items),
             hooks_path=baselinesvc.hooks_recorded_path(items),
             links=baselinesvc.follows_links(self.state, r["id"]),
+            linked=baselinesvc.skips_linked(self.state, r["id"]),
+            git=self.git,
         )
         current = baselinesvc.compute(spec)
         self.baseline_current = current

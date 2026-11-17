@@ -154,7 +154,7 @@ def test_the_record_and_both_leases_exist_while_the_worktree_is_added(w: CW, cap
     seen: dict = {}
 
     def look(sub, argv, kw):  # noqa: ANN001, ANN202
-        if sub == "worktree":
+        if sub == "worktree" and "add" in argv:  # not the later `worktree list` of the baseline
             seen["records"] = [(r["id"], r["state"]) for r in w.records()]
             seen["leases"] = leases(w)
 

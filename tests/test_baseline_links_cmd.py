@@ -73,17 +73,17 @@ def link_claude_md(rec: dict) -> Path:
 # --- format 2 ------------------------------------------------------------------------------
 
 
-def test_create_records_format_2(w: CW, capsys) -> None:  # noqa: ANN001
+def test_create_records_the_current_format(w: CW, capsys) -> None:  # noqa: ANN001
     rec = made(w, capsys)
-    assert fmt(w, rec["id"]) == 2
+    assert fmt(w, rec["id"]) == 3
     data = good_check(check(w, capsys, rec["id"]))
     assert "format" not in data and "new_coverage" not in data
 
 
-def test_adopt_records_format_2(w: CW, capsys) -> None:  # noqa: ANN001
+def test_adopt_records_the_current_format(w: CW, capsys) -> None:  # noqa: ANN001
     path = foreign(w)
     rec = ok_adopt(adopt(w, capsys, path))["record"]
-    assert fmt(w, rec["id"]) == 2
+    assert fmt(w, rec["id"]) == 3
 
 
 def test_an_edit_behind_claude_md_is_a_baseline_change_after_accept(w: CW, capsys) -> None:  # noqa: ANN001
@@ -175,7 +175,7 @@ def test_accept_upgrades_a_format_1_record_and_new_coverage_applies(w: CW, capsy
     make_legacy(w, rec["id"])
     data = good_accept(accept(w, capsys, rec["id"], "--yes"))
     assert [i["key"] for i in data["items"]] == [KEY]
-    assert fmt(w, rec["id"]) == 2
+    assert fmt(w, rec["id"]) == 3
     good_check(check(w, capsys, rec["id"]))
     agents.write_text("now seen")
     err_of(check(w, capsys, rec["id"]), 20, "repo_config_changed")
@@ -207,7 +207,7 @@ def test_a_cross_device_new_item_does_not_fail_a_format_1_record_and_accept_reco
         assert not any(i.get("detail") for i in data["new_coverage"])
         good_check(check(w, capsys, rec["id"]))  # still routine
         good_accept(accept(w, capsys, rec["id"], "--yes"))
-        assert fmt(w, rec["id"]) == 2
+        assert fmt(w, rec["id"]) == 3
         assert good_check(check(w, capsys, rec["id"]))["uncovered"] == ["CLAUDE.md"]
     finally:
         other.unlink()
@@ -225,12 +225,12 @@ def test_a_bootstrap_rerun_keeps_a_format_1_record_in_format_1(w: CW, capsys) ->
     good_check(check(w, capsys, rec["id"]))
 
 
-def test_a_bootstrap_rerun_of_a_format_2_record_stays_format_2(w: CW, capsys) -> None:  # noqa: ANN001
+def test_a_bootstrap_rerun_of_a_current_format_record_stays_current(w: CW, capsys) -> None:  # noqa: ANN001
     from tests.test_bootstrap_cmd import good, rerun
 
     rec = made(w, capsys)
     good(rerun(w, capsys, rec["id"]))
-    assert fmt(w, rec["id"]) == 2
+    assert fmt(w, rec["id"]) == 3
 
 
 def test_the_removal_checks_of_a_format_1_record_ignore_the_new_items(

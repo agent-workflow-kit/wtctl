@@ -317,7 +317,7 @@ class Reconciler:
         info = worktrees.inspect_existing(self.git, rec["common_dir"], admin)
         # the baseline first: a record that cannot be adopted is left exactly as it was
         baseline = baselinesvc.record_current(
-            self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}
+            self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}, git=self.git
         )
         if baseline.has_detail():
             self.warnings.append(f"{rec['id']}: the repo-config baseline could not be recorded")
