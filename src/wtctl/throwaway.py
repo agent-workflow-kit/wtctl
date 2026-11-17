@@ -244,6 +244,8 @@ class ThrowawayCreator:
         """The throwaway root must not lie in (or be) the directory of any live record, or a
         clone or worktree wtctl knows (Locations, path rules; exit 2)."""
         known = [r["path"] for r in self.state.records() if r["path"]]
+        self._check_root_within(known)
+        known = []
         if self.res is not None:
             known.append(self.res.clone_path)
             try:
@@ -251,10 +253,27 @@ class ThrowawayCreator:
             except WtctlError:
                 pass  # no list of the clone's worktrees: the records and the clone path remain
         known += [c.clone for c in map(self.config.repo, self.config.repos) if c.clone]
+        self._check_root_within(known)
+
+    def _check_root_within(self, known: list[str]) -> None:
         for d in known:
             real = os.path.realpath(d)
             if self.root == real or self.root.startswith(real.rstrip("/") + "/"):
                 raise UsageError(f"the throwaway root {self.root} lies inside {d}")
+
+    def _check_record_overlap(self, rows: list[Record]) -> None:
+        """The path rule against the live records of every repo and throwaway, run inside the
+        record-insert transaction: a worktree create or adopt in another clone (which this
+        creator's lease does not serialize) may have committed a record since the pre-check. The
+        root may not be, or lie inside, a record's path (so throwaways never nest, nor sit in a
+        worktree), and no record may lie inside the new throwaway's own path. An equal path is
+        left to the insert's unique constraint (``path_exists``)."""
+        paths = [r["path"] for r in rows if r["path"]]
+        self._check_root_within([d for d in paths if os.path.realpath(d) != self.path])
+        for d in paths:
+            real = os.path.realpath(d)
+            if real != self.path and real.startswith(self.path + "/"):
+                raise UsageError(f"the throwaway {self.path} contains the existing record {d}")
 
     # -- step 5: hooks ------------------------------------------------------------------------
 
@@ -421,7 +440,9 @@ class ThrowawayCreator:
         # A creator killed outright after this insert leaves a `creating` record and possibly a
         # directory; `reconcile` settles it (prune never touches `creating` records).
         try:
-            return self.state.insert_record_leased(self._fields(root_id), labels=self.o.labels)
+            return self.state.insert_record_leased(
+                self._fields(root_id), labels=self.o.labels, guard=self._check_record_overlap
+            )
         except Conflict as exc:
             raise WtctlError(
                 "refused", f"{self.path} was taken meanwhile ({exc.column})", reason="path_exists"
