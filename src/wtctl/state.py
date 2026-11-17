@@ -142,7 +142,10 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
 )
 
 # The format of every baseline wtctl records now; a record without a baseline_meta row is 1.
-BASELINE_FORMAT = 2
+# 2: symlink targets are followed (#64, #68); 3: verified linked worktrees beneath the walked tree
+# are skipped and recorded as ``linked-worktree`` items (#71).
+BASELINE_FORMAT = 3
+LINKS_BASELINE_FORMAT = 2
 LEGACY_BASELINE_FORMAT = 1
 
 COLUMNS = (

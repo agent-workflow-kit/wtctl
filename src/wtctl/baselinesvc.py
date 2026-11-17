@@ -11,11 +11,12 @@ import os
 import pwd
 from typing import Any
 
-from . import linkcheck, repobaseline
+from . import linkcheck, repobaseline, worktrees
 from .errors import UsageError, WtctlError
+from .hardgit import Git
 from .locate import describe_mount
 from .repobaseline import Baseline, Item, Spec
-from .state import BASELINE_FORMAT
+from .state import BASELINE_FORMAT, LINKS_BASELINE_FORMAT
 
 # The collector runner: ``fsafe_child.run_op`` (a child process under the walk deadline) unless
 # a test substitutes ``repobaseline.inproc``.
@@ -75,6 +76,8 @@ def spec_for(
     hooks_path: str | None = None,
     rebind_hooks: bool = False,
     links: bool = True,
+    linked: bool = True,
+    git: Git | None = None,
 ) -> Spec:
     return Spec(
         common_dir=record["common_dir"],
@@ -89,7 +92,23 @@ def spec_for(
         hooks_identity_path=hooks_path,
         rebind_hooks=rebind_hooks,
         links=links,
+        linked=linked,
+        listed=listed_worktrees(git, record["common_dir"]) if linked and git is not None else [],
     )
+
+
+def listed_worktrees(git: Git, common_dir: str) -> list[str]:
+    """The paths of the clone's linked worktrees that git lists and that are neither locked nor
+    prunable (docs/interface.md, Baseline, Linked worktrees). One ``git worktree list`` per
+    computation, cross-checked against the admin entries (``worktrees.worktree_entries``). A
+    listing that fails, or that is forged (a path with a newline), hands in nothing: every
+    directory is then walked, which can only report a change, never hide one."""
+    try:
+        entries = worktrees.worktree_entries(git, common_dir)
+    except WtctlError:
+        return []
+    rest = entries if entries and entries[0].bare else entries[1:]
+    return [e.path for e in rest if not e.bare and e.locked is None and e.prunable is None]
 
 
 def follows_links(state: Any, record_id: str) -> bool:
@@ -97,6 +116,13 @@ def follows_links(state: Any, record_id: str) -> bool:
     A baseline recorded before that (format 1) is compared by the collector that recorded it, so
     the new coverage never makes a routine command fail by itself (docs/interface.md,
     Baseline, Format)."""
+    return bool(state.baseline_format(record_id) >= LINKS_BASELINE_FORMAT)
+
+
+def skips_linked(state: Any, record_id: str) -> bool:
+    """Whether the record's baseline is compared with the collector that skips verified linked
+    worktrees (format 3). A format 1 or 2 baseline was recorded with their content in it and is
+    compared by the collector that recorded it (docs/interface.md, Baseline, Format)."""
     return bool(state.baseline_format(record_id) >= BASELINE_FORMAT)
 
 
@@ -173,7 +199,7 @@ def require_worktree(record: dict[str, Any], what: str) -> None:
 
 
 def verify_unchanged(
-    config: Any, state: Any, record: dict[str, Any]
+    config: Any, state: Any, record: dict[str, Any], git: Git | None = None
 ) -> tuple[linkcheck.Links, Baseline]:
     """Integrity, then the baseline compared with the recorded one; a change in either class
     raises ``repo_config_changed`` (the shared part of ``baseline check`` and a bootstrap
@@ -188,6 +214,8 @@ def verify_unchanged(
         hooks_id=hooks_identity(items),
         hooks_path=hooks_recorded_path(items),
         links=follows_links(state, record["id"]),
+        linked=skips_linked(state, record["id"]),
+        git=git,
     )
     current = compute(spec)
     if is_changed(record, current):
@@ -196,12 +224,12 @@ def verify_unchanged(
 
 
 def new_coverage(
-    config: Any, state: Any, record: dict[str, Any], current: Baseline
+    config: Any, state: Any, record: dict[str, Any], current: Baseline, git: Git | None = None
 ) -> list[dict[str, Any]]:
-    """For a format 1 record whose baseline matched: the items a ``baseline accept`` would add
-    (the format 2 collector's items that the format 1 one did not emit), as ``baseline_item``
-    rows. Empty for a format 2 record."""
-    if follows_links(state, record["id"]):
+    """For a format 1 or 2 record whose baseline matched: what a ``baseline accept`` would change
+    (the current collector's items that the recording one did not emit, or emitted differently),
+    as ``baseline_item`` rows. Empty for a format 3 record."""
+    if skips_linked(state, record["id"]):
         return []
     items = recorded_items(state, record["id"])
     full = compute(
@@ -212,16 +240,30 @@ def new_coverage(
             dir_id=record["dir_id"],
             hooks_id=hooks_identity(items),
             hooks_path=hooks_recorded_path(items),
+            git=git,
         )
     )
     return repobaseline.compare(current.items, full.items)
 
 
-def record_current(config: Any, record: dict[str, Any], *, links: bool = True) -> Baseline:
+def record_current(
+    config: Any,
+    record: dict[str, Any],
+    *,
+    links: bool = True,
+    linked: bool = True,
+    git: Git | None = None,
+) -> Baseline:
     """The baseline of a worktree that was just made or just bootstrapped, from the record's own
     identities (``create`` and a bootstrap re-run record it)."""
     return compute(
         spec_for(
-            config, record, common_id=record["common_id"], dir_id=record["dir_id"], links=links
+            config,
+            record,
+            common_id=record["common_id"],
+            dir_id=record["dir_id"],
+            links=links,
+            linked=linked,
+            git=git,
         )
     )

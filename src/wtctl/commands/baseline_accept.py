@@ -106,6 +106,7 @@ def _snapshot(ctx: Context, record: dict[str, Any]) -> Snapshot:
         hooks_id=hooks_id,
         hooks_path=hooks_path,
         rebind_hooks=True,
+        git=open_git(config, ctx.gateway),
     )
     current = baselinesvc.compute(spec)
     anchors = known
@@ -213,6 +214,7 @@ def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
             hooks_id=baselinesvc.hooks_identity(recorded),
             hooks_path=baselinesvc.hooks_recorded_path(recorded),
             rebind_hooks=True,
+            git=git,
         )  # fmt: skip
     )
     if preview.has_detail():

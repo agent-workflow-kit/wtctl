@@ -262,12 +262,13 @@
                 "symlink",
                 "config",
                 "symlink_target",
-                "symlink_uncovered"
+                "symlink_uncovered",
+                "linked_worktree"
               ]
             },
             "sha256": {
               "$ref": "#/$defs/digest",
-              "description": "file: content hash; directory: hash of the recursive listing of names, types and content hashes; symlink: hash of the target string; config: hash of the key's values in order; symlink_target (key symlink-target, baseline format 2): hash of every hop's target string and of the final target (a file's content hash and executable bit, a directory's listing, or its absence), or a link to the null device (/dev/null, by type only); symlink_uncovered (key symlink-target, baseline format 2): the link's target is on another device or mount (/dev/null excepted), at a position nothing runs or parses (CLAUDE*.md, info/exclude, core.excludesFile, alternates; elsewhere it is the mount_point refusal), so nothing behind it is read: hash of every hop's target string and of the path and type of the first entry on the other device, never of any content. A change of the link or of that path is a change; a change of the content behind it is not detected."
+              "description": "file: content hash; directory: hash of the recursive listing of names, types and content hashes; symlink: hash of the target string; config: hash of the key's values in order; symlink_target (key symlink-target, baseline format 2): hash of every hop's target string and of the final target (a file's content hash and executable bit, a directory's listing, or its absence), or a link to the null device (/dev/null, by type only); symlink_uncovered (key symlink-target, baseline format 2): the link's target is on another device or mount (/dev/null excepted), at a position nothing runs or parses (CLAUDE*.md, info/exclude, core.excludesFile, alternates; elsewhere it is the mount_point refusal), so nothing behind it is read: hash of every hop's target string and of the path and type of the first entry on the other device, never of any content. A change of the link or of that path is a change; a change of the content behind it is not detected. linked_worktree (key linked-worktree, class claude, baseline format 3; path is the directory): a linked worktree of the same clone beneath the walked tree that git lists and whose .git file and admin entry verify; its content is not read: hash of the directory path and the admin entry name only. Its appearance, disappearance or replacement is a change; an edit inside it is not."
             }
           },
           "additionalProperties": false,
@@ -353,7 +354,7 @@
           ],
           "minLength": 1,
           "x-untrusted": true,
-          "description": "Untrusted: a config key (section[.subsection].key) read from a file agents can write; the fixed value symlink-target for a symlink_target item; null for items that are neither."
+          "description": "Untrusted: a config key (section[.subsection].key) read from a file agents can write; the fixed value symlink-target for a symlink_target item, linked-worktree for a linked_worktree item; null for items that are neither."
         },
         "before": {
           "$ref": "#/$defs/baseline_entry"

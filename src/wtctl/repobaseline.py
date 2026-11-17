@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import baselinelinks, fsafe, gitconfig
+from . import baselinelinked, baselinelinks, fsafe, gitconfig
 
 EMPTY = hashlib.sha256(b"").hexdigest()
 MAX_FILE = 64 * 1024 * 1024
@@ -95,6 +95,9 @@ class Spec:
     hooks_identity_path: str | None = None  # the path it was recorded for (None: whatever path)
     rebind_hooks: bool = False  # trust the current identity (baseline accept after inspection)
     links: bool = True  # follow symlinks (baseline format 2); False is the legacy format 1
+    # skip verified linked worktrees beneath the walk (baseline format 3), of those git listed
+    linked: bool = True
+    listed: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -313,7 +316,11 @@ class Tree:
     def readlink(self, parts: tuple[str, ...]) -> str:
         return os.readlink(parts[-1], dir_fd=self.parent(parts))
 
-    def listing(self, skip: Callable[[fsafe.Entry], bool] | None = None) -> tuple[str, str | None]:
+    def listing(
+        self,
+        skip: Callable[[fsafe.Entry], bool] | None = None,
+        linked: baselinelinked.LinkedWorktrees | None = None,
+    ) -> tuple[str, str | None]:
         """Hash of the recursive listing of the whole tree below the root, and a status
         (``None``, ``incomplete`` or ``mount_point``)."""
         h = hashlib.sha256()
@@ -322,8 +329,15 @@ class Tree:
         progress = [0]
         sub = Tree(self.anchor, self.root_fd, self.root_path, self.budget)
 
+        def skipped(e: fsafe.Entry) -> bool:
+            # a verified linked worktree is not read and not listed: the claude collector
+            # records it as a ``linked-worktree`` item instead
+            return (skip is not None and skip(e)) or (
+                linked is not None and linked.check(self.root_path, e)
+            )
+
         def descend(e: fsafe.Entry) -> bool:
-            return not (skip is not None and skip(e))
+            return not skipped(e)
 
         try:
             walker = fsafe.walk_tree(
@@ -335,7 +349,7 @@ class Tree:
                 progress=progress,
             )
             for e in walker:
-                if skip is not None and skip(e):
+                if skipped(e):
                     continue
                 rel = _enc("/".join(e.path))
                 typ, sha, x = e.kind, "", ""
@@ -989,9 +1003,29 @@ class ClaudeCollector:
         self.spec = spec
         self.budget = Budget(spec.limit, spec.max_total, spec.max_file)
         self.items: list[Item] = []
+        self.linked: baselinelinked.LinkedWorktrees | None = None
 
     def _problem(self, rel: str, detail: str, typ: str = "directory") -> None:
         self.items.append(Item("claude", rel, None, typ, EMPTY, detail))
+
+    def _linked_items(self) -> None:
+        """The decision of the walk, after repeating it: one item per verified linked worktree,
+        ``incomplete`` for one that does not verify the same way a second time."""
+        if self.linked is None:
+            return
+        good, bad = self.linked.reverify()
+        for v in good:
+            self.items.append(
+                Item(
+                    "claude",
+                    v.rel,
+                    baselinelinked.LINKED_KEY,
+                    baselinelinked.LINKED_TYPE,
+                    baselinelinked.identity_hash(v.rel, v.admin),
+                )  # fmt: skip
+            )
+        for rel in bad:
+            self._problem(rel, "incomplete")
 
     def run(self) -> list[Item]:
         spec = self.spec
@@ -1002,11 +1036,21 @@ class ClaudeCollector:
             return self.items
         tree = Tree(anchor, anchor.fd, anchor.path, self.budget)
         charge = Charge(self.budget)
+        if spec.linked and spec.listed:
+            self.linked = baselinelinked.LinkedWorktrees(
+                anchor, spec.common_dir, spec.common_id, spec.listed,
+                lambda n: _is_claude_name(n) or _is_claude_md(n) or n == ".git",
+            )  # fmt: skip
         try:
             self._walk(anchor, tree, charge)
         except (fsafe.FsafeError, Stop, OSError) as exc:
             self._problem(".", _detail_for(exc) if not isinstance(exc, OSError) else "incomplete")
         finally:
+            try:
+                self._linked_items()
+            finally:
+                if self.linked is not None:
+                    self.linked.close()
             tree.close()
             charge.settle()
             anchor.close()
@@ -1015,7 +1059,11 @@ class ClaudeCollector:
     def _walk(self, anchor: fsafe.Anchor, tree: Tree, charge: Charge) -> None:
         def descend(e: fsafe.Entry) -> bool:
             name = e.path[-1]
-            return name != ".git" and not _is_claude_name(name)
+            return (
+                name != ".git"
+                and not _is_claude_name(name)
+                and not (self.linked is not None and self.linked.check(anchor.path, e))
+            )
 
         for e in fsafe.walk_tree(
             anchor,
@@ -1035,6 +1083,8 @@ class ClaudeCollector:
                 # whatever its name: an entry that cannot be read may hold any of the files
                 self._problem(rel, "incomplete")
                 continue
+            if self.linked is not None and self.linked.check(anchor.path, e):
+                continue  # recorded by _linked_items
             if _is_claude_name(name):
                 self._item(anchor, tree, e, rel)
             elif _is_claude_md(name) and e.kind != "dir":
@@ -1060,7 +1110,7 @@ class ClaudeCollector:
                 fd = fsafe.open_dir(anchor, pfd, e.path[-1])
                 try:
                     sub = Tree(anchor, fd, anchor.path + "/" + rel, self.budget)
-                    sha, status = sub.listing(skip=_cc_writes)
+                    sha, status = sub.listing(skip=_cc_writes, linked=self.linked)
                     if self.spec.links:
                         st = anchor.fs.fstat(fd)
                         self.items += follow_inner(

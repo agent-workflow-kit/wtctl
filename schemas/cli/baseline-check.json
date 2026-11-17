@@ -19,8 +19,11 @@
       "$ref": "../defs.json#/$defs/digest"
     },
     "format": {
-      "const": 1,
-      "description": "Present only for a record whose baseline was recorded before symlink targets were covered (format 1); it is compared by the format 1 collector. baseline accept re-records it as format 2."
+      "enum": [
+        1,
+        2
+      ],
+      "description": "Present only for a record whose baseline was recorded in an older format: 1 before symlink targets were covered, 2 before verified linked worktrees beneath the worktree were skipped. It is compared by the collector that recorded it; baseline accept re-records it as format 3."
     },
     "uncovered": {
       "type": "array",
@@ -37,7 +40,7 @@
       "items": {
         "$ref": "../defs.json#/$defs/baseline_item"
       },
-      "description": "Only with format, and only when not empty: the items a baseline accept would add (symlink targets); one with a detail would block it. A notice, never a failure."
+      "description": "Only with format, and only when not empty: the items a baseline accept would add or change (symlink targets, linked-worktree items and the directory items that stop listing a linked worktree); one with a detail would block it. A notice, never a failure."
     }
   },
   "additionalProperties": false,
