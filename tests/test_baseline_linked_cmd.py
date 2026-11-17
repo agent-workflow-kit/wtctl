@@ -224,3 +224,90 @@ def test_the_listing_failing_never_hides_anything(
     monkeypatch.setattr(worktrees, "worktree_entries", boom)
     e = err_of(check(w, capsys, rec["id"]), 20, "repo_config_changed")  # walked: reported
     assert [i["after"] for i in e["items"] if i["key"] == KEY] == ["absent"]
+
+
+# --- round 1: lazy git, listing failures, bootstrap of an old record --------------------------
+
+
+def _git_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wtctl.errors import WtctlError
+
+    def boom(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        raise WtctlError("internal", "git not found")
+
+    monkeypatch.setattr(baseline_check, "open_git", boom)
+    monkeypatch.setattr(baseline_accept, "open_git", boom)
+
+
+def test_check_of_an_old_record_works_when_git_cannot_be_opened(
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    rec = main_record(w, capsys)
+    rerecord_as(w, rec["id"], 2)
+    _git_unavailable(monkeypatch)
+    data = good_check(check(w, capsys, rec["id"]))
+    assert data["format"] == 2 and data["changed"] is False
+
+
+def test_check_of_a_format_3_record_with_git_unavailable_skips_nothing(
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    linked(w)
+    rec = main_record(w, capsys)
+    _git_unavailable(monkeypatch)
+    e = err_of(check(w, capsys, rec["id"]), 20, "repo_config_changed")  # a report, not an error
+    assert [i["after"] for i in e["items"] if i["key"] == KEY] == ["absent"]
+
+
+def test_accept_with_git_unavailable_records_a_failed_listing_not_an_error(
+    w: CW,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    rec = main_record(w, capsys)
+    linked(w, "later")
+    _git_unavailable(monkeypatch)
+    good_accept(accept(w, capsys, rec["id"], "--yes"))
+    assert not [i for i in w.rows('SELECT "key" FROM baseline_items WHERE record_id = ?', rec["id"])
+                if i["key"] == KEY]  # fmt: skip
+
+
+def test_a_file_in_place_of_the_admin_directory_is_not_an_internal_error(w: CW, capsys) -> None:  # noqa: ANN001
+    rec = main_record(w, capsys)
+    (w.clone / ".git" / "worktrees").write_text("junk\n")
+    good_check(check(w, capsys, rec["id"]))
+    assert w.cli(capsys, "status", rec["id"]).code == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores modes")
+def test_an_unreadable_admin_directory_is_not_an_internal_error(w: CW, capsys) -> None:  # noqa: ANN001
+    linked(w)
+    rec = main_record(w, capsys)
+    adm = w.clone / ".git" / "worktrees"
+    adm.chmod(0)
+    try:
+        # the listing fails: nothing is skipped, so the walk reports; never an internal error
+        err_of(check(w, capsys, rec["id"]), 20, "repo_config_changed")
+    finally:
+        adm.chmod(0o755)
+
+
+def test_a_bootstrap_rerun_keeps_format_2_with_a_linked_worktree_beneath(w: CW, capsys) -> None:  # noqa: ANN001
+    from tests.test_bootstrap_cmd import good as boot_good
+    from tests.test_bootstrap_cmd import made, rerun
+
+    rec = made(w, capsys)
+    base = Path(rec["path"])
+    w.g(["worktree", "add", "-q", "-b", "b-under", str(base / ".claude" / "worktrees" / "u")])
+    rerecord_as(w, rec["id"], 2)
+    boot_good(rerun(w, capsys, rec["id"]))
+    assert fmt(w, rec["id"]) == 2
+    data = good_check(check(w, capsys, rec["id"]))
+    assert data["format"] == 2
+    assert KEY not in {i["key"] for i in w.rows(
+        'SELECT "key" FROM baseline_items WHERE record_id = ?', rec["id"]
+    )}  # fmt: skip

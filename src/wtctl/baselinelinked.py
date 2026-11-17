@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -34,7 +33,12 @@ from .errors import WtctlError
 LINKED_KEY = "linked-worktree"  # never a config key: those always contain a dot
 LINKED_TYPE = "linked_worktree"
 _LINKED_VERSION = b"wtctl-linked-v1\n"
-_ADMIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def is_admin_name(name: str) -> bool:
+    """One plain path component: an admin entry's name must not be able to name a nested path
+    (``worktrees/x/y``, which the pointer verification would open) or forge a line."""
+    return name not in ("", ".", "..") and not any(c in name for c in "/\0\n\r")
 
 
 @dataclass(frozen=True)
@@ -134,7 +138,7 @@ class LinkedWorktrees:
             if named is None or not named.startswith(prefix):
                 return None
             name = named[len(prefix) :]
-            if _ADMIN_NAME.fullmatch(name) is None:
+            if not is_admin_name(name):
                 return None
             linkcheck._pointers(  # pyright: ignore[reportPrivateUsage]
                 anchor, dfd, canchor, absolute, self.common_dir, named

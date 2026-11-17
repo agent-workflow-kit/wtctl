@@ -492,3 +492,97 @@ def test_a_failed_listing_hands_in_nothing(w: World, monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(worktrees, "worktree_entries", boom)
     assert listed(w) == []
+
+
+# --- admin names, listing failures, never-skipped names (round 1) -----------------------------
+
+
+@pytest.mark.parametrize("name", ["x+y", "_u", "é", "a@b"])
+def test_a_worktree_with_an_unusual_but_valid_admin_name_is_skipped(w: World, name: str) -> None:
+    tree(w)
+    wt = add_wt(w, f".claude/worktrees/{name}", branch="b-" + name.encode().hex())
+    assert admin_of(w, wt).name == name
+    b = run(w)
+    assert [i.path for i in linked_items(b)] == [f".claude/worktrees/{name}"]
+    before = cdigest(b)
+    (wt / "CLAUDE.md").write_text("edited\n")
+    assert cd(w) == before
+
+
+def test_a_forged_nested_admin_name_is_walked(w: World) -> None:
+    tree(w)
+    d = planted_dir(w, "fake")
+    admin = Path(w.common) / "worktrees" / "fx" / "y"
+    admin.mkdir(parents=True)
+    (admin / "gitdir").write_text(f"{d}/.git\n")
+    (admin / "commondir").write_text(f"{w.common}\n")
+    (d / ".git").write_text(f"gitdir: {admin}\n")
+    before = run(w, listed=[str(d)])
+    assert not linked_items(before)
+    (d / "CLAUDE.md").write_text("planted\n")
+    assert cdigest(run(w, listed=[str(d)])) != cdigest(before)
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "a\nb", "a\rb", "a\0b"])
+def test_admin_name_must_be_one_plain_component(bad: str) -> None:
+    assert not baselinelinked.is_admin_name(bad)
+
+
+@pytest.mark.parametrize("good", ["x", "x+y", "_u", "é", "a@b", "feat-1.2", ".dot", "...x"])
+def test_admin_name_accepts_any_other_single_component(good: str) -> None:
+    assert baselinelinked.is_admin_name(good)
+
+
+def test_a_regular_file_in_place_of_the_admin_directory_hands_in_nothing(w: World) -> None:
+    import shutil as sh
+
+    wt = add_wt(w, ".claude/worktrees/x")
+    sh.rmtree(Path(w.common) / "worktrees")
+    (Path(w.common) / "worktrees").write_text("junk\n")
+    assert wt.exists()
+    assert listed(w) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores modes")
+def test_an_unreadable_admin_directory_hands_in_nothing(w: World) -> None:
+    add_wt(w, ".claude/worktrees/x")
+    adm = Path(w.common) / "worktrees"
+    adm.chmod(0)
+    try:
+        assert listed(w) == []
+    finally:
+        adm.chmod(0o755)
+
+
+def test_a_worktree_path_with_a_newline_is_not_skipped(w: World) -> None:
+    tree(w)
+    wt = add_wt(w, ".claude/worktrees/a\nb", branch="b-nl")
+    assert listed(w) == []
+    b = run(w)
+    assert not linked_items(b)
+    (wt / "CLAUDE.md").write_text("edited\n")
+    assert cdigest(run(w)) != cdigest(b)
+
+
+def test_a_prunable_worktree_is_not_skipped(w: World) -> None:
+    tree(w)
+    wt = add_wt(w, ".claude/worktrees/x")
+    shutil.rmtree(wt)  # git lists it as prunable
+    assert str(wt) not in listed(w)
+    wt.mkdir()
+    (wt / "CLAUDE.md").write_text("planted\n")
+    assert not linked_items(run(w))
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["CLAUDE.md", "sub/claude.md", "CLAUDE-x.md", ".mcp.json", ".claude"],
+)
+def test_a_verified_worktree_at_a_claude_named_path_is_walked(w: World, rel: str) -> None:
+    wt = add_wt(w, rel)
+    assert str(wt) in listed(w)  # git lists it: only the name protects the content
+    b = run(w)
+    assert not [i for i in linked_items(b) if i.path == rel]
+    before = cdigest(b)
+    (wt / "CLAUDE.md").write_text("planted\n")
+    assert cdigest(run(w)) != before

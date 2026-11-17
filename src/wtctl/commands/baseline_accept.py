@@ -106,7 +106,7 @@ def _snapshot(ctx: Context, record: dict[str, Any]) -> Snapshot:
         hooks_id=hooks_id,
         hooks_path=hooks_path,
         rebind_hooks=True,
-        git=open_git(config, ctx.gateway),
+        git=baselinesvc.LazyGit(lambda: open_git(config, ctx.gateway)),
     )
     current = baselinesvc.compute(spec)
     anchors = known

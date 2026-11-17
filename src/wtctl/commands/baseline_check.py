@@ -17,7 +17,7 @@ from ..output import escape_control
 def run(ctx: Context) -> Result:
     record = ctx.state.resolve(ctx.args.target)
     baselinesvc.require_worktree(record, "baseline check")
-    git = open_git(ctx.config, ctx.gateway)
+    git = baselinesvc.LazyGit(lambda: open_git(ctx.config, ctx.gateway))
     _links, current = baselinesvc.verify_unchanged(ctx.config, ctx.state, record, git)
     data: dict[str, Any] = {
         "id": record["id"],
