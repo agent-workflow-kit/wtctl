@@ -165,3 +165,17 @@ def test_an_equal_path_is_the_unique_constraint_not_the_overlap(
     assert err["reason"] == "path_exists"
     assert leaks(w.troot) == []
     assert w.leases() == []
+
+
+@pytest.mark.parametrize("form", ["{path}/", "{path}/.", "{path}/x/.."])
+def test_a_record_resolving_to_the_new_path_by_other_text_is_refused_as_an_overlap(
+    w: TW,
+    planted,  # noqa: ANN001
+    form: str,
+) -> None:
+    the_root(w)
+    planted.append((form, {}))
+    err = w.failed(w.throw("--source", "remote"), 2)
+    assert "contains the existing record" in err["message"]
+    assert leaks(w.troot) == []
+    assert w.leases() == []

@@ -266,13 +266,17 @@ class ThrowawayCreator:
         record-insert transaction: a worktree create or adopt in another clone (which this
         creator's lease does not serialize) may have committed a record since the pre-check. The
         root may not be, or lie inside, a record's path (so throwaways never nest, nor sit in a
-        worktree), and no record may lie inside the new throwaway's own path. An equal path is
-        left to the insert's unique constraint (``path_exists``)."""
+        worktree), and no record may be, or lie inside, the new throwaway's own path. A record
+        whose stored text is exactly the new path is left to the insert's unique constraint
+        (``path_exists``); any other record that resolves to it (trailing slash, ``..``, a
+        symlink) is an overlap."""
         paths = [r["path"] for r in rows if r["path"]]
-        self._check_root_within([d for d in paths if os.path.realpath(d) != self.path])
+        self._check_root_within([d for d in paths if d != self.path])
         for d in paths:
+            if d == self.path:
+                continue
             real = os.path.realpath(d)
-            if real != self.path and real.startswith(self.path + "/"):
+            if real == self.path or real.startswith(self.path + "/"):
                 raise UsageError(f"the throwaway {self.path} contains the existing record {d}")
 
     # -- step 5: hooks ------------------------------------------------------------------------
