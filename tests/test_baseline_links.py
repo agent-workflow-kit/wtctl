@@ -411,7 +411,7 @@ def test_an_empty_target_is_dangling(w: World) -> None:
 
 
 @pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs a second file system")
-def test_a_target_on_another_device_is_a_mount_point_item(w: World) -> None:
+def test_a_target_on_another_device_is_an_uncovered_item(w: World) -> None:
     if os.stat("/dev/shm").st_dev == os.stat(w.tmp).st_dev:
         pytest.skip("/dev/shm shares the device")
     other = Path("/dev/shm") / f"wtctl-link-{os.getpid()}.md"
@@ -419,15 +419,15 @@ def test_a_target_on_another_device_is_a_mount_point_item(w: World) -> None:
     try:
         os.symlink(other, w.wt / "CLAUDE.md")
         b = w.compute()
-        item = one(b, "CLAUDE.md")
-        assert item.detail == "mount_point"
-        assert b.has_detail()
+        got = link_items(b, "CLAUDE.md")
+        assert [(i.type, i.detail) for i in got] == [("symlink_uncovered", None)]
+        assert not b.has_detail()
     finally:
         other.unlink()
 
 
 @pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs a second file system")
-def test_a_link_through_a_directory_on_another_device_is_a_mount_point_item(w: World) -> None:
+def test_a_link_through_a_directory_on_another_device_blocks_at_the_hooks_dir(w: World) -> None:
     if os.stat("/dev/shm").st_dev == os.stat(w.tmp).st_dev:
         pytest.skip("/dev/shm shares the device")
     d = Path("/dev/shm") / f"wtctl-linkdir-{os.getpid()}"
@@ -436,12 +436,13 @@ def test_a_link_through_a_directory_on_another_device_is_a_mount_point_item(w: W
         (d / "hooks").mkdir()
         shutil.rmtree(Path(w.common) / "hooks")
         os.symlink(d / "hooks", Path(w.common) / "hooks")
-        assert one(w.compute(), "/hooks").detail == "mount_point"
+        got = link_items(w.compute(), "/hooks")
+        assert [(i.type, i.detail) for i in got] == [("symlink_target", "mount_point")]
     finally:
         shutil.rmtree(d)
 
 
-def test_a_target_whose_mount_id_differs_is_a_mount_point_item(
+def test_a_target_whose_mount_id_differs_is_an_uncovered_item(
     w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A bind mount on the same device: only the mount id tells."""
@@ -465,7 +466,8 @@ def test_a_target_whose_mount_id_differs_is_a_mount_point_item(
     monkeypatch.setattr(gateway, "fd_mount_id", fake)
     if real(os.open(w.tmp, os.O_RDONLY)) is None:
         pytest.skip("no mount ids on this platform")
-    assert one(w.compute(), "CLAUDE.md").detail == "mount_point"
+    got = link_items(w.compute(), "CLAUDE.md")
+    assert [(i.type, i.detail) for i in got] == [("symlink_uncovered", None)]
 
 
 def test_special_targets_are_recorded_by_type_and_never_opened(w: World) -> None:
@@ -496,8 +498,8 @@ def test_a_socket_target_is_recorded_by_type(w: World) -> None:
 
 def test_a_device_target_is_never_read(w: World) -> None:
     os.symlink("/dev/zero", w.wt / "CLAUDE.md")  # endless if it were read
-    item = one(w.compute(), "CLAUDE.md")
-    assert item.detail in ("mount_point", "incomplete", None)
+    item = link_items(w.compute(), "CLAUDE.md")[0]
+    assert item.detail is None
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads everything")
@@ -772,17 +774,23 @@ class _OtherDeviceSpecials(fsafe.Fs):
         return st
 
 
-def test_a_special_target_on_another_device_is_recorded_by_type(
+def test_a_special_target_on_another_device_stays_type_only(
     w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """R4: never opened, and the item hash is the one from before cross-device links."""
+    import hashlib
+
     os.mkfifo(w.tmp / "pipe")
     os.symlink(w.tmp / "pipe", w.wt / "CLAUDE.md")
     monkeypatch.setattr(fsafe, "DEFAULT_FS", _OtherDeviceSpecials())
-    item = one(w.compute(), "CLAUDE.md")
-    assert item.detail is None  # a type-only record leaks nothing: not a mount point
+    item = link_items(w.compute(), "CLAUDE.md")[0]
+    assert (item.type, item.detail) == ("symlink_target", None)
+    hop = str(w.tmp / "pipe").encode()
+    h = hashlib.sha256(b"wtctl-link-v1\n" + b"hop:%d:" % len(hop) + hop + b"\nspecial:fifo\n")
+    assert item.sha256 == h.hexdigest()
 
 
-def test_a_regular_file_on_another_device_is_still_a_mount_point(
+def test_a_regular_file_on_another_device_is_uncovered_and_not_read(
     w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Files(fsafe.Fs):
@@ -793,7 +801,8 @@ def test_a_regular_file_on_another_device_is_still_a_mount_point(
     ino = os.stat(w.tmp / "plain").st_ino
     os.symlink(w.tmp / "plain", w.wt / "CLAUDE.md")
     monkeypatch.setattr(fsafe, "DEFAULT_FS", Files())
-    assert one(w.compute(), "CLAUDE.md").detail == "mount_point"
+    item = link_items(w.compute(), "CLAUDE.md")[0]
+    assert (item.type, item.detail) == ("symlink_uncovered", None)
 
 
 def claude_dir_link(w: World, where: str) -> Path:

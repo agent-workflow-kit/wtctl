@@ -191,7 +191,9 @@ def test_a_format_1_change_in_a_format_1_item_still_fails(w: CW, capsys) -> None
 
 
 @pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs a second file system")
-def test_an_unrecordable_new_item_does_not_fail_a_format_1_record(w: CW, capsys) -> None:  # noqa: ANN001
+def test_a_cross_device_new_item_does_not_fail_a_format_1_record_and_accept_records_it(
+    w: CW, capsys
+) -> None:  # noqa: ANN001
     if os.stat("/dev/shm").st_dev == os.stat(w.tmp).st_dev:
         pytest.skip("/dev/shm shares the device")
     rec = made(w, capsys)
@@ -201,11 +203,12 @@ def test_an_unrecordable_new_item_does_not_fail_a_format_1_record(w: CW, capsys)
         os.symlink(other, Path(rec["path"], "CLAUDE.md"))
         make_legacy(w, rec["id"])
         data = good_check(check(w, capsys, rec["id"]))
-        assert any(i.get("detail") == "mount_point" for i in data["new_coverage"])
-        e = err_of(accept(w, capsys, rec["id"], "--yes"), 20, "repo_config_changed")
-        assert any(i.get("detail") == "mount_point" for i in e["items"])
-        assert fmt(w, rec["id"]) is None
+        assert [i["after"]["type"] for i in data["new_coverage"]] == ["symlink_uncovered"]
+        assert not any(i.get("detail") for i in data["new_coverage"])
         good_check(check(w, capsys, rec["id"]))  # still routine
+        good_accept(accept(w, capsys, rec["id"], "--yes"))
+        assert fmt(w, rec["id"]) == 2
+        assert good_check(check(w, capsys, rec["id"]))["uncovered"] == ["CLAUDE.md"]
     finally:
         other.unlink()
 

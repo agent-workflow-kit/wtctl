@@ -172,6 +172,14 @@ class Fs:
     def lstat_at(self, dir_fd: int, name: str) -> FdStat:
         return self.adjust(_fdstat(os.stat(name, dir_fd=dir_fd, follow_symlinks=False)))
 
+    def char_rdev_at(self, dir_fd: int, name: str) -> tuple[int, int] | None:
+        """``(major, minor)`` of ``name`` when it is a character device, else ``None``; the only
+        look the baseline takes at a node on another device (``lstat``, never an open)."""
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISCHR(st.st_mode):
+            return None
+        return os.major(st.st_rdev), os.minor(st.st_rdev)
+
     def mount_id(self, fd: int) -> int | None:
         return gateway.fd_mount_id(fd)
 

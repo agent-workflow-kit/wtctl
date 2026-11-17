@@ -36,6 +36,9 @@ _SKIP_MODULE_DIRS = frozenset({"objects", "refs", "logs"})
 # The item recording what a collected symlink points at (docs/interface.md, Baseline, Symlinks).
 LINK_KEY = "symlink-target"  # never a config key: those always contain a dot
 LINK_TYPE = "symlink_target"
+# A link whose target is on another device or mount (``/dev/null`` excepted): recorded from the
+# hop strings and the final entry's path and type, nothing read, and never a refusal.
+UNCOVERED_TYPE = "symlink_uncovered"
 MAX_LINK_NEST = 4  # a followed directory holding links to directories holding links ...
 _LINK_VERSION = b"wtctl-link-v1\n"
 
@@ -103,6 +106,10 @@ class Baseline:
 
     def has_detail(self) -> bool:
         return any(i.detail for i in self.items)
+
+    def uncovered(self) -> list[str]:
+        """Paths of the links whose target is on another device (not blocking, not read)."""
+        return sorted({i.path for i in self.items if i.type == UNCOVERED_TYPE})
 
 
 # --- digest and comparison -----------------------------------------------------------------
@@ -361,8 +368,10 @@ class Tree:
 # --- following symlinks --------------------------------------------------------------------
 
 
-def _link_item(cls: str, display: str, sha: str, detail: str | None = None) -> Item:
-    return Item(cls, display, LINK_KEY, LINK_TYPE, sha, detail)
+def _link_item(
+    cls: str, display: str, sha: str, detail: str | None = None, type_: str = LINK_TYPE
+) -> Item:
+    return Item(cls, display, LINK_KEY, type_, sha, detail, None)
 
 
 def follow_link(
@@ -373,6 +382,7 @@ def follow_link(
     budget: Budget,
     *,
     keep: bool = False,
+    uncovered_ok: bool = False,
     level: int = 0,
     active: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[list[Item], bytes | None]:
@@ -382,7 +392,9 @@ def follow_link(
     link inside a followed directory. With ``keep`` and a regular file at the end, its bytes too
     (a config file). Anything that cannot be read in full is an item with a ``detail``. The chain
     is resolved twice, around the read, and must be identical: a link retargeted meanwhile is
-    ``incomplete``."""
+    ``incomplete``. A target on another device or mount is a ``symlink_uncovered`` item only with
+    ``uncovered_ok`` (a position whose content nothing runs or parses); everywhere else, the
+    default, it is the blocking ``mount_point``."""
 
     def bad(exc: BaseException | None = None, detail: str | None = None) -> list[Item]:
         d = detail or (_detail_for(exc) if isinstance(exc, fsafe.FsafeError | Stop) else None)
@@ -394,6 +406,9 @@ def follow_link(
         first = baselinelinks.resolve(anchor, abs_path, budget.entry)
     except (fsafe.FsafeError, Stop, OSError) as exc:
         return bad(exc), None
+    if first.uncovered and not uncovered_ok:
+        first.close()
+        return bad(detail="mount_point"), None
     items: list[Item] = []
     data: bytes | None = None
     status: str | None = None
@@ -403,7 +418,10 @@ def follow_link(
             b = _enc(hop)
             h.update(b"hop:%d:" % len(b) + b + b"\n")
         inner: list[tuple[str, ...]] = []
-        if first.kind == "file":
+        if first.uncovered:
+            b = _enc(first.path)
+            h.update(f"uncovered|{first.kind}|".encode() + b"%d:" % len(b) + b + b"\n")
+        elif first.kind == "file":
             sha, data = _read_fd(first.fd, budget, keep)
             h.update(f"file|{sha}|{'x' if first.executable else ''}\n".encode())
         elif first.kind == "dir":
@@ -428,6 +446,7 @@ def follow_link(
                 sub = "/".join(rel)
                 got, _ = follow_link(
                     cls, anchor, f"{first.path}/{sub}", f"{display}/{sub}", budget,
+                    uncovered_ok=_inner_ok(cls, f"{display}/{sub}", uncovered_ok),
                     level=level + 1, active=nested,
                 )  # fmt: skip
                 items += got
@@ -438,7 +457,17 @@ def follow_link(
         return bad(exc), None
     finally:
         first.close()
-    return [_link_item(cls, display, h.hexdigest(), status), *items], data
+    top = _link_item(
+        cls, display, h.hexdigest(), status, UNCOVERED_TYPE if first.uncovered else LINK_TYPE
+    )
+    return [top, *items], data
+
+
+def _inner_ok(cls: str, display: str, inherited: bool) -> bool:
+    """Whether a link found inside a followed directory may be uncovered: in the claude class
+    only a ``CLAUDE*.md`` link at an allowed position (see ``_claude_md_ok``), else what the
+    directory's position allows."""
+    return _claude_md_ok(display.split("/")) if cls == "claude" else inherited
 
 
 def follow_inner(
@@ -449,6 +478,7 @@ def follow_inner(
     display_root: str,
     root_ident: tuple[int, int] | None,
     budget: Budget,
+    uncovered_ok: bool = False,
 ) -> list[Item]:
     """The ``symlink_target`` items of the links found by the last ``tree.listing()``."""
     out: list[Item] = []
@@ -457,7 +487,13 @@ def follow_inner(
         sub = "/".join(rel)
         try:
             got, _ = follow_link(
-                cls, anchor, f"{abs_root}/{sub}", f"{display_root}/{sub}", budget, active=active
+                cls,
+                anchor,
+                f"{abs_root}/{sub}",
+                f"{display_root}/{sub}",
+                budget,
+                uncovered_ok=_inner_ok(cls, f"{display_root}/{sub}", uncovered_ok),
+                active=active,
             )
         except Stop:
             got = [_link_item(cls, f"{display_root}/{sub}", EMPTY, "incomplete")]
@@ -540,7 +576,12 @@ class GitCollector:
             anchor.close()
 
     def _leaf(
-        self, path: str, *, keep: bool = False, physical: str | None = None
+        self,
+        path: str,
+        *,
+        keep: bool = False,
+        physical: str | None = None,
+        uncovered_ok: bool = False,
     ) -> tuple[Item | None, bytes | None]:
         """The item for a file-ish path (``None``: absent) and, with ``keep``, the bytes of a
         regular file (``None`` for anything else). ``physical`` is where the file really is when
@@ -559,11 +600,14 @@ class GitCollector:
                     link = Item("git", path, None, "symlink", _sha(_enc(target)))
                     if not self.spec.links:
                         return link, None
-                    extra, data = follow_link("git", anchor, real, path, self.budget, keep=keep)
+                    extra, data = follow_link(
+                        "git", anchor, real, path, self.budget, keep=keep,
+                        uncovered_ok=uncovered_ok,
+                    )  # fmt: skip
                     self.items += extra
                     return link, data
                 if kind == "dir":
-                    return self._dir_item(path, anchor, pfd, name, real), None
+                    return self._dir_item(path, anchor, pfd, name, real, uncovered_ok), None
                 if kind != "file":
                     return Item("git", path, None, "file", _sha(f"special:{kind}".encode())), None
                 fd = fsafe.open_file(anchor, pfd, name)
@@ -579,7 +623,15 @@ class GitCollector:
         except (Stop, OSError):
             return Item("git", path, None, "file", EMPTY, "incomplete"), None
 
-    def _dir_item(self, path: str, anchor: fsafe.Anchor, pfd: int, name: str, real: str) -> Item:
+    def _dir_item(
+        self,
+        path: str,
+        anchor: fsafe.Anchor,
+        pfd: int,
+        name: str,
+        real: str,
+        uncovered_ok: bool = False,
+    ) -> Item:
         """A directory listing item for ``name`` inside ``pfd`` (anchored by ``anchor``)."""
         try:
             fd = fsafe.open_dir(anchor, pfd, name)
@@ -591,15 +643,17 @@ class GitCollector:
             if self.spec.links:
                 st = anchor.fs.fstat(fd)
                 self.items += follow_inner(
-                    "git", anchor, tree, real, path, (st.dev, st.ino), self.budget
+                    "git", anchor, tree, real, path, (st.dev, st.ino), self.budget, uncovered_ok
                 )
             tree.close()
         finally:
             os.close(fd)
         return Item("git", path, None, "directory", sha, status)
 
-    def _add_leaf(self, path: str, physical: str | None = None) -> None:
-        item, _ = self._leaf(path, physical=physical)
+    def _add_leaf(
+        self, path: str, physical: str | None = None, *, uncovered_ok: bool = False
+    ) -> None:
+        item, _ = self._leaf(path, physical=physical, uncovered_ok=uncovered_ok)
         if item is not None:
             self.items.append(item)
 
@@ -748,9 +802,12 @@ class GitCollector:
         try:
             target = tree.readlink(parts)
             with baselinelinks.resolve(self.common, real, self.budget.entry) as first:
-                if first.kind != "dir":
+                if first.kind not in ("dir", "unresolved"):
                     return
                 self.items.append(Item("git", full, None, "symlink", _sha(_enc(target))))
+                if first.uncovered:  # its config and hooks would be read and run: a refusal
+                    self.items.append(_link_item("git", full, EMPTY, "mount_point"))
+                    return
                 if level >= MAX_LINK_NEST or first.ident in active or first.ident is None:
                     self.items.append(_link_item("git", full, EMPTY, "incomplete"))
                     return
@@ -828,7 +885,7 @@ class GitCollector:
         if path is None:
             self._problem(raw, "incomplete")
             return
-        self._add_leaf(path)
+        self._add_leaf(path, uncovered_ok=True)
 
     def run(self) -> list[Item]:
         spec = self.spec
@@ -881,8 +938,8 @@ class GitCollector:
             self._config_root(root, applies=applies)
         self._add_leaf(f"{c}/hooks")
         self._hooks_path()
-        self._add_leaf(f"{c}/objects/info/alternates")
-        self._add_leaf(f"{c}/info/exclude")
+        self._add_leaf(f"{c}/objects/info/alternates", uncovered_ok=True)
+        self._add_leaf(f"{c}/info/exclude", uncovered_ok=True)
         self._excludes_file()
         self._modules(c, self.common.fd)
         if admin and admin_ok:
@@ -903,6 +960,16 @@ def _is_claude_md(name: str) -> bool:
     # case-insensitive: a default macOS volume loads claude.md as CLAUDE.md
     low = name.casefold()
     return low.startswith("claude") and low.endswith(".md") and len(low) >= len("claude.md")
+
+
+def _claude_md_ok(parts: list[str] | tuple[str, ...]) -> bool:
+    """A ``CLAUDE*.md`` path whose cross-device target may be uncovered: outside every
+    ``.claude`` directory, or a direct child of one. Deeper (commands, agents) it is an
+    executable prompt, not instructions."""
+    if not _is_claude_md(parts[-1]):
+        return False
+    below = [p.casefold() for p in parts[:-1]]
+    return ".claude" not in below or below[-1] == ".claude"
 
 
 def _is_claude_name(name: str) -> bool:
@@ -980,7 +1047,10 @@ class ClaudeCollector:
                     Item("claude", rel, None, "symlink", _sha(_enc(tree.readlink(e.path))))
                 )
                 if self.spec.links:
-                    got, _ = follow_link("claude", anchor, f"{anchor.path}/{rel}", rel, self.budget)
+                    got, _ = follow_link(
+                        "claude", anchor, f"{anchor.path}/{rel}", rel, self.budget,
+                        uncovered_ok=_claude_md_ok(e.path),
+                    )  # fmt: skip
                     self.items += got
             elif e.kind == "file":
                 sha, _, _ = tree.hash_file(e.path)

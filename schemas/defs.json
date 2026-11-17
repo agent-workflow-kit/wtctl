@@ -261,12 +261,13 @@
                 "directory",
                 "symlink",
                 "config",
-                "symlink_target"
+                "symlink_target",
+                "symlink_uncovered"
               ]
             },
             "sha256": {
               "$ref": "#/$defs/digest",
-              "description": "file: content hash; directory: hash of the recursive listing of names, types and content hashes; symlink: hash of the target string; config: hash of the key's values in order; symlink_target (key symlink-target, baseline format 2): hash of every hop's target string and of the final target (a file's content hash and executable bit, a directory's listing, or its absence)."
+              "description": "file: content hash; directory: hash of the recursive listing of names, types and content hashes; symlink: hash of the target string; config: hash of the key's values in order; symlink_target (key symlink-target, baseline format 2): hash of every hop's target string and of the final target (a file's content hash and executable bit, a directory's listing, or its absence), or a link to the null device (/dev/null, by type only); symlink_uncovered (key symlink-target, baseline format 2): the link's target is on another device or mount (/dev/null excepted), at a position nothing runs or parses (CLAUDE*.md, info/exclude, core.excludesFile, alternates; elsewhere it is the mount_point refusal), so nothing behind it is read: hash of every hop's target string and of the path and type of the first entry on the other device, never of any content. A change of the link or of that path is a change; a change of the content behind it is not detected."
             }
           },
           "additionalProperties": false,
