@@ -30,7 +30,7 @@
       },
       "minItems": 1,
       "uniqueItems": true,
-      "description": "Only when not empty: the paths of symlinks whose target is on another device or mount (not /dev/null). The baseline records their hop targets and the path of the first entry on the other device but reads nothing behind them, so a change of that content is not detected. A notice, never a failure; also printed to stderr and shown by status as a warning."
+      "description": "Only when not empty: the paths of symlinks whose target is on another device or mount (not /dev/null). The baseline records their hop targets and the path of the first entry on the other device but reads nothing behind them, so a change of that content is not detected. Only positions nothing runs or parses can be uncovered (CLAUDE*.md, info/exclude, the core.excludesFile target, alternates); elsewhere such a link is refused. The array is complete (bounded by the shared entry budget); the stderr list and the status warning are cut with a (+N more) count. A notice, never a failure; also printed to stderr and shown by status as a warning."
     },
     "new_coverage": {
       "type": "array",

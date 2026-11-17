@@ -427,7 +427,7 @@ def test_a_target_on_another_device_is_an_uncovered_item(w: World) -> None:
 
 
 @pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs a second file system")
-def test_a_link_through_a_directory_on_another_device_is_an_uncovered_item(w: World) -> None:
+def test_a_link_through_a_directory_on_another_device_blocks_at_the_hooks_dir(w: World) -> None:
     if os.stat("/dev/shm").st_dev == os.stat(w.tmp).st_dev:
         pytest.skip("/dev/shm shares the device")
     d = Path("/dev/shm") / f"wtctl-linkdir-{os.getpid()}"
@@ -437,7 +437,7 @@ def test_a_link_through_a_directory_on_another_device_is_an_uncovered_item(w: Wo
         shutil.rmtree(Path(w.common) / "hooks")
         os.symlink(d / "hooks", Path(w.common) / "hooks")
         got = link_items(w.compute(), "/hooks")
-        assert [(i.type, i.detail) for i in got] == [("symlink_uncovered", None)]
+        assert [(i.type, i.detail) for i in got] == [("symlink_target", "mount_point")]
     finally:
         shutil.rmtree(d)
 
@@ -774,14 +774,20 @@ class _OtherDeviceSpecials(fsafe.Fs):
         return st
 
 
-def test_a_special_target_on_another_device_is_uncovered_not_blocking(
+def test_a_special_target_on_another_device_stays_type_only(
     w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """R4: never opened, and the item hash is the one from before cross-device links."""
+    import hashlib
+
     os.mkfifo(w.tmp / "pipe")
     os.symlink(w.tmp / "pipe", w.wt / "CLAUDE.md")
     monkeypatch.setattr(fsafe, "DEFAULT_FS", _OtherDeviceSpecials())
     item = link_items(w.compute(), "CLAUDE.md")[0]
-    assert (item.type, item.detail) == ("symlink_uncovered", None)
+    assert (item.type, item.detail) == ("symlink_target", None)
+    hop = str(w.tmp / "pipe").encode()
+    h = hashlib.sha256(b"wtctl-link-v1\n" + b"hop:%d:" % len(hop) + hop + b"\nspecial:fifo\n")
+    assert item.sha256 == h.hexdigest()
 
 
 def test_a_regular_file_on_another_device_is_uncovered_and_not_read(

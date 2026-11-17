@@ -15,6 +15,7 @@ from tests.createlib import CW
 from tests.schemacheck import validate
 from tests.test_baseline_cmd import accept, check, err_of, good_accept, good_check, made
 from wtctl import baselinesvc, repobaseline
+from wtctl.commands import clone
 
 KEY = "symlink-target"
 UNCOVERED = "symlink_uncovered"
@@ -148,7 +149,7 @@ def test_remove_class_split_for_uncovered_links(w: CW, capsys, shm: Path) -> Non
     (shm / "a").write_text("a")
     (shm / "b").write_text("b")
     os.symlink(shm / "a", claude)
-    os.symlink(shm / "a", hook)
+    os.symlink("/dev/null", hook)  # a hook link to another device would block (and /dev/null)
     good_accept(accept(w, capsys, rec["id"], "--yes"))
     # content behind the targets changed: undetectable, the baseline still passes
     (shm / "a").write_text("changed")
@@ -160,7 +161,9 @@ def test_remove_class_split_for_uncovered_links(w: CW, capsys, shm: Path) -> Non
     assert r.json()["checks"]["baseline"]["status"] == "warn"
     good_accept(accept(w, capsys, rec["id"], "--yes"))
     # a git-class link retargeted: a failure
-    relink(hook, shm / "b")
+    plain = w.tmp / "plain-hook"
+    plain.write_text("#!/bin/sh\n")
+    relink(hook, plain)
     r = w.cli(capsys, "status", rec["id"])
     body = r.json().get("error", r.json())
     assert body["checks"]["baseline"]["status"] == "fail"
@@ -198,3 +201,100 @@ def test_routine_git_leaves_the_digest_with_uncovered_links(w: CW, capsys, shm: 
     w.g(["branch", "--set-upstream-to=origin/main", "wt/one"], wt)
     w.g(["worktree", "remove", "--force", b["path"]], w.clone)
     good_check(check(w, capsys, a["id"]))
+
+
+# --- R5, R6: truncation, escaping, several paths, the real accept prompt, create/adopt ---------
+
+
+def status_warning(w: CW, capsys, rid: str) -> str:  # noqa: ANN001
+    """The uncovered-links warning of ``status``, as the decoded JSON string."""
+    got = [x for x in w.cli(capsys, "status", rid).json()["warnings"] if "another device" in x]
+    assert len(got) == 1, got
+    return got[0]
+
+
+HOSTILE = ("CLAUDE\x1b[2J.md", "CLAUDE\nforged line.md")
+
+
+def many(rec: dict, shm: Path, n: int, *names: str) -> None:
+    for i in range(n):
+        os.symlink(shm / "t", Path(rec["path"], f"CLAUDE-{i:02}.md"))
+    for name in names:
+        os.symlink(shm / "t", Path(rec["path"], name))
+
+
+def test_check_status_and_accept_escape_hostile_names(
+    w: CW,
+    capsys,
+    shm: Path,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    rec = made(w, capsys)
+    many(rec, shm, 0, *HOSTILE)
+    asked: list[str] = []
+    monkeypatch.setattr(clone, "confirm", lambda q, *, tty: asked.append(q) or True)
+    good_accept(accept(w, capsys, rec["id"]))
+    assert len(asked) == 1 and "not covered" in asked[0]
+    for text in (
+        asked[0],
+        check(w, capsys, rec["id"]).err,
+        status_warning(w, capsys, rec["id"]),
+    ):
+        assert "\x1b" not in text and "CLAUDE\nforged" not in text
+        assert "CLAUDE\\x1b[2J.md" in text and "CLAUDE\\x0aforged line.md" in text, text
+
+
+def test_two_uncovered_paths_are_all_listed(w: CW, capsys, shm: Path) -> None:  # noqa: ANN001
+    rec = made(w, capsys)
+    many(rec, shm, 2)
+    good_accept(accept(w, capsys, rec["id"], "--yes"))
+    r = check(w, capsys, rec["id"])
+    assert good_check(r)["uncovered"] == ["CLAUDE-00.md", "CLAUDE-01.md"]
+    assert "CLAUDE-00.md, CLAUDE-01.md" in r.err
+    out = status_warning(w, capsys, rec["id"])
+    assert "2 symlink targets" in out and "CLAUDE-00.md, CLAUDE-01.md" in out
+
+
+def test_long_lists_announce_the_truncation_and_json_stays_complete(
+    w: CW,
+    capsys,
+    shm: Path,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
+) -> None:
+    rec = made(w, capsys)
+    many(rec, shm, 25)
+    asked: list[str] = []
+    monkeypatch.setattr(clone, "confirm", lambda q, *, tty: asked.append(q) or True)
+    good_accept(accept(w, capsys, rec["id"]))
+    assert "(+5 more)" in asked[0] and "CLAUDE-19.md" in asked[0] and "CLAUDE-20.md" not in asked[0]
+    r = check(w, capsys, rec["id"])
+    assert len(good_check(r)["uncovered"]) == 25
+    assert "25 symlink targets" in r.err and "(+5 more)" in r.err and "CLAUDE-20.md" not in r.err
+    out = status_warning(w, capsys, rec["id"])
+    assert "(+15 more)" in out and "CLAUDE-10.md" not in out
+
+
+def test_create_and_adopt_record_a_dev_null_hook_link_without_a_notice(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    os.symlink("/dev/null", w.clone / ".git" / "hooks" / "pre-commit")
+    rec = made(w, capsys)
+    assert "uncovered" not in good_check(check(w, capsys, rec["id"]))
+    path = foreign(w)
+    os.symlink("/dev/null", w.clone / ".git" / "hooks" / "pre-push")
+    arec = ok_adopt(adopt(w, capsys, path))["record"]
+    assert "uncovered" not in good_check(check(w, capsys, arec["id"]))
+
+
+def test_create_with_a_tracked_cross_device_claude_md_records_it(
+    w: CW,
+    capsys,
+    shm: Path,  # noqa: ANN001
+) -> None:
+    os.symlink(shm / "dots.md", w.clone / "CLAUDE.md")
+    w.g(["add", "CLAUDE.md"])
+    w.g(["commit", "-q", "-m", "claude"])
+    w.g(["push", "-q", "origin", "main"])
+    rec = made(w, capsys)
+    assert good_check(check(w, capsys, rec["id"]))["uncovered"] == ["CLAUDE.md"]

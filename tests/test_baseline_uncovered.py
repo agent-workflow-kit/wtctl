@@ -237,12 +237,12 @@ def test_a_directory_on_another_device_is_uncovered_and_never_listed(
 ) -> None:
     (shm / "d").mkdir()
     (shm / "d" / "secret").write_text("x")
-    os.symlink(shm / "d", w.wt / ".claude")
+    os.symlink(shm / "d", w.wt / "CLAUDE.md")
     seen: list[str] = []
     real = os.scandir
     monkeypatch.setattr(os, "scandir", lambda p=".": seen.append(str(p)) or real(p))
     b = w.compute()
-    assert one(b, ".claude").type == UNCOVERED
+    assert one(b, "CLAUDE.md").type == UNCOVERED
     assert not b.has_detail()
     before = b.digest
     (shm / "d" / "secret").write_text("changed")
@@ -251,12 +251,13 @@ def test_a_directory_on_another_device_is_uncovered_and_never_listed(
     assert not any(str(shm) in s for s in seen)
 
 
-def test_a_hooks_directory_on_another_device_is_uncovered(w: World, shm: Path) -> None:
+def test_a_hooks_directory_on_another_device_blocks(w: World, shm: Path) -> None:
     (shm / "hooks").mkdir()
     shutil.rmtree(Path(w.common) / "hooks")
     os.symlink(shm / "hooks", Path(w.common) / "hooks")
     b = w.compute()
-    assert one(b, "/hooks").type == UNCOVERED and not b.has_detail()
+    assert (one(b, "/hooks").type, one(b, "/hooks").detail) == (COVERED, "mount_point")
+    assert not uncovered(b)
 
 
 def test_a_chain_that_crosses_a_device_in_the_middle(w: World, shm: Path) -> None:
@@ -316,10 +317,10 @@ def test_links_inside_a_followed_directory_that_leave_the_device_are_uncovered(
     real = w.tmp / "claude-real"
     real.mkdir()
     (shm / "x.md").write_text("x")
-    os.symlink(shm / "x.md", real / "inner.md")
+    os.symlink(shm / "x.md", real / "CLAUDE.md")
     os.symlink(real, w.wt / ".claude")
     b = w.compute()
-    assert one(b, ".claude/inner.md").type == UNCOVERED
+    assert one(b, ".claude/CLAUDE.md").type == UNCOVERED
     assert one(b, ".claude").type == COVERED
     assert not b.has_detail()
 
@@ -425,6 +426,7 @@ def test_a_submodule_git_dir_on_another_device_blocks(w: World, shm: Path) -> No
     os.symlink(shm / "sub", Path(w.common) / "modules" / "sub")
     b = w.compute()
     assert not any(i.type == UNCOVERED for i in b.items)
+    assert one(b, "modules/sub").detail == "mount_point"
 
 
 # --- unchanged behavior --------------------------------------------------------------------
@@ -545,9 +547,11 @@ class _DevOnTheAnchorDevice(fsafe.Fs):
         return 1
 
 
-def test_the_final_node_is_matched_by_path_when_its_directory_is_not_a_crossing(
+def test_a_final_special_node_is_type_only_whatever_its_device(
     w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """R4: a final node that is not a file or a directory is recorded by type, never uncovered
+    (the format-2 shape from before cross-device links were uncovered)."""
     if os.stat("/dev").st_ino == os.stat("/dev/null").st_ino:
         pytest.skip("odd /dev")
     monkeypatch.setattr(fsafe, "DEFAULT_FS", _DevOnTheAnchorDevice(os.stat(w.common).st_dev))
@@ -555,4 +559,214 @@ def test_the_final_node_is_matched_by_path_when_its_directory_is_not_a_crossing(
     os.symlink("/dev/zero", w.wt / ".mcp.json")
     b = w.compute()
     assert one(b, "CLAUDE.md").type == COVERED
-    assert one(b, ".mcp.json").type == UNCOVERED
+    assert one(b, ".mcp.json").type == COVERED
+    assert not b.has_detail() and not uncovered(b)
+
+
+# --- the position policy (R1): blocking by default, uncovered only on the allow-list --------
+
+
+def blocks(b: repobaseline.Baseline, suffix: str) -> None:
+    got = [i for i in link_items(b, suffix) if i.detail]
+    assert [(i.type, i.detail) for i in got] == [(COVERED, "mount_point")], [
+        (i.path, i.type, i.detail) for i in b.items if i.key == KEY
+    ]
+    assert not uncovered(b)
+
+
+def test_a_hook_entry_on_another_device_blocks(w: World, shm: Path) -> None:
+    (shm / "h").write_text("#!/bin/sh\n")
+    os.symlink(shm / "h", Path(w.common) / "hooks" / "pre-commit")
+    blocks(w.compute(), "hooks/pre-commit")
+
+
+def test_a_hook_entry_inside_a_followed_directory_blocks(w: World, shm: Path) -> None:
+    real = w.tmp / "hookdir"
+    real.mkdir()
+    (shm / "h").write_text("x")
+    os.symlink(shm / "h", real / "pre-push")
+    shutil.rmtree(Path(w.common) / "hooks")
+    os.symlink(real, Path(w.common) / "hooks")
+    blocks(w.compute(), "hooks/pre-push")
+
+
+def test_an_external_hooks_path_entry_blocks(w: World, shm: Path) -> None:
+    ext = w.tmp / "exthooks"
+    ext.mkdir()
+    (shm / "h").write_text("x")
+    os.symlink(shm / "h", ext / "pre-commit")
+    w.append_cfg(f"[core]\n\thooksPath = {ext}\n")
+    blocks(w.compute(), "exthooks/pre-commit")
+
+
+def test_an_external_hooks_path_link_to_another_device_blocks(w: World, shm: Path) -> None:
+    (shm / "hd").mkdir()
+    link = w.tmp / "hooklink"
+    os.symlink(shm / "hd", link)
+    w.append_cfg(f"[core]\n\thooksPath = {link}\n")
+    blocks(w.compute(), "hooklink")
+
+
+def test_a_submodule_config_and_hooks_on_another_device_block(w: World, shm: Path) -> None:
+    (shm / "c").write_text("[core]\n")
+    (shm / "h").write_text("x")
+    sub = Path(w.common) / "modules" / "sub"
+    (sub / "hooks").mkdir(parents=True)
+    (sub / "HEAD").write_text("ref: refs/heads/x\n")
+    os.symlink(shm / "c", sub / "config")
+    os.symlink(shm / "h", sub / "hooks" / "pre-commit")
+    b = w.compute()
+    assert {i.path.rsplit("modules/", 1)[-1] for i in link_items(b) if i.detail} == {
+        "sub/config",
+        "sub/hooks/pre-commit",
+    }
+    assert not uncovered(b)
+
+
+def test_the_config_file_on_another_device_blocks(w: World, shm: Path) -> None:
+    (shm / "cfg").write_text("[core]\n")
+    os.unlink(Path(w.common) / "config")
+    os.symlink(shm / "cfg", Path(w.common) / "config")
+    blocks(w.compute(), "/config")
+
+
+def test_a_symlinked_git_dir_across_a_non_final_crossing_blocks(w: World, shm: Path) -> None:
+    """R2: ``/dev/shm`` is crossed in the middle of the path (kind ``unresolved``)."""
+    (Path(w.common) / "modules").mkdir()
+    os.symlink(shm / "no" / "such", Path(w.common) / "modules" / "sub")
+    b = w.compute()
+    assert [(i.type, i.detail) for i in link_items(b, "modules/sub")] == [(COVERED, "mount_point")]
+
+
+def test_the_admin_gitdir_link_on_another_device_blocks(w: World, shm: Path) -> None:
+    (shm / "g").write_text("x")
+    gitdir = Path(w.repo.admin_dir) / "gitdir"
+    gitdir.unlink()
+    os.symlink(shm / "g", gitdir)
+    blocks(w.compute(), "/gitdir")
+
+
+def test_claude_settings_and_mcp_links_on_another_device_block(w: World, shm: Path) -> None:
+    (shm / "s").write_text("{}")
+    (w.wt / ".claude").mkdir()
+    os.symlink(shm / "s", w.wt / ".claude" / "settings.json")
+    os.symlink(shm / "s", w.wt / ".mcp.json")
+    b = w.compute()
+    assert {i.path for i in link_items(b) if i.detail} == {".claude/settings.json", ".mcp.json"}
+    assert not uncovered(b)
+
+
+def test_a_claude_directory_link_to_another_device_blocks(w: World, shm: Path) -> None:
+    (shm / "d").mkdir()
+    os.symlink(shm / "d", w.wt / ".claude")
+    blocks(w.compute(), ".claude")
+
+
+def test_claude_md_inside_the_claude_dir_is_uncovered_but_its_neighbours_block(
+    w: World, shm: Path
+) -> None:
+    (shm / "x").write_text("x")
+    (w.wt / ".claude").mkdir()
+    os.symlink(shm / "x", w.wt / ".claude" / "claude.MD")
+    os.symlink(shm / "x", w.wt / ".claude" / "agent.md")
+    b = w.compute()
+    assert uncovered(b) == [".claude/claude.MD"]
+    assert [i.path for i in link_items(b) if i.detail] == [".claude/agent.md"]
+
+
+def test_info_exclude_alternates_and_excludes_file_are_uncovered(w: World, shm: Path) -> None:
+    (shm / "x").write_text("x")
+    (Path(w.common) / "info").mkdir(exist_ok=True)
+    (Path(w.common) / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    for p in (Path(w.common) / "info" / "exclude", Path(w.common) / "objects/info/alternates"):
+        p.unlink(missing_ok=True)
+        os.symlink(shm / "x", p)
+    os.symlink(shm / "x", w.tmp / "ignore")
+    w.append_cfg(f"[core]\n\texcludesFile = {w.tmp / 'ignore'}\n")
+    b = w.compute()
+    assert not b.has_detail()
+    assert {p.rsplit("/", 1)[-1] for p in uncovered(b)} == {"exclude", "alternates", "ignore"}
+
+
+def test_dev_null_is_covered_at_every_position(w: World) -> None:
+    os.symlink("/dev/null", Path(w.common) / "hooks" / "pre-commit")
+    (w.wt / ".claude").mkdir()
+    os.symlink("/dev/null", w.wt / ".claude" / "settings.json")
+    os.symlink("/dev/null", w.wt / ".mcp.json")
+    b = w.compute()
+    assert not b.has_detail() and not uncovered(b)
+
+
+def test_a_wrong_device_number_at_dev_null_blocks_in_a_hook(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R6(f): only the numbers tell /dev/null; at a blocking position it is a refusal."""
+    os.symlink("/dev/null", Path(w.common) / "hooks" / "pre-commit")
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", _Rdev((1, 4)))
+    blocks(w.compute(), "hooks/pre-commit")
+
+
+# --- R3: a bind-mounted regular file on the same device ------------------------------------
+
+
+def _bind_file(w: World, monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    from wtctl import gateway
+
+    real = gateway.fd_mount_id
+    if real(os.open(w.tmp, os.O_RDONLY)) is None:
+        pytest.skip("no mount ids on this platform")
+
+    def fake(fd: int) -> int | None:
+        base = real(fd)
+        try:
+            where = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            return base
+        return (base or 0) + 4242 if where == str(target) else base
+
+    monkeypatch.setattr(gateway, "fd_mount_id", fake)
+
+
+def test_a_bind_mounted_file_is_uncovered_at_claude_md_and_blocks_in_a_hook(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = w.tmp / "bound.md"
+    f.write_text("x")
+    os.symlink(f, w.wt / "CLAUDE.md")
+    os.symlink(f, Path(w.common) / "hooks" / "pre-commit")
+    _bind_file(w, monkeypatch, f)
+    b = w.compute()
+    assert uncovered(b) == ["CLAUDE.md"]
+    assert [i.path for i in link_items(b) if i.detail] == [f"{w.common}/hooks/pre-commit"]
+
+
+def test_a_bind_mounted_file_found_in_the_mount_table_is_uncovered(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = w.tmp / "bound2.md"
+    f.write_text("x")
+    os.symlink(f, w.wt / "CLAUDE.md")
+    real = fsafe.open_anchor
+
+    def anchor(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        got = real(*a, **kw)
+        got.mounts_below = (*got.mounts_below, str(f))
+        return got
+
+    monkeypatch.setattr(fsafe, "open_anchor", anchor)
+    assert uncovered(w.compute()) == ["CLAUDE.md"]
+
+
+# --- R6(a): the link target is the crossing directory itself --------------------------------
+
+
+def test_a_link_whose_target_is_the_crossing_directory_itself_is_uncovered(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fs = _SwapDevice()
+    (w.tmp / "vol").mkdir()
+    fs.inodes.add(os.stat(w.tmp / "vol").st_ino)
+    os.symlink(w.tmp / "vol", w.wt / "CLAUDE.md")
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", fs)
+    b = w.compute()
+    assert one(b, "CLAUDE.md").type == UNCOVERED and not b.has_detail()

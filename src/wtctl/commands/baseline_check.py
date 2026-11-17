@@ -41,6 +41,8 @@ def run(ctx: Context) -> Result:
         data["uncovered"] = blind
         notice += (
             f"\n{record['name']}: {len(blind)} symlink targets are on another device and their "
-            "content is not covered by the baseline: " + ", ".join(escape_control(p) for p in blind)
+            "content is not covered by the baseline: "
+            + ", ".join(escape_control(p) for p in blind[:20])
+            + (f" (+{len(blind) - 20} more)" if len(blind) > 20 else "")
         )
     return Result(data, human=record["id"], stderr=notice)

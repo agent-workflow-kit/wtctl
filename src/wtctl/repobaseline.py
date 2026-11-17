@@ -382,6 +382,7 @@ def follow_link(
     budget: Budget,
     *,
     keep: bool = False,
+    uncovered_ok: bool = False,
     level: int = 0,
     active: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[list[Item], bytes | None]:
@@ -391,7 +392,9 @@ def follow_link(
     link inside a followed directory. With ``keep`` and a regular file at the end, its bytes too
     (a config file). Anything that cannot be read in full is an item with a ``detail``. The chain
     is resolved twice, around the read, and must be identical: a link retargeted meanwhile is
-    ``incomplete``."""
+    ``incomplete``. A target on another device or mount is a ``symlink_uncovered`` item only with
+    ``uncovered_ok`` (a position whose content nothing runs or parses); everywhere else, the
+    default, it is the blocking ``mount_point``."""
 
     def bad(exc: BaseException | None = None, detail: str | None = None) -> list[Item]:
         d = detail or (_detail_for(exc) if isinstance(exc, fsafe.FsafeError | Stop) else None)
@@ -403,6 +406,9 @@ def follow_link(
         first = baselinelinks.resolve(anchor, abs_path, budget.entry)
     except (fsafe.FsafeError, Stop, OSError) as exc:
         return bad(exc), None
+    if first.uncovered and not uncovered_ok:
+        first.close()
+        return bad(detail="mount_point"), None
     items: list[Item] = []
     data: bytes | None = None
     status: str | None = None
@@ -440,6 +446,7 @@ def follow_link(
                 sub = "/".join(rel)
                 got, _ = follow_link(
                     cls, anchor, f"{first.path}/{sub}", f"{display}/{sub}", budget,
+                    uncovered_ok=_inner_ok(cls, rel[-1], uncovered_ok),
                     level=level + 1, active=nested,
                 )  # fmt: skip
                 items += got
@@ -456,6 +463,12 @@ def follow_link(
     return [top, *items], data
 
 
+def _inner_ok(cls: str, name: str, inherited: bool) -> bool:
+    """Whether a link found inside a followed directory may be uncovered: in the claude class
+    only a ``CLAUDE*.md`` link (by its own name), else what the directory's position allows."""
+    return _is_claude_md(name) if cls == "claude" else inherited
+
+
 def follow_inner(
     cls: str,
     anchor: fsafe.Anchor,
@@ -464,6 +477,7 @@ def follow_inner(
     display_root: str,
     root_ident: tuple[int, int] | None,
     budget: Budget,
+    uncovered_ok: bool = False,
 ) -> list[Item]:
     """The ``symlink_target`` items of the links found by the last ``tree.listing()``."""
     out: list[Item] = []
@@ -472,7 +486,13 @@ def follow_inner(
         sub = "/".join(rel)
         try:
             got, _ = follow_link(
-                cls, anchor, f"{abs_root}/{sub}", f"{display_root}/{sub}", budget, active=active
+                cls,
+                anchor,
+                f"{abs_root}/{sub}",
+                f"{display_root}/{sub}",
+                budget,
+                uncovered_ok=_inner_ok(cls, rel[-1], uncovered_ok),
+                active=active,
             )
         except Stop:
             got = [_link_item(cls, f"{display_root}/{sub}", EMPTY, "incomplete")]
@@ -555,7 +575,12 @@ class GitCollector:
             anchor.close()
 
     def _leaf(
-        self, path: str, *, keep: bool = False, physical: str | None = None
+        self,
+        path: str,
+        *,
+        keep: bool = False,
+        physical: str | None = None,
+        uncovered_ok: bool = False,
     ) -> tuple[Item | None, bytes | None]:
         """The item for a file-ish path (``None``: absent) and, with ``keep``, the bytes of a
         regular file (``None`` for anything else). ``physical`` is where the file really is when
@@ -574,15 +599,14 @@ class GitCollector:
                     link = Item("git", path, None, "symlink", _sha(_enc(target)))
                     if not self.spec.links:
                         return link, None
-                    extra, data = follow_link("git", anchor, real, path, self.budget, keep=keep)
-                    if keep and extra[0].type == UNCOVERED_TYPE:
-                        # a config file is parsed (an include can set hooksPath): content that
-                        # is not read there is a refusal, not a notice
-                        extra[0] = _link_item("git", path, EMPTY, "mount_point")
+                    extra, data = follow_link(
+                        "git", anchor, real, path, self.budget, keep=keep,
+                        uncovered_ok=uncovered_ok,
+                    )  # fmt: skip
                     self.items += extra
                     return link, data
                 if kind == "dir":
-                    return self._dir_item(path, anchor, pfd, name, real), None
+                    return self._dir_item(path, anchor, pfd, name, real, uncovered_ok), None
                 if kind != "file":
                     return Item("git", path, None, "file", _sha(f"special:{kind}".encode())), None
                 fd = fsafe.open_file(anchor, pfd, name)
@@ -598,7 +622,15 @@ class GitCollector:
         except (Stop, OSError):
             return Item("git", path, None, "file", EMPTY, "incomplete"), None
 
-    def _dir_item(self, path: str, anchor: fsafe.Anchor, pfd: int, name: str, real: str) -> Item:
+    def _dir_item(
+        self,
+        path: str,
+        anchor: fsafe.Anchor,
+        pfd: int,
+        name: str,
+        real: str,
+        uncovered_ok: bool = False,
+    ) -> Item:
         """A directory listing item for ``name`` inside ``pfd`` (anchored by ``anchor``)."""
         try:
             fd = fsafe.open_dir(anchor, pfd, name)
@@ -610,15 +642,17 @@ class GitCollector:
             if self.spec.links:
                 st = anchor.fs.fstat(fd)
                 self.items += follow_inner(
-                    "git", anchor, tree, real, path, (st.dev, st.ino), self.budget
+                    "git", anchor, tree, real, path, (st.dev, st.ino), self.budget, uncovered_ok
                 )
             tree.close()
         finally:
             os.close(fd)
         return Item("git", path, None, "directory", sha, status)
 
-    def _add_leaf(self, path: str, physical: str | None = None) -> None:
-        item, _ = self._leaf(path, physical=physical)
+    def _add_leaf(
+        self, path: str, physical: str | None = None, *, uncovered_ok: bool = False
+    ) -> None:
+        item, _ = self._leaf(path, physical=physical, uncovered_ok=uncovered_ok)
         if item is not None:
             self.items.append(item)
 
@@ -767,7 +801,7 @@ class GitCollector:
         try:
             target = tree.readlink(parts)
             with baselinelinks.resolve(self.common, real, self.budget.entry) as first:
-                if first.kind != "dir":
+                if first.kind != "dir" and not first.uncovered:
                     return
                 self.items.append(Item("git", full, None, "symlink", _sha(_enc(target))))
                 if first.uncovered:  # its config and hooks would be read and run: a refusal
@@ -850,7 +884,7 @@ class GitCollector:
         if path is None:
             self._problem(raw, "incomplete")
             return
-        self._add_leaf(path)
+        self._add_leaf(path, uncovered_ok=True)
 
     def run(self) -> list[Item]:
         spec = self.spec
@@ -903,8 +937,8 @@ class GitCollector:
             self._config_root(root, applies=applies)
         self._add_leaf(f"{c}/hooks")
         self._hooks_path()
-        self._add_leaf(f"{c}/objects/info/alternates")
-        self._add_leaf(f"{c}/info/exclude")
+        self._add_leaf(f"{c}/objects/info/alternates", uncovered_ok=True)
+        self._add_leaf(f"{c}/info/exclude", uncovered_ok=True)
         self._excludes_file()
         self._modules(c, self.common.fd)
         if admin and admin_ok:
@@ -1002,7 +1036,10 @@ class ClaudeCollector:
                     Item("claude", rel, None, "symlink", _sha(_enc(tree.readlink(e.path))))
                 )
                 if self.spec.links:
-                    got, _ = follow_link("claude", anchor, f"{anchor.path}/{rel}", rel, self.budget)
+                    got, _ = follow_link(
+                        "claude", anchor, f"{anchor.path}/{rel}", rel, self.budget,
+                        uncovered_ok=_is_claude_md(e.path[-1]),
+                    )  # fmt: skip
                     self.items += got
             elif e.kind == "file":
                 sha, _, _ = tree.hash_file(e.path)

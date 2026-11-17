@@ -152,7 +152,9 @@ def _question(record: dict[str, Any], snap: Snapshot) -> str:
     if blind:
         text += esc(
             " Symlink targets on another device are recorded by path only, their content is not "
-            "covered: " + ", ".join(blind[:20])
+            "covered: "
+            + ", ".join(blind[:20])
+            + (f" (+{len(blind) - 20} more)" if len(blind) > 20 else "")
         )
     if snap.clone_stale and not moved:
         text += " The clone's recorded identity is out of date."

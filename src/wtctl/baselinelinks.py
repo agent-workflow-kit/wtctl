@@ -114,17 +114,6 @@ def resolve(
                 return None
             raise
 
-    def is_null(dirfd: int, comp: str, rest: list[str]) -> bool:
-        """``/dev/null``: the resolved path is exactly that and the node is the null device."""
-        if _NULL_DEVICE is None:
-            return False
-        if rest or here(comp) != "/dev/null":
-            return False
-        try:
-            return fs.char_rdev_at(dirfd, comp) == _NULL_DEVICE
-        except OSError:
-            return False
-
     def beyond(kind: str, text: str) -> Chain:
         return Chain(tuple(hops), kind, text, None, uncovered=True)
 
@@ -205,15 +194,18 @@ def resolve(
                 continue
             if not final:
                 return missing()  # a file or special entry used as a directory
-            crossing = st.dev != anchor.identity.dev
             if kind != "file":
-                # recorded by type only: it is never opened, so nothing of it leaks
-                if crossing and not is_null(dirfd, comp, rest):
-                    return beyond(kind, here(comp))
+                # recorded by type only, whatever its device: it is never opened, so nothing of
+                # it leaks (the format-2 shape from before cross-device links were uncovered)
                 return Chain(tuple(hops), kind, here(comp), None)
-            if crossing:
+            if st.dev != anchor.identity.dev or here(comp) in anchor.mounts_below:
                 return beyond("file", here(comp))
-            fd = fsafe.open_file(anchor, dirfd, comp)
+            try:
+                fd = fsafe.open_file(anchor, dirfd, comp)
+            except fsafe.FsafeError as exc:
+                if exc.kind == "mount_point":  # a bind-mounted file on the same device
+                    return beyond("file", here(comp))
+                raise
             fst = fs.fstat(fd)
             return Chain(
                 tuple(hops),
