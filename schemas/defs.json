@@ -260,12 +260,13 @@
                 "file",
                 "directory",
                 "symlink",
-                "config"
+                "config",
+                "symlink_target"
               ]
             },
             "sha256": {
               "$ref": "#/$defs/digest",
-              "description": "file: content hash; directory: hash of the recursive listing of names, types and content hashes; symlink: hash of the target string; config: hash of the key's values in order."
+              "description": "file: content hash; directory: hash of the recursive listing of names, types and content hashes; symlink: hash of the target string; config: hash of the key's values in order; symlink_target (key symlink-target, baseline format 2): hash of every hop's target string and of the final target (a file's content hash and executable bit, a directory's listing, or its absence)."
             }
           },
           "additionalProperties": false,
@@ -351,7 +352,7 @@
           ],
           "minLength": 1,
           "x-untrusted": true,
-          "description": "Untrusted: a config key (section[.subsection].key) read from a file agents can write; null for items that are not config values."
+          "description": "Untrusted: a config key (section[.subsection].key) read from a file agents can write; the fixed value symlink-target for a symlink_target item; null for items that are neither."
         },
         "before": {
           "$ref": "#/$defs/baseline_entry"

@@ -115,17 +115,17 @@ def test_cc_writes_noise_does_not_change_the_digest(w: World) -> None:
     assert w.digest() != before
 
 
-def test_claude_symlink_is_recorded_by_target_and_not_followed(w: World) -> None:
+def test_claude_symlink_is_recorded_by_target_and_not_followed_in_format_1(w: World) -> None:
     (w.tmp / "outside.md").write_text("one")
     os.symlink(w.tmp / "outside.md", w.wt / "CLAUDE.md")
-    b = w.compute()
+    b = w.compute(links=False)
     item = find(b.items, "claude", "CLAUDE.md")[0]
     assert item.type == "symlink"
     (w.tmp / "outside.md").write_text("two")
-    assert w.digest() == b.digest  # the target's content is not part of the item
+    assert w.digest(links=False) == b.digest  # the target's content is not part of the item
     os.unlink(w.wt / "CLAUDE.md")
     os.symlink(w.tmp / "other.md", w.wt / "CLAUDE.md")
-    assert w.digest() != b.digest
+    assert w.digest(links=False) != b.digest
 
 
 def test_claude_fifo_is_recorded_by_type_only_without_blocking(w: World) -> None:
@@ -378,13 +378,13 @@ def test_include_fan_out_is_bounded_by_the_entry_budget(w: World) -> None:
     assert any(i.detail == "incomplete" for i in b.items)
 
 
-def test_include_symlink_is_recorded_by_target_not_followed(w: World) -> None:
+def test_include_symlink_is_recorded_by_target_not_followed_in_format_1(w: World) -> None:
     real = w.tmp / "real.cfg"
     real.write_text("[x]\n\tk = v\n")
     link = w.tmp / "link.cfg"
     os.symlink(real, link)
     w.append_cfg(f"[include]\n\tpath = {link}\n")
-    b = w.compute()
+    b = w.compute(links=False)
     assert "x.k" not in keys(b)
     assert any(i.type == "symlink" and i.path == str(link) for i in b.items)
 

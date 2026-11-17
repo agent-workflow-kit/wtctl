@@ -17,6 +17,17 @@
     },
     "recorded_digest": {
       "$ref": "../defs.json#/$defs/digest"
+    },
+    "format": {
+      "const": 1,
+      "description": "Present only for a record whose baseline was recorded before symlink targets were covered (format 1); it is compared by the format 1 collector. baseline accept re-records it as format 2."
+    },
+    "new_coverage": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/baseline_item"
+      },
+      "description": "Only with format, and only when not empty: the items a baseline accept would add (symlink targets); one with a detail would block it. A notice, never a failure."
     }
   },
   "additionalProperties": false,

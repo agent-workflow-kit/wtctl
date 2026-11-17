@@ -14,7 +14,7 @@ import pytest
 from tests.statehelpers import FakeClock, FakeProcs, fake_gateway, make_state, rec
 from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway
-from wtctl.state import State, state_path
+from wtctl.state import MIGRATIONS, State, state_path
 
 
 def two_holders(tmp: Path) -> tuple[State, State, FakeClock, FakeProcs]:
@@ -343,7 +343,28 @@ def test_real_concurrent_id_allocation_never_collides(tmp_path: Path, worker: Pa
 def test_real_concurrent_first_open_migrates_once(tmp_path: Path, worker: Path) -> None:
     procs = [spawn(worker, "open", "-") for _ in range(8)]
     outs = finish(procs)
-    assert all(o.startswith("open 1") for o in outs)
+    assert all(o.startswith(f"open {len(MIGRATIONS)}") for o in outs)
+
+
+def test_real_concurrent_upgrade_of_a_version_1_database(tmp_path: Path, worker: Path) -> None:
+    import sqlite3
+
+    path = state_path()
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    conn = sqlite3.connect(path, isolation_level=None)
+    for sql in MIGRATIONS[0][1]:
+        conn.execute(sql)
+    conn.execute("INSERT INTO schema_version(version) VALUES (1)")
+    conn.close()
+    procs = [spawn(worker, "open", "-") for _ in range(8)]
+    outs = finish(procs)
+    assert all(o.startswith("open 2") for o in outs)
+    check = sqlite3.connect(path)
+    try:
+        assert check.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 2
+        check.execute("SELECT count(*) FROM baseline_meta")
+    finally:
+        check.close()
 
 
 _ = (fake_gateway,)

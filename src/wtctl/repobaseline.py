@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import fsafe, gitconfig
+from . import baselinelinks, fsafe, gitconfig
 
 EMPTY = hashlib.sha256(b"").hexdigest()
 MAX_FILE = 64 * 1024 * 1024
@@ -33,6 +33,11 @@ MAX_INCLUDE_DEPTH = 10
 _CHUNK = 1 << 16
 _DIGEST_VERSION = b"wtctl-baseline-v1\n"
 _SKIP_MODULE_DIRS = frozenset({"objects", "refs", "logs"})
+# The item recording what a collected symlink points at (docs/interface.md, Baseline, Symlinks).
+LINK_KEY = "symlink-target"  # never a config key: those always contain a dot
+LINK_TYPE = "symlink_target"
+MAX_LINK_NEST = 4  # a followed directory holding links to directories holding links ...
+_LINK_VERSION = b"wtctl-link-v1\n"
 
 
 def _printable(text: str) -> str:
@@ -86,6 +91,7 @@ class Spec:
     hooks_identity: str | None = None  # the recorded identity of an external hooksPath directory
     hooks_identity_path: str | None = None  # the path it was recorded for (None: whatever path)
     rebind_hooks: bool = False  # trust the current identity (baseline accept after inspection)
+    links: bool = True  # follow symlinks (baseline format 2); False is the legacy format 1
 
 
 @dataclass
@@ -257,6 +263,7 @@ class Tree:
         self.budget = budget
         self._parts: tuple[str, ...] | None = None
         self._fd = -1
+        self.links: list[tuple[str, ...]] = []  # symlink entries of the last listing
 
     def close(self) -> None:
         if self._fd >= 0:
@@ -304,6 +311,7 @@ class Tree:
         (``None``, ``incomplete`` or ``mount_point``)."""
         h = hashlib.sha256()
         status: str | None = None
+        self.links = []
         progress = [0]
         sub = Tree(self.anchor, self.root_fd, self.root_path, self.budget)
 
@@ -335,6 +343,7 @@ class Tree:
                     x = "x" if exe else ""
                 elif e.kind == "symlink":
                     sha = _sha(_enc(sub.readlink(e.path)))
+                    self.links.append(e.path)
                 h.update(b"%d:" % len(rel) + rel + f"|{typ}|{sha}|{x}\n".encode())
         except (fsafe.FsafeError, Stop, OSError) as exc:
             status = (
@@ -347,6 +356,113 @@ class Tree:
             self.budget.entries -= progress[0]
             self.budget.used_entries += progress[0]
         return h.hexdigest(), status
+
+
+# --- following symlinks --------------------------------------------------------------------
+
+
+def _link_item(cls: str, display: str, sha: str, detail: str | None = None) -> Item:
+    return Item(cls, display, LINK_KEY, LINK_TYPE, sha, detail)
+
+
+def follow_link(
+    cls: str,
+    anchor: fsafe.Anchor,
+    abs_path: str,
+    display: str,
+    budget: Budget,
+    *,
+    keep: bool = False,
+    level: int = 0,
+    active: frozenset[tuple[int, int]] = frozenset(),
+) -> tuple[list[Item], bytes | None]:
+    """The items for the symlink at ``abs_path`` (shown as ``display``): one ``symlink_target``
+    item whose hash covers every hop's target string and the final target (a file's hash and
+    executable bit, a directory's listing, ``missing`` or a special type), plus the same for every
+    link inside a followed directory. With ``keep`` and a regular file at the end, its bytes too
+    (a config file). Anything that cannot be read in full is an item with a ``detail``. The chain
+    is resolved twice, around the read, and must be identical: a link retargeted meanwhile is
+    ``incomplete``."""
+
+    def bad(exc: BaseException | None = None, detail: str | None = None) -> list[Item]:
+        d = detail or (_detail_for(exc) if isinstance(exc, fsafe.FsafeError | Stop) else None)
+        return [_link_item(cls, display, EMPTY, d or "incomplete")]
+
+    if level > MAX_LINK_NEST:
+        return bad(detail="incomplete"), None
+    try:
+        first = baselinelinks.resolve(anchor, abs_path, budget.entry)
+    except (fsafe.FsafeError, Stop, OSError) as exc:
+        return bad(exc), None
+    items: list[Item] = []
+    data: bytes | None = None
+    status: str | None = None
+    try:
+        h = hashlib.sha256(_LINK_VERSION)
+        for hop in first.hops:
+            b = _enc(hop)
+            h.update(b"hop:%d:" % len(b) + b + b"\n")
+        inner: list[tuple[str, ...]] = []
+        if first.kind == "file":
+            sha, data = _read_fd(first.fd, budget, keep)
+            h.update(f"file|{sha}|{'x' if first.executable else ''}\n".encode())
+        elif first.kind == "dir":
+            if first.ident in active:
+                return bad(detail="incomplete"), None  # a link loop through directories
+            tree = Tree(anchor, first.fd, first.path, budget)
+            try:
+                # a `.claude` directory reached through a link skips `.cc-writes` like a direct one
+                is_claude = cls == "claude" and display.rsplit("/", 1)[-1].casefold() == ".claude"
+                sha, status = tree.listing(skip=_cc_writes if is_claude else None)
+                inner = list(tree.links)
+            finally:
+                tree.close()
+            h.update(f"dir|{sha}\n".encode())
+        elif first.kind == "missing":
+            h.update(b"missing\n")
+        else:
+            h.update(f"special:{first.kind}\n".encode())
+        if status is None and first.ident is not None:
+            nested = active | {first.ident}
+            for rel in sorted(inner):
+                sub = "/".join(rel)
+                got, _ = follow_link(
+                    cls, anchor, f"{first.path}/{sub}", f"{display}/{sub}", budget,
+                    level=level + 1, active=nested,
+                )  # fmt: skip
+                items += got
+        with baselinelinks.resolve(anchor, abs_path, budget.entry) as second:
+            if not second.same_as(first):
+                return bad(detail="incomplete"), None
+    except (fsafe.FsafeError, Stop, OSError) as exc:
+        return bad(exc), None
+    finally:
+        first.close()
+    return [_link_item(cls, display, h.hexdigest(), status), *items], data
+
+
+def follow_inner(
+    cls: str,
+    anchor: fsafe.Anchor,
+    tree: Tree,
+    abs_root: str,
+    display_root: str,
+    root_ident: tuple[int, int] | None,
+    budget: Budget,
+) -> list[Item]:
+    """The ``symlink_target`` items of the links found by the last ``tree.listing()``."""
+    out: list[Item] = []
+    active = frozenset([root_ident]) if root_ident is not None else frozenset()
+    for rel in sorted(tree.links):
+        sub = "/".join(rel)
+        try:
+            got, _ = follow_link(
+                cls, anchor, f"{abs_root}/{sub}", f"{display_root}/{sub}", budget, active=active
+            )
+        except Stop:
+            got = [_link_item(cls, f"{display_root}/{sub}", EMPTY, "incomplete")]
+        out += got
+    return out
 
 
 # --- the git class -------------------------------------------------------------------------
@@ -423,11 +539,15 @@ class GitCollector:
         finally:
             anchor.close()
 
-    def _leaf(self, path: str, *, keep: bool = False) -> tuple[Item | None, bytes | None]:
+    def _leaf(
+        self, path: str, *, keep: bool = False, physical: str | None = None
+    ) -> tuple[Item | None, bytes | None]:
         """The item for a file-ish path (``None``: absent) and, with ``keep``, the bytes of a
-        regular file (``None`` for anything else)."""
+        regular file (``None`` for anything else). ``physical`` is where the file really is when
+        ``path`` (the displayed one) goes through a followed submodule git-dir link."""
+        real = physical or path
         try:
-            with self._parent_of(path) as (anchor, pfd, name):
+            with self._parent_of(real) as (anchor, pfd, name):
                 try:
                     st = anchor.fs.lstat_at(pfd, name)
                 except FileNotFoundError:
@@ -436,9 +556,14 @@ class GitCollector:
                 self.budget.entry()
                 if kind == "symlink":
                     target = os.readlink(name, dir_fd=pfd)
-                    return Item("git", path, None, "symlink", _sha(_enc(target))), None
+                    link = Item("git", path, None, "symlink", _sha(_enc(target)))
+                    if not self.spec.links:
+                        return link, None
+                    extra, data = follow_link("git", anchor, real, path, self.budget, keep=keep)
+                    self.items += extra
+                    return link, data
                 if kind == "dir":
-                    return self._dir_item(path, anchor, pfd, name), None
+                    return self._dir_item(path, anchor, pfd, name, real), None
                 if kind != "file":
                     return Item("git", path, None, "file", _sha(f"special:{kind}".encode())), None
                 fd = fsafe.open_file(anchor, pfd, name)
@@ -454,22 +579,27 @@ class GitCollector:
         except (Stop, OSError):
             return Item("git", path, None, "file", EMPTY, "incomplete"), None
 
-    def _dir_item(self, path: str, anchor: fsafe.Anchor, pfd: int, name: str) -> Item:
+    def _dir_item(self, path: str, anchor: fsafe.Anchor, pfd: int, name: str, real: str) -> Item:
         """A directory listing item for ``name`` inside ``pfd`` (anchored by ``anchor``)."""
         try:
             fd = fsafe.open_dir(anchor, pfd, name)
         except fsafe.FsafeError as exc:
             return Item("git", path, None, "directory", EMPTY, _detail_for(exc))
         try:
-            tree = Tree(anchor, fd, path, self.budget)
+            tree = Tree(anchor, fd, real, self.budget)
             sha, status = tree.listing()
+            if self.spec.links:
+                st = anchor.fs.fstat(fd)
+                self.items += follow_inner(
+                    "git", anchor, tree, real, path, (st.dev, st.ino), self.budget
+                )
             tree.close()
         finally:
             os.close(fd)
         return Item("git", path, None, "directory", sha, status)
 
-    def _add_leaf(self, path: str) -> None:
-        item, _ = self._leaf(path)
+    def _add_leaf(self, path: str, physical: str | None = None) -> None:
+        item, _ = self._leaf(path, physical=physical)
         if item is not None:
             self.items.append(item)
 
@@ -482,7 +612,9 @@ class GitCollector:
         item, data = self._leaf(path, keep=True)
         if item is None:
             return
-        if item.type != "file" or item.detail or data is None:
+        if item.type == "symlink" and data is not None and not item.detail:
+            self.items.append(item)  # the link itself stays an item; its target is parsed below
+        elif item.type != "file" or item.detail or data is None:
             self.items.append(item)
             return
         try:
@@ -540,8 +672,20 @@ class GitCollector:
             if exc.kind not in ("missing", "not_dir"):
                 self._problem(base_path + "/modules", _detail_for(exc), "directory")
             return
-        root = base_path + "/modules"
-        tree = Tree(self.common, mfd, root, self.budget)
+        try:
+            st = self.common.fs.fstat(mfd)
+            root = base_path + "/modules"
+            self._scan_modules(mfd, root, root, 0, frozenset([(st.dev, st.ino)]))
+        finally:
+            os.close(mfd)
+
+    def _scan_modules(
+        self, mfd: int, phys: str, disp: str, level: int, active: frozenset[tuple[int, int]]
+    ) -> None:
+        """One walk of a ``modules`` tree (or a followed submodule git dir) open as ``mfd``, at
+        ``phys`` on disk and shown as ``disp``."""
+        assert self.common is not None
+        tree = Tree(self.common, mfd, phys, self.budget)
         charge = Charge(self.budget)
         git_dirs: set[tuple[str, ...]] = set()
 
@@ -556,13 +700,15 @@ class GitCollector:
                 mfd,
                 limit=max(self.budget.entries, 0),
                 descend=descend,
-                root_path=root,
+                root_path=phys,
                 progress=charge.progress,
             )
             for e in walker:
                 charge.sync()
                 name = e.path[-1]
-                full = root + "/" + "/".join(e.path)
+                rel = "/".join(e.path)
+                full = disp + "/" + rel
+                real = phys + "/" + rel
                 if name == "HEAD" and e.kind in ("file", "symlink"):
                     git_dirs.add(e.path[:-1])
                 if e.kind == "mount":
@@ -570,15 +716,57 @@ class GitCollector:
                 elif e.kind in ("unreadable", "changed"):
                     self._problem(full, "incomplete", "directory")
                 elif name in ("config", "config.worktree") and e.kind != "dir":
-                    self._add_leaf(full)
+                    self._add_leaf(full, real)
                 elif name == "hooks":
-                    self._add_leaf(full)
+                    self._add_leaf(full, real)
+                elif (
+                    e.kind == "symlink"
+                    and self.spec.links
+                    and not (name in _SKIP_MODULE_DIRS and e.path[:-1] in git_dirs)
+                ):
+                    self._git_dir_link(tree, e.path, full, real, level, active)
         except (fsafe.FsafeError, Stop) as exc:
-            self._problem(root, _detail_for(exc), "directory")
+            self._problem(disp, _detail_for(exc), "directory")
         finally:
             tree.close()
-            os.close(mfd)
             charge.settle()
+
+    def _git_dir_link(
+        self,
+        tree: Tree,
+        parts: tuple[str, ...],
+        full: str,
+        real: str,
+        level: int,
+        active: frozenset[tuple[int, int]],
+    ) -> None:
+        """A symlink below ``modules`` that points at a directory is a submodule git dir (git
+        follows it): its link items, and its ``config``, ``config.worktree`` and ``hooks`` are
+        collected under the link's displayed path. Any other target is not collected (as in
+        format 1). Chains are resolved again after the scan and must be identical."""
+        assert self.common is not None
+        try:
+            target = tree.readlink(parts)
+            with baselinelinks.resolve(self.common, real, self.budget.entry) as first:
+                if first.kind != "dir":
+                    return
+                self.items.append(Item("git", full, None, "symlink", _sha(_enc(target))))
+                if level >= MAX_LINK_NEST or first.ident in active or first.ident is None:
+                    self.items.append(_link_item("git", full, EMPTY, "incomplete"))
+                    return
+                h = hashlib.sha256(_LINK_VERSION)
+                for hop in first.hops:
+                    b = _enc(hop)
+                    h.update(b"hop:%d:" % len(b) + b + b"\n")
+                h.update(b"gitdir\n")
+                self.items.append(_link_item("git", full, h.hexdigest()))
+                self._scan_modules(first.fd, first.path, full, level + 1, active | {first.ident})
+                with baselinelinks.resolve(self.common, real, self.budget.entry) as second:
+                    if not second.same_as(first):
+                        self.items.append(_link_item("git", full, EMPTY, "incomplete"))
+        except (fsafe.FsafeError, Stop, OSError) as exc:
+            detail = _detail_for(exc) if isinstance(exc, fsafe.FsafeError | Stop) else "incomplete"
+            self.items.append(_link_item("git", full, EMPTY, detail))
 
     def _external_hooks(self, path: str) -> None:
         """A ``core.hooksPath`` directory outside the common dir: its own anchor."""
@@ -605,6 +793,11 @@ class GitCollector:
                 return
             tree = Tree(anchor, anchor.fd, anchor.path, self.budget)
             sha, status = tree.listing()
+            if self.spec.links:
+                ident = (anchor.identity.dev, anchor.identity.ino)
+                self.items += follow_inner(
+                    "git", anchor, tree, anchor.path, path, ident, self.budget
+                )
             tree.close()
             self.items.append(Item("git", path, None, "directory", sha, status, cur))
         finally:
@@ -786,6 +979,9 @@ class ClaudeCollector:
                 self.items.append(
                     Item("claude", rel, None, "symlink", _sha(_enc(tree.readlink(e.path))))
                 )
+                if self.spec.links:
+                    got, _ = follow_link("claude", anchor, f"{anchor.path}/{rel}", rel, self.budget)
+                    self.items += got
             elif e.kind == "file":
                 sha, _, _ = tree.hash_file(e.path)
                 self.items.append(Item("claude", rel, None, "file", sha))
@@ -795,6 +991,12 @@ class ClaudeCollector:
                 try:
                     sub = Tree(anchor, fd, anchor.path + "/" + rel, self.budget)
                     sha, status = sub.listing(skip=_cc_writes)
+                    if self.spec.links:
+                        st = anchor.fs.fstat(fd)
+                        self.items += follow_inner(
+                            "claude", anchor, sub, anchor.path + "/" + rel, rel,
+                            (st.dev, st.ino), self.budget,
+                        )  # fmt: skip
                     sub.close()
                 finally:
                     os.close(fd)

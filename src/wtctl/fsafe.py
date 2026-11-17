@@ -50,7 +50,8 @@ class FsafeError(Exception):
 
     ``kind`` is one of: ``name`` (unsafe path component or path), ``missing``, ``symlink``,
     ``not_dir``, ``not_regular``, ``hardlink``, ``mount_point``, ``identity``, ``owner``,
-    ``exists``, ``permission``, ``limit``, ``deadline``, ``unavailable``, ``bad_request``, ``io``.
+    ``exists``, ``permission``, ``limit``, ``deadline``, ``unavailable``, ``bad_request``, ``io``,
+    ``link_depth`` and ``link_loop`` (the baseline's symlink walk).
     """
 
     def __init__(
@@ -440,6 +441,13 @@ def open_dir(
     except BaseException:
         os.close(fd)
         raise
+
+
+def open_ancestor(parent_fd: int, name: str) -> int:
+    """Open directory ``name`` no-follow without comparing it with an anchor: only for a
+    directory on the path *above* the anchor (its own chain from ``/``, which may cross mounts)."""
+    check_component(name)
+    return _open_dir_nofollow(parent_fd, name, name)
 
 
 def open_chain(
