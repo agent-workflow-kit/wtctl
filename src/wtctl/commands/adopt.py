@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -319,7 +320,8 @@ class Adopter:
                 if r["object_type"] != "worktree":
                     raise UsageError(f"{self.path} is a throwaway; adopt is for worktrees")
                 raise _Existing(r)
-        self._check_nesting(live, res)
+        self._check_nesting(res)
+        self._check_overlap(live, res, layout)
         if is_fuse(describe_mount(self.path, os.stat(self.path))["fs_type"]):
             raise _unlinked(f"{_shown(self.path)} is on a FUSE file system")
         common_id = res.recorded_id or res.common_id
@@ -378,6 +380,7 @@ class Adopter:
                 holders=[self.holder] if self.holder else [],
                 baseline_items=baselinesvc.item_rows(baseline),
                 stash_ids=info.stash_ids,
+                guard=lambda rows: self._check_overlap(rows, res, layout),
             )
         except Conflict as exc:  # a name or path taken since the checks above
             raise WtctlError(
@@ -386,17 +389,14 @@ class Adopter:
             ) from None  # fmt: skip
         return self._result(record, existing=False, human=f"adopted {name}")
 
-    def _check_nesting(self, live: list[Record], res: Resolution) -> None:
-        """No adopted worktree lies inside, or around, another worktree: the clone's own
-        (``git worktree list``, cross-checked against the admin entries) or a recorded one."""
-        known: dict[str, bool] = {r["path"]: True for r in live}
+    def _check_nesting(self, res: Resolution) -> None:
+        """The candidate must be a listed, unlocked, non-prunable worktree of the clone.
+        Worktrees git lists but wtctl does not record do not block nesting: nothing wtctl holds
+        depends on those paths, and the identity, pointer and linkcheck steps still run."""
         mine: worktrees.WorktreeEntry | None = None
         for e in worktrees.worktree_entries(self.git, res.common_dir):
-            real = os.path.realpath(e.path)
-            if real == self.path:
+            if os.path.realpath(e.path) == self.path:
                 mine = e
-            else:
-                known[real] = True
         if mine is None:
             raise _unlinked(f"git does not list {_shown(self.path)} as a worktree of the clone")
         if mine.locked is not None:
@@ -408,11 +408,37 @@ class Adopter:
             )
         if mine.prunable is not None:
             raise _unlinked(f"git considers {_shown(self.path)} prunable")
-        for other in known:
+
+    def _check_overlap(self, live: Sequence[Record], res: Resolution, layout: Layout) -> None:
+        """No live record's path may lie inside, or around, the candidate's. The one exemption: a
+        clone's main worktree and a linked worktree of the same clone, the linked one lying inside
+        the main one (the ``.claude/worktrees`` layout), in either adopt order. Equal paths are the
+        already-recorded case, not an overlap. Pure over ``live``, so it also runs inside the
+        insert transaction (see ``_fresh``)."""
+        common = res.recorded_id or res.common_id
+        mine_main = layout.admin is None
+
+        def same_clone_main_over_linked(main: bool, linked: bool, rec: Record) -> bool:
+            return (
+                main and linked and rec["object_type"] == "worktree" and rec["common_id"] == common
+            )
+
+        for r in live:
+            other = r["path"]
+            if other == self.path:
+                continue
+            rec_main = r["object_type"] == "worktree" and r["admin_dir"] is None
+            rec_linked = r["object_type"] == "worktree" and r["admin_dir"] is not None
+            ident = f"the live record {_shown(other)} (id {r['id']})"
+            hint = "; forget or remove that record first"
             if _within(self.path, other):
-                raise UsageError(f"{_shown(self.path)} lies inside the worktree {_shown(other)}")
+                if same_clone_main_over_linked(rec_main, not mine_main, r):
+                    continue
+                raise UsageError(f"{_shown(self.path)} lies inside the path of {ident}{hint}")
             if _within(other, self.path):
-                raise UsageError(f"{_shown(self.path)} contains the worktree {_shown(other)}")
+                if same_clone_main_over_linked(mine_main, rec_linked, r):
+                    continue
+                raise UsageError(f"{_shown(self.path)} contains the path of {ident}{hint}")
 
     def _pick_name(self, live: list[Record], repo: str) -> str:
         taken = {r["name"].casefold(): r for r in live if r["repo"] == repo and r["name"]}

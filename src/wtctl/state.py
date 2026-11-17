@@ -548,11 +548,16 @@ class State:
         holders: Iterable[str] = (),
         baseline_items: Sequence[Mapping[str, Any]] | None = None,
         stash_ids: Iterable[str] = (),
+        guard: Callable[[list[Record]], None] | None = None,
     ) -> Record:
         """Insert a record. ``baseline_items`` (as :meth:`transition` takes them) and ``stash_ids``
         are written in the same transaction, so a record never exists without the rows its
-        ``baseline_digest`` and stash check rely on (``adopt``)."""
+        ``baseline_digest`` and stash check rely on (``adopt``). ``guard`` is called with the live
+        records read inside that transaction; what it raises aborts the insert, so a check on the
+        live set is atomic with the insert."""
         with self._txn() as c:
+            if guard is not None:
+                guard(self.records())
             self._insert(c, fields, labels, holders)
             if baseline_items is not None:
                 self._write_baseline(c, fields["id"], baseline_items)

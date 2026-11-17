@@ -9,7 +9,17 @@ from pathlib import Path
 
 import pytest
 
-from tests.adoptlib import adopt, err_of, foreign, inproc_baseline, ok_adopt, world
+from tests.adoptlib import (
+    REPO2,
+    adopt,
+    adopt_in,
+    err_of,
+    foreign,
+    inproc_baseline,
+    ok_adopt,
+    second_clone,
+    world,
+)
 from tests.createlib import CW, REPO
 from tests.schemacheck import validate
 
@@ -317,18 +327,232 @@ def test_a_path_with_a_newline_is_refused(w: CW, capsys) -> None:  # noqa: ANN00
     assert w.count("records") == 0
 
 
-def test_nested_inside_or_around_another_worktree_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
+def test_adopt_under_claude_worktrees_of_the_main_worktree(w: CW, capsys) -> None:  # noqa: ANN001
+    inner = w.clone / ".claude" / "worktrees" / "feat"
+    inner.parent.mkdir(parents=True)
+    w.g(["worktree", "add", "-q", "-b", "feat", str(inner)])
+    assert rec_of(w, capsys, inner)["path"] == str(inner.resolve())
+
+
+def test_adopt_a_main_worktree_with_unrecorded_linked_worktrees_beneath_it(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    lin = w.clone / "sub-wt"
+    w.g(["worktree", "add", "-q", "-b", "sub", str(lin)])
+    deep = w.clone / ".claude" / "worktrees" / "deep"
+    deep.parent.mkdir(parents=True)
+    w.g(["worktree", "add", "-q", "-b", "deep", str(deep)])
+    assert rec_of(w, capsys, w.clone)["path"] == str(w.clone.resolve())
+    assert w.count("records") == 1
+
+
+def test_inside_an_unrecorded_listed_worktree_is_adopted(w: CW, capsys) -> None:  # noqa: ANN001
+    outer = foreign(w, "outer")
+    inner = outer / "inner"
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
+    assert rec_of(w, capsys, inner)["path"] == str(inner.resolve())
+
+
+def test_inside_a_live_record_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
     outer = foreign(w, "outer")
     rec_of(w, capsys, outer)
     inner = outer / "inner"
     w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
     err_of(adopt(w, capsys, inner), 2)
-    # the main worktree contains a linked one
-    lin = w.clone / "sub-wt"
-    w.g(["worktree", "add", "-q", "-b", "sub", str(lin)])
-    err_of(adopt(w, capsys, w.clone), 2)
-    err_of(adopt(w, capsys, lin), 2)
     assert w.count("records") == 1
+
+
+def test_around_a_live_record_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
+    outer = foreign(w, "outer")
+    inner = outer / "inner"
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
+    rec_of(w, capsys, inner)
+    err_of(adopt(w, capsys, outer), 2)
+    assert w.count("records") == 1
+
+
+@pytest.mark.parametrize("main_first", [True, False])
+def test_a_main_worktree_and_its_linked_worktree_adopt_in_both_orders(
+    w: CW,
+    capsys,  # noqa: ANN001
+    main_first: bool,
+) -> None:
+    lin = w.clone / ".claude" / "worktrees" / "feat"
+    lin.parent.mkdir(parents=True)
+    w.g(["worktree", "add", "-q", "-b", "feat", str(lin)])
+    first, second = (w.clone, lin) if main_first else (lin, w.clone)
+    rec_of(w, capsys, first)
+    rec_of(w, capsys, second)
+    assert w.count("records") == 2
+
+
+def test_a_linked_worktree_inside_a_live_linked_worktree_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
+    outer = foreign(w, "outer")
+    rec_of(w, capsys, outer)
+    inner = outer / "inner"
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
+    err_of(adopt(w, capsys, inner), 2)
+    assert w.count("records") == 1
+
+
+def test_the_main_worktree_inside_a_live_linked_worktree_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
+    # a clone that sits inside a recorded linked worktree of another clone is a different clone
+    # (see the cross-clone tests); within one clone the main worktree cannot be inside a linked one
+    # unless the clone itself was placed there
+    outer = foreign(w, "outer")
+    rec_of(w, capsys, outer)
+    moved = outer / "clone-here"
+    os.rename(w.clone, moved)
+    w.g(["worktree", "repair"], moved)
+    w.repo_cfg["clone"] = str(moved)
+    err_of(adopt(w, capsys, moved), 2)
+    assert w.count("records") == 1
+
+
+def test_a_linked_worktree_of_another_clone_under_a_recorded_main_is_refused(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    clone2, cfg = second_clone(w)
+    inner = w.clone / ".claude" / "worktrees" / "other"
+    inner.parent.mkdir(parents=True)
+    w.g(["worktree", "add", "-q", "-b", "other", str(inner)], clone2)
+    rec_of(w, capsys, w.clone)
+    err_of(adopt_in(w, capsys, cfg, REPO2, inner), 2)
+    assert w.count("records") == 1
+
+
+def test_a_clone_around_another_clones_live_record_is_refused(w: CW, capsys) -> None:  # noqa: ANN001
+    clone2, cfg = second_clone(w)
+    inner = clone2 / ".claude" / "worktrees" / "mine"
+    inner.parent.mkdir(parents=True)
+    w.g(["worktree", "add", "-q", "-b", "mine", str(inner)])  # linked worktree of the first clone
+    rec_of(w, capsys, inner)
+    err_of(adopt_in(w, capsys, cfg, REPO2, clone2), 2)
+    assert w.count("records") == 1
+
+
+def test_a_throwaway_overlap_still_blocks_a_main_worktree(w: CW, capsys) -> None:  # noqa: ANN001
+    from wtctl.gateway import Gateway
+    from wtctl.state import State
+
+    d = w.clone / "scratch"
+    d.mkdir()
+    st = State(w.db, Gateway())
+    st.insert_record(
+        {"id": st.allocate_id(), "object_type": "throwaway", "state": "active", "repo": REPO,
+         "path": str(d)}
+    )  # fmt: skip
+    st.close()
+    err_of(adopt(w, capsys, w.clone), 2)  # around the throwaway
+    assert w.count("records") == 1
+
+
+@pytest.mark.parametrize("live,new", [("ext", "ext2"), ("ext2", "ext")])
+def test_sibling_names_sharing_a_string_prefix_do_not_overlap(
+    w: CW,
+    capsys,  # noqa: ANN001
+    live: str,
+    new: str,
+) -> None:
+    rec_of(w, capsys, foreign(w, live))
+    rec_of(w, capsys, foreign(w, new))
+    assert w.count("records") == 2
+
+
+@pytest.mark.parametrize("state", ["forgotten", "removed", "gone"])
+@pytest.mark.parametrize("recorded", ["outer", "inner"])
+def test_a_tombstone_does_not_block_nesting(
+    w: CW,
+    capsys,  # noqa: ANN001
+    state: str,
+    recorded: str,
+) -> None:
+    outer = foreign(w, "outer")
+    inner = outer / "inner"
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
+    first, second = (outer, inner) if recorded == "outer" else (inner, outer)
+    r = rec_of(w, capsys, first)
+    w.set_state(r["id"], state)
+    assert rec_of(w, capsys, second)["path"] == str(second.resolve())
+
+
+def test_a_symlink_into_a_live_record_is_resolved_and_refused(w: CW, capsys) -> None:  # noqa: ANN001
+    outer = foreign(w, "outer")
+    rec_of(w, capsys, outer)
+    inner = outer / "inner"
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
+    link = w.tmp / "elsewhere"
+    link.symlink_to(inner)
+    err_of(adopt(w, capsys, link), 2)
+    assert w.count("records") == 1
+
+
+def test_a_live_record_in_any_state_still_blocks_nesting(w: CW, capsys) -> None:  # noqa: ANN001
+    outer = foreign(w, "outer")
+    r = rec_of(w, capsys, outer)
+    w.set_state(r["id"], "unlinked")  # still live
+    inner = outer / "inner"
+    w.g(["worktree", "add", "-q", "-b", "inner", str(inner)])
+    err_of(adopt(w, capsys, inner), 2)
+
+
+def test_a_forged_pointer_inside_a_recorded_main_worktree_is_still_unlinked(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    rec_of(w, capsys, w.clone)
+    real = foreign(w, "real")
+    fake = w.clone / ".claude" / "worktrees" / "fake"
+    fake.mkdir(parents=True)
+    (fake / ".git").write_text((real / ".git").read_text())
+    err_of(adopt(w, capsys, fake), 20, "unlinked")
+    assert w.count("records") == 1
+
+
+def test_a_forged_pointer_inside_a_main_worktree_is_still_unlinked(w: CW, capsys) -> None:  # noqa: ANN001
+    real = foreign(w, "real")
+    fake = w.clone / ".claude" / "worktrees" / "fake"
+    fake.mkdir(parents=True)
+    (fake / ".git").write_text((real / ".git").read_text())
+    err_of(adopt(w, capsys, fake), 20, "unlinked")
+    assert w.count("records") == 0
+
+
+def test_a_forged_pointer_inside_a_live_record_cannot_smuggle_an_overlap(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    outer = foreign(w, "outer")
+    rec_of(w, capsys, outer)
+    other = foreign(w, "other")
+    fake = outer / "fake"
+    fake.mkdir()
+    (fake / ".git").write_text((other / ".git").read_text())
+    err_of(adopt(w, capsys, fake), 20, "unlinked")  # the pointer is checked before nesting
+    # a forged .git DIRECTORY is no worktree either: the origin check fails first (12), not (20)
+    faked = outer / "faked"
+    (faked / ".git").mkdir(parents=True)
+    err_of(adopt(w, capsys, faked), 12)
+    assert w.count("records") == 1
+    # a genuinely linked worktree there is refused as nesting
+    real = outer / "real"
+    w.g(["worktree", "add", "-q", "-b", "realb", str(real)])
+    err_of(adopt(w, capsys, real), 2)
+    assert w.count("records") == 1
+
+
+def test_an_unrecorded_nested_worktree_with_a_forged_back_pointer_is_unlinked(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    inner = w.clone / ".claude" / "worktrees" / "feat"
+    inner.parent.mkdir(parents=True)
+    w.g(["worktree", "add", "-q", "-b", "feat", str(inner)])
+    moved = w.clone / ".claude" / "worktrees" / "moved"
+    os.rename(inner, moved)  # the admin entry still names the old path
+    err_of(adopt(w, capsys, moved), 20, "unlinked")
 
 
 # -- directories that only look like worktrees ---------------------------------------------------
