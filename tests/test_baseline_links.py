@@ -8,6 +8,7 @@ through anything but no-follow descriptors; the cases below are the hostile ones
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import socket
@@ -18,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from tests.baselib import World
-from wtctl import baselinelinks, repobaseline
+from wtctl import baselinelinks, fsafe, repobaseline
 
 KEY = "symlink-target"
 TYPE = "symlink_target"
@@ -363,7 +364,7 @@ def test_a_chain_longer_than_the_bound_is_incomplete(w: World) -> None:
     final = w.tmp / "end.md"
     final.write_text("x")
     prev = final
-    for n in range(baselinelinks.MAX_HOPS + 2):
+    for n in range(16):  # with CLAUDE.md itself: 17 links, one over the bound of 16
         link = w.tmp / f"hop{n}"
         os.symlink(prev, link)
         prev = link
@@ -375,7 +376,7 @@ def test_a_chain_at_the_bound_is_complete(w: World) -> None:
     final = w.tmp / "end.md"
     final.write_text("x")
     prev = final
-    for n in range(baselinelinks.MAX_HOPS - 1):  # CLAUDE.md itself is the last hop
+    for n in range(15):  # CLAUDE.md itself is the 16th and last hop
         link = w.tmp / f"hop{n}"
         os.symlink(prev, link)
         prev = link
@@ -719,3 +720,171 @@ def test_routine_git_changes_leave_the_digest_alone_with_links_present(w: World)
     w.repo.g(["worktree", "add", "-q", "-b", "sibling", str(w.tmp / "sib")], w.repo.main)
     w.repo.g(["worktree", "remove", "--force", str(w.tmp / "sib")], w.repo.main)
     assert w.digest() == before
+
+
+# --- round 1 review fixes ------------------------------------------------------------------
+
+
+def nested_claude_links(w: World, depth: int) -> None:
+    """.claude -> lvl<depth>, each lvl<i> holding `next` -> lvl<i-1>: ``depth`` links nested
+    inside the first followed directory."""
+    prev = w.tmp / "lvl0"
+    prev.mkdir()
+    (prev / "f").write_text("leaf")
+    for n in range(1, depth + 1):
+        d = w.tmp / f"lvl{n}"
+        d.mkdir()
+        os.symlink(prev, d / "next")
+        prev = d
+    os.symlink(prev, w.wt / ".claude")
+
+
+def test_nesting_of_four_links_is_complete(w: World) -> None:
+    nested_claude_links(w, 4)
+    assert not any(i.detail for i in link_items(w.compute()))
+
+
+def test_nesting_of_five_links_is_incomplete(w: World) -> None:
+    nested_claude_links(w, 5)
+    assert any(i.detail == "incomplete" for i in link_items(w.compute()))
+
+
+def test_a_swapped_anchor_directory_is_refused_by_resolve(w: World) -> None:
+    (w.wt / "CLAUDE.md").write_text("old")
+    anchor = fsafe.open_anchor(str(w.wt), expected=repobaseline._identity(w.repo.dir_id))
+    try:
+        os.rename(w.wt, w.tmp / "old-wt")
+        w.wt.mkdir()
+        (w.wt / "CLAUDE.md").write_text("new")
+        with pytest.raises(fsafe.FsafeError) as e:
+            baselinelinks.resolve(anchor, f"{w.wt}/CLAUDE.md", lambda: None).close()
+        assert e.value.kind == "identity"
+    finally:
+        anchor.close()
+
+
+class _OtherDeviceSpecials(fsafe.Fs):
+    """FIFOs and sockets report another device (a /dev/null-like node on a device file system)."""
+
+    def adjust(self, st: fsafe.FdStat) -> fsafe.FdStat:
+        if stat.S_ISFIFO(st.mode) or stat.S_ISSOCK(st.mode):
+            return dataclasses.replace(st, dev=st.dev + 1)
+        return st
+
+
+def test_a_special_target_on_another_device_is_recorded_by_type(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    os.mkfifo(w.tmp / "pipe")
+    os.symlink(w.tmp / "pipe", w.wt / "CLAUDE.md")
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", _OtherDeviceSpecials())
+    item = one(w.compute(), "CLAUDE.md")
+    assert item.detail is None  # a type-only record leaks nothing: not a mount point
+
+
+def test_a_regular_file_on_another_device_is_still_a_mount_point(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Files(fsafe.Fs):
+        def adjust(self, st: fsafe.FdStat) -> fsafe.FdStat:
+            return dataclasses.replace(st, dev=st.dev + 1) if st.ino == ino else st
+
+    (w.tmp / "plain").write_text("x")
+    ino = os.stat(w.tmp / "plain").st_ino
+    os.symlink(w.tmp / "plain", w.wt / "CLAUDE.md")
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", Files())
+    assert one(w.compute(), "CLAUDE.md").detail == "mount_point"
+
+
+def claude_dir_link(w: World, where: str) -> Path:
+    real = w.tmp / "claude-real"
+    (real / "agents").mkdir(parents=True)
+    (real / "agents" / "a.md").write_text("one")
+    link = w.wt / where
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(real, link)
+    return real
+
+
+@pytest.mark.parametrize("where", [".claude", "pkg/.claude"])
+def test_cc_writes_behind_a_symlinked_claude_directory_is_ignored(w: World, where: str) -> None:
+    real = claude_dir_link(w, where)
+    before = w.digest()
+    (real / ".cc-writes").mkdir()
+    (real / ".cc-writes" / "x").write_text("churn")
+    assert w.digest() == before
+    (real / ".cc-writes" / "x").write_text("more churn")
+    assert w.digest() == before
+    (real / "agents" / "a.md").write_text("two")  # real content still counts
+    assert w.digest() != before
+
+
+def test_cc_writes_behind_a_link_not_named_claude_still_counts(w: World) -> None:
+    real = w.tmp / "other-real"
+    (real / ".cc-writes").mkdir(parents=True)
+    (real / ".cc-writes" / "x").write_text("one")
+    (w.wt / ".claude").mkdir()
+    os.symlink(real, w.wt / ".claude" / "sub")
+    before = w.digest()
+    (real / ".cc-writes" / "x").write_text("two")
+    assert w.digest() != before
+
+
+def gitdir_link(w: World, name: str = "sub") -> tuple[Path, Path]:
+    real = w.tmp / "gitdirs" / name
+    (real / "hooks").mkdir(parents=True)
+    (real / "objects").mkdir()
+    (real / "HEAD").write_text("ref: refs/heads/main\n")
+    (real / "config").write_text("[core]\n\tfsmonitor = a\n")
+    (real / "hooks" / "h").write_text("a")
+    modules = Path(w.common) / "modules"
+    modules.mkdir(exist_ok=True)
+    os.symlink(real, modules / name)
+    return real, modules / name
+
+
+def test_a_symlinked_submodule_git_dir_is_followed(w: World) -> None:
+    real, _ = gitdir_link(w)
+    a = w.compute()
+    assert clean(a) and one(a, "modules/sub").detail is None
+    assert any(i.path.endswith("modules/sub/config") for i in a.items)
+    (real / "config").write_text("[core]\n\tfsmonitor = b\n")
+    b = w.compute()
+    assert b.digest != a.digest
+    (real / "hooks" / "h").write_text("b")
+    c = w.compute()
+    assert c.digest != b.digest
+    (real / "hooks" / "new").write_text("n")
+    assert w.digest() != c.digest
+
+
+def test_a_symlinked_submodule_git_dir_skips_objects_and_refs(w: World) -> None:
+    real, _ = gitdir_link(w)
+    before = w.digest()
+    (real / "objects" / "ab").write_text("pack")
+    assert w.digest() == before
+
+
+def test_a_symlinked_submodule_git_dir_is_ignored_by_the_legacy_collector(w: World) -> None:
+    real, _ = gitdir_link(w)
+    before = w.digest(links=False)
+    (real / "config").write_text("[core]\n\tfsmonitor = b\n")
+    assert w.digest(links=False) == before
+
+
+def test_a_symlinked_submodule_git_dir_that_loops_is_incomplete(w: World) -> None:
+    modules = Path(w.common) / "modules"
+    modules.mkdir()
+    os.symlink("../modules", modules / "again")
+    b = w.compute()
+    assert any(i.detail == "incomplete" for i in link_items(b, "modules/again"))
+
+
+def test_a_retargeted_submodule_git_dir_link_changes_the_digest(w: World) -> None:
+    real, link = gitdir_link(w)
+    other = w.tmp / "gitdirs" / "other"
+    shutil.copytree(real, other, symlinks=True)
+    before = w.digest()
+    link.unlink()
+    os.symlink(other, link)
+    assert w.digest() != before

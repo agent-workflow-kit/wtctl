@@ -152,10 +152,12 @@ def resolve(
                 continue
             if not final:
                 return missing()  # a file or special entry used as a directory
+            if kind != "file":
+                # recorded by type only, before the device check: it is never opened, so nothing
+                # of it leaks, and a link to a device node (/dev/null) is not a mount point
+                return Chain(tuple(hops), kind, here(comp), None)
             if st.dev != anchor.identity.dev:
                 raise fsafe.FsafeError("mount_point", f"{here(comp)} is on another device")
-            if kind != "file":
-                return Chain(tuple(hops), kind, here(comp), None)
             fd = fsafe.open_file(anchor, dirfd, comp)
             fst = fs.fstat(fd)
             return Chain(

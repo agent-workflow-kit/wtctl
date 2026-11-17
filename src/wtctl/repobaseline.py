@@ -411,7 +411,9 @@ def follow_link(
                 return bad(detail="incomplete"), None  # a link loop through directories
             tree = Tree(anchor, first.fd, first.path, budget)
             try:
-                sha, status = tree.listing()
+                # a `.claude` directory reached through a link skips `.cc-writes` like a direct one
+                is_claude = cls == "claude" and display.rsplit("/", 1)[-1].casefold() == ".claude"
+                sha, status = tree.listing(skip=_cc_writes if is_claude else None)
                 inner = list(tree.links)
             finally:
                 tree.close()
@@ -537,11 +539,15 @@ class GitCollector:
         finally:
             anchor.close()
 
-    def _leaf(self, path: str, *, keep: bool = False) -> tuple[Item | None, bytes | None]:
+    def _leaf(
+        self, path: str, *, keep: bool = False, physical: str | None = None
+    ) -> tuple[Item | None, bytes | None]:
         """The item for a file-ish path (``None``: absent) and, with ``keep``, the bytes of a
-        regular file (``None`` for anything else)."""
+        regular file (``None`` for anything else). ``physical`` is where the file really is when
+        ``path`` (the displayed one) goes through a followed submodule git-dir link."""
+        real = physical or path
         try:
-            with self._parent_of(path) as (anchor, pfd, name):
+            with self._parent_of(real) as (anchor, pfd, name):
                 try:
                     st = anchor.fs.lstat_at(pfd, name)
                 except FileNotFoundError:
@@ -553,11 +559,11 @@ class GitCollector:
                     link = Item("git", path, None, "symlink", _sha(_enc(target)))
                     if not self.spec.links:
                         return link, None
-                    extra, data = follow_link("git", anchor, path, path, self.budget, keep=keep)
+                    extra, data = follow_link("git", anchor, real, path, self.budget, keep=keep)
                     self.items += extra
                     return link, data
                 if kind == "dir":
-                    return self._dir_item(path, anchor, pfd, name), None
+                    return self._dir_item(path, anchor, pfd, name, real), None
                 if kind != "file":
                     return Item("git", path, None, "file", _sha(f"special:{kind}".encode())), None
                 fd = fsafe.open_file(anchor, pfd, name)
@@ -573,27 +579,27 @@ class GitCollector:
         except (Stop, OSError):
             return Item("git", path, None, "file", EMPTY, "incomplete"), None
 
-    def _dir_item(self, path: str, anchor: fsafe.Anchor, pfd: int, name: str) -> Item:
+    def _dir_item(self, path: str, anchor: fsafe.Anchor, pfd: int, name: str, real: str) -> Item:
         """A directory listing item for ``name`` inside ``pfd`` (anchored by ``anchor``)."""
         try:
             fd = fsafe.open_dir(anchor, pfd, name)
         except fsafe.FsafeError as exc:
             return Item("git", path, None, "directory", EMPTY, _detail_for(exc))
         try:
-            tree = Tree(anchor, fd, path, self.budget)
+            tree = Tree(anchor, fd, real, self.budget)
             sha, status = tree.listing()
             if self.spec.links:
                 st = anchor.fs.fstat(fd)
                 self.items += follow_inner(
-                    "git", anchor, tree, path, path, (st.dev, st.ino), self.budget
+                    "git", anchor, tree, real, path, (st.dev, st.ino), self.budget
                 )
             tree.close()
         finally:
             os.close(fd)
         return Item("git", path, None, "directory", sha, status)
 
-    def _add_leaf(self, path: str) -> None:
-        item, _ = self._leaf(path)
+    def _add_leaf(self, path: str, physical: str | None = None) -> None:
+        item, _ = self._leaf(path, physical=physical)
         if item is not None:
             self.items.append(item)
 
@@ -666,8 +672,20 @@ class GitCollector:
             if exc.kind not in ("missing", "not_dir"):
                 self._problem(base_path + "/modules", _detail_for(exc), "directory")
             return
-        root = base_path + "/modules"
-        tree = Tree(self.common, mfd, root, self.budget)
+        try:
+            st = self.common.fs.fstat(mfd)
+            root = base_path + "/modules"
+            self._scan_modules(mfd, root, root, 0, frozenset([(st.dev, st.ino)]))
+        finally:
+            os.close(mfd)
+
+    def _scan_modules(
+        self, mfd: int, phys: str, disp: str, level: int, active: frozenset[tuple[int, int]]
+    ) -> None:
+        """One walk of a ``modules`` tree (or a followed submodule git dir) open as ``mfd``, at
+        ``phys`` on disk and shown as ``disp``."""
+        assert self.common is not None
+        tree = Tree(self.common, mfd, phys, self.budget)
         charge = Charge(self.budget)
         git_dirs: set[tuple[str, ...]] = set()
 
@@ -682,13 +700,15 @@ class GitCollector:
                 mfd,
                 limit=max(self.budget.entries, 0),
                 descend=descend,
-                root_path=root,
+                root_path=phys,
                 progress=charge.progress,
             )
             for e in walker:
                 charge.sync()
                 name = e.path[-1]
-                full = root + "/" + "/".join(e.path)
+                rel = "/".join(e.path)
+                full = disp + "/" + rel
+                real = phys + "/" + rel
                 if name == "HEAD" and e.kind in ("file", "symlink"):
                     git_dirs.add(e.path[:-1])
                 if e.kind == "mount":
@@ -696,15 +716,57 @@ class GitCollector:
                 elif e.kind in ("unreadable", "changed"):
                     self._problem(full, "incomplete", "directory")
                 elif name in ("config", "config.worktree") and e.kind != "dir":
-                    self._add_leaf(full)
+                    self._add_leaf(full, real)
                 elif name == "hooks":
-                    self._add_leaf(full)
+                    self._add_leaf(full, real)
+                elif (
+                    e.kind == "symlink"
+                    and self.spec.links
+                    and not (name in _SKIP_MODULE_DIRS and e.path[:-1] in git_dirs)
+                ):
+                    self._git_dir_link(tree, e.path, full, real, level, active)
         except (fsafe.FsafeError, Stop) as exc:
-            self._problem(root, _detail_for(exc), "directory")
+            self._problem(disp, _detail_for(exc), "directory")
         finally:
             tree.close()
-            os.close(mfd)
             charge.settle()
+
+    def _git_dir_link(
+        self,
+        tree: Tree,
+        parts: tuple[str, ...],
+        full: str,
+        real: str,
+        level: int,
+        active: frozenset[tuple[int, int]],
+    ) -> None:
+        """A symlink below ``modules`` that points at a directory is a submodule git dir (git
+        follows it): its link items, and its ``config``, ``config.worktree`` and ``hooks`` are
+        collected under the link's displayed path. Any other target is not collected (as in
+        format 1). Chains are resolved again after the scan and must be identical."""
+        assert self.common is not None
+        try:
+            target = tree.readlink(parts)
+            with baselinelinks.resolve(self.common, real, self.budget.entry) as first:
+                if first.kind != "dir":
+                    return
+                self.items.append(Item("git", full, None, "symlink", _sha(_enc(target))))
+                if level >= MAX_LINK_NEST or first.ident in active or first.ident is None:
+                    self.items.append(_link_item("git", full, EMPTY, "incomplete"))
+                    return
+                h = hashlib.sha256(_LINK_VERSION)
+                for hop in first.hops:
+                    b = _enc(hop)
+                    h.update(b"hop:%d:" % len(b) + b + b"\n")
+                h.update(b"gitdir\n")
+                self.items.append(_link_item("git", full, h.hexdigest()))
+                self._scan_modules(first.fd, first.path, full, level + 1, active | {first.ident})
+                with baselinelinks.resolve(self.common, real, self.budget.entry) as second:
+                    if not second.same_as(first):
+                        self.items.append(_link_item("git", full, EMPTY, "incomplete"))
+        except (fsafe.FsafeError, Stop, OSError) as exc:
+            detail = _detail_for(exc) if isinstance(exc, fsafe.FsafeError | Stop) else "incomplete"
+            self.items.append(_link_item("git", full, EMPTY, detail))
 
     def _external_hooks(self, path: str) -> None:
         """A ``core.hooksPath`` directory outside the common dir: its own anchor."""

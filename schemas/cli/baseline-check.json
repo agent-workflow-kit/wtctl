@@ -27,7 +27,7 @@
       "items": {
         "$ref": "../defs.json#/$defs/baseline_item"
       },
-      "description": "Only with format: the items a baseline accept would add (symlink targets); one with a detail would block it. A notice, never a failure."
+      "description": "Only with format, and only when not empty: the items a baseline accept would add (symlink targets); one with a detail would block it. A notice, never a failure."
     }
   },
   "additionalProperties": false,
