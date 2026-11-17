@@ -309,19 +309,20 @@ class Reconciler:
             links = linkcheck.verify_links(probe, self.state)
         except WtctlError:
             return False
+        info = worktrees.inspect_existing(self.git, rec["common_dir"], admin)
+        # the baseline first (also in a dry run, which stays read-only and must report what a
+        # real run does): a record that cannot be adopted is left exactly as it was
+        baseline = baselinesvc.record_current(
+            self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}, git=self.git
+        )
+        if baseline.has_detail():
+            return self.uncomputable(rec, admin, links.dir_id, info, baseline)
         if self.dry:
             self.changes.append(
                 {"id": rec["id"], "from": "creating", "to": "active", "action": "adopt_after_crash"}
             )
             self.report("adopted_after_crash", id=rec["id"], path=rec["path"])
             return True
-        info = worktrees.inspect_existing(self.git, rec["common_dir"], admin)
-        # the baseline first: a record that cannot be adopted is left exactly as it was
-        baseline = baselinesvc.record_current(
-            self.config, {**rec, "admin_dir": admin, "dir_id": links.dir_id}, git=self.git
-        )
-        if baseline.has_detail():
-            return self.uncomputable(rec, admin, links.dir_id, info, baseline)
         self.state.transition(
             rec["id"], "creating", "creating",
             admin_dir=admin, dir_id=links.dir_id, head_at_create=info.head,
@@ -373,10 +374,16 @@ class Reconciler:
             )
         if crashed:
             updates["bootstrap_state"] = "interrupted"
-        if crashed:
-            self.state.set_stash_ids(rec["id"], info.stash_ids)
-            self.state.clear_bootstrap_sets(rec["id"], expected="creating")
         done = self.move(rec, "creating", "partial", "abandon_uncomputable_baseline", **updates)
+        if done and crashed and not self.dry:
+            # only after the move won: a lost race leaves the other actor's record untouched
+            try:
+                self.state.set_stash_ids(rec["id"], info.stash_ids)
+                self.state.clear_bootstrap_sets(rec["id"], expected="partial")
+            except WtctlError as exc:
+                if exc.code != "busy":
+                    raise
+                self.warnings.append(f"{rec['id']}: changed by another command; left alone")
         if done:
             self.report("abandoned", id=rec["id"], path=rec["path"], message=note)
         return True

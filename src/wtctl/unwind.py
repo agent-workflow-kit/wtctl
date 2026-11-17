@@ -32,6 +32,7 @@ class Outcome:
     remaining: list[str] = dataclasses.field(default_factory=list)
     notes: list[str] = dataclasses.field(default_factory=list)
     branch_deleted: bool = False
+    tree_deleted: bool = False  # the worktree directory is gone (an admin entry may be left)
 
     @property
     def done(self) -> bool:
@@ -70,13 +71,36 @@ def unwind_worktree(
     *,
     lease_wait: float,
     branch_sha: str | None,
-    written: dict[str, worktrees.UpstreamKey] | None = None,
+    written: dict[str, worktrees.UpstreamKey],
 ) -> Outcome:
     """Delete the worktree of ``rec`` (``admin_dir`` and ``dir_id`` set), its admin entry and, when
     ``branch_sha`` is given (the sha the branch was created at: only a branch this create made),
     the branch by compare-and-swap. The caller holds the record lease and made the worktree in this
     very command: nobody else has had its path (``reconcile`` never calls this, it deletes no
     file)."""
+    started = [False]  # set once a deletion may have begun
+    try:
+        return _unwind(ctx, git, rec, lease_wait, branch_sha, written, started)
+    except WtctlError as exc:
+        if exc.code == "busy" and not started[0]:
+            return Outcome(REFUSED, "the clone is busy")
+        why = exc.message
+    except Exception as exc:  # noqa: BLE001 - any failure must reach the ``partial`` fallback
+        why = f"unexpected {type(exc).__name__}: {exc}"
+    if started[0]:
+        return Outcome(PARTIAL, f"the deletion stopped ({why})", remaining=[rec["path"]])
+    return Outcome(REFUSED, f"the unwind could not start ({why})")
+
+
+def _unwind(
+    ctx: Context,
+    git: Git,
+    rec: dict[str, Any],
+    lease_wait: float,
+    branch_sha: str | None,
+    written: dict[str, worktrees.UpstreamKey],
+    started: list[bool],
+) -> Outcome:
     state: State = ctx.state
     try:
         linkcheck.verify_links(rec, state)
@@ -98,16 +122,20 @@ def unwind_worktree(
             return Outcome(REFUSED, "the admin entry names another path")
         if admin.locked:
             return Outcome(REFUSED, "the worktree is locked")
+        started[0] = True
         tree = removal_delete.delete_worktree(state, rec, del_budget)
         if tree.status == "refused":
+            started[0] = False
             why = tree.error.kind if tree.error else "unknown"
             return Outcome(REFUSED, f"the directory is not the recorded one ({why})")
         if tree.status == "partial":
             return Outcome(PARTIAL, "the deletion stopped part-way", remaining=tree.remaining)
         entry, left = removal_delete.delete_admin(state, rec, del_budget)
-        out = Outcome(UNWOUND)
+        out = Outcome(UNWOUND, tree_deleted=True)
         if entry in ("partial", "failed"):
-            return Outcome(PARTIAL, "the admin entry could not be deleted", remaining=left)
+            return Outcome(
+                PARTIAL, "the admin entry could not be deleted", remaining=left, tree_deleted=True
+            )
         if entry in ("foreign", "changed"):
             out.notes.append(f"the admin entry {rec['admin_dir']} was left ({entry})")
         _branch(git, rec, branch_sha, written, out)
@@ -118,7 +146,7 @@ def _branch(
     git: Git,
     rec: dict[str, Any],
     sha: str | None,
-    written: dict[str, worktrees.UpstreamKey] | None,
+    written: dict[str, worktrees.UpstreamKey],
     out: Outcome,
 ) -> None:
     """Only a branch this create made, only at the sha it was made at; the unwind never fails
@@ -132,14 +160,6 @@ def _branch(
         else:
             out.notes.append(f"branch {branch} was left (it moved, or could not be deleted)")
             return
-        if written is not None:
-            out.notes += worktrees.remove_upstream(git, common, branch, written)
-        else:
-            git.run(
-                ["config", "--local", "--remove-section", f"branch.{branch}"],
-                git_dir=common,
-                cwd=common,
-                timeout=60,
-            )
+        out.notes += worktrees.remove_upstream(git, common, branch, written)
     except Exception as exc:  # noqa: BLE001 - cleanup must not mask the original error
         out.notes.append(f"branch {branch} was left ({exc})")

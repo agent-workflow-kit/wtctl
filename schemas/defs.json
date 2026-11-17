@@ -1677,7 +1677,7 @@
               "type": "null"
             }
           ],
-          "description": "Throwaway, or a worktree whose baseline is not recorded yet (creating): null."
+          "description": "Throwaway, or a worktree whose baseline is not recorded (creating, or a partial worktree whose create or reclaim could not compute it in full): null."
         },
         "bootstrap": {
           "oneOf": [
@@ -1934,11 +1934,34 @@
               "head_at_create": {
                 "$ref": "#/$defs/sha"
               },
-              "baseline_digest": {
-                "$ref": "#/$defs/digest"
-              },
               "dir_id": {
                 "$ref": "#/$defs/dev_ino"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "object_type": {
+                "const": "worktree"
+              },
+              "state": {
+                "not": {
+                  "enum": [
+                    "creating",
+                    "partial",
+                    "gone",
+                    "forgotten"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "baseline_digest": {
+                "$ref": "#/$defs/digest"
               }
             }
           }
@@ -2152,7 +2175,7 @@
             "null"
           ],
           "x-untrusted": true,
-          "description": "Untrusted: git's stderr, a pointer-rewrite failure message, or, for kept_unpushed, the condition that kept the admin entry."
+          "description": "Untrusted: git's stderr, a pointer-rewrite failure message, for kept_unpushed, the condition that kept the admin entry, or, for abandoned, a message wtctl composed (why a creating record was skipped, or the baseline positions that blocked it, which are paths from the worktree and untrusted)."
         },
         "kind_of": {
           "enum": [

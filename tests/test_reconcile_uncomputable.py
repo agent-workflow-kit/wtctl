@@ -108,3 +108,58 @@ def test_a_crash_shape_with_an_uncomputable_baseline_is_partial_with_identity(
     row = w.row(rec["id"])
     assert row["admin_dir"] == rec["admin_dir"] and row["dir_id"] == rec["dir_id"]
     validate("wtctl/cli/reconcile.json", data)
+
+
+def test_a_dry_run_reports_what_a_real_run_does(w: RC, shm: Path) -> None:
+    rec = old_stuck(w)
+    bad_hook(w, shm)
+    dry = w.reconciled("--dry-run")
+    assert w.actions(dry) == [(rec["id"], "creating", "partial", "abandon_uncomputable_baseline")]
+    assert (
+        dry["reports"][0]["kind"] == "abandoned" and "post-commit" in dry["reports"][0]["message"]
+    )
+    assert w.row(rec["id"])["state"] == "creating"  # read-only
+    real = w.reconciled()
+    assert w.actions(real) == w.actions(dry)
+    assert real["reports"] == dry["reports"]
+
+
+def test_a_dry_run_of_a_computable_crash_still_reports_the_adoption(w: RC) -> None:
+    rec = w.wt()
+    crash_after_add(w, rec)
+    dry = w.reconciled("--dry-run")
+    assert w.actions(dry) == [(rec["id"], "creating", "active", "adopt_after_crash")]
+    assert w.row(rec["id"])["state"] == "creating"
+
+
+def test_a_crash_shape_settles_with_every_recorded_identity(w: RC, shm: Path) -> None:
+    rec = w.wt()
+    crash_after_add(w, rec)
+    w.update(
+        "INSERT INTO bootstrap_paths(record_id, path, kind, digest) VALUES (?, 'x', 'file', 'd')",
+        rec["id"],
+    )
+    bad_hook(w, shm)
+    w.reconciled()
+    row = w.row(rec["id"])
+    assert row["state"] == "partial" and row["bootstrap_state"] == "interrupted"
+    assert row["reflog_start_ts"] and row["head_at_create"]
+    assert w.rows("SELECT * FROM bootstrap_paths WHERE record_id=?", rec["id"]) == []
+    assert w.rows("SELECT * FROM stash_ids WHERE record_id=?", rec["id"]) == []
+
+
+def test_a_lost_race_writes_nothing_else(w: RC, shm: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from wtctl import reconciler
+
+    rec = w.wt()
+    crash_after_add(w, rec)
+    w.update(
+        "INSERT INTO bootstrap_paths(record_id, path, kind, digest) VALUES (?, 'x', 'file', 'd')",
+        rec["id"],
+    )
+    bad_hook(w, shm)
+    monkeypatch.setattr(reconciler.Reconciler, "move", lambda self, *a, **k: False)
+    w.reconciled()
+    row = w.row(rec["id"])
+    assert row["state"] == "creating" and row["admin_dir"] is None and row["dir_id"] is None
+    assert len(w.rows("SELECT * FROM bootstrap_paths WHERE record_id=?", rec["id"])) == 1

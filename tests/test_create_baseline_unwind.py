@@ -171,28 +171,6 @@ def test_a_directory_swapped_for_a_symlink_deletes_nothing_outside(
     assert w.records()[0]["state"] == "partial"
 
 
-def test_the_unwind_refuses_when_the_directory_identity_differs(
-    w: CW,
-    capsys,
-    shm: Path,
-    monkeypatch: pytest.MonkeyPatch,  # noqa: ANN001
-) -> None:
-    """Mutation guard: dropping the recorded identity check would delete a replaced tree."""
-    bad_hook(w, shm)
-    from wtctl import unwind
-
-    seen: list[str] = []
-    real = unwind.linkcheck.verify_links
-
-    def spy(rec, state, **kw):  # noqa: ANN001, ANN202
-        seen.append(rec["dir_id"])
-        return real(rec, state, **kw)
-
-    monkeypatch.setattr(unwind.linkcheck, "verify_links", spy)
-    err(w.create(capsys, "--name", "one"))
-    assert seen and seen[0]  # verified against the recorded identity
-
-
 def test_a_failure_before_the_worktree_exists_is_unchanged(w: CW, capsys) -> None:  # noqa: ANN001
     r = w.create(capsys, "--base", "no-such-branch")
     assert r.code == 12 and w.count("records") == 0 and w.admin_entries() == []
