@@ -674,6 +674,49 @@ def test_claude_md_inside_the_claude_dir_is_uncovered_but_its_neighbours_block(
     assert [i.path for i in link_items(b) if i.detail] == [".claude/agent.md"]
 
 
+def test_a_deep_claude_md_named_link_under_claude_blocks(w: World, shm: Path) -> None:
+    """T1: commands and agents are executable prompts, whatever their file name."""
+    (shm / "x").write_text("x")
+    for sub in ("commands", "agents", "commands/deep"):
+        (w.wt / ".claude" / sub).mkdir(parents=True, exist_ok=True)
+        os.symlink(shm / "x", w.wt / ".claude" / sub / "claude-x.md")
+    b = w.compute()
+    assert not uncovered(b)
+    assert sorted(i.path for i in link_items(b) if i.detail == "mount_point") == [
+        ".claude/agents/claude-x.md",
+        ".claude/commands/claude-x.md",
+        ".claude/commands/deep/claude-x.md",
+    ]
+
+
+def test_claude_md_outside_claude_and_directly_inside_it_is_uncovered(w: World, shm: Path) -> None:
+    (shm / "x").write_text("x")
+    (w.wt / "sub").mkdir()
+    (w.wt / ".claude").mkdir()
+    os.symlink(shm / "x", w.wt / "CLAUDE.md")
+    os.symlink(shm / "x", w.wt / "sub" / "CLAUDE.md")
+    os.symlink(shm / "x", w.wt / ".claude" / "CLAUDE.md")
+    b = w.compute()
+    assert uncovered(b) == [".claude/CLAUDE.md", "CLAUDE.md", "sub/CLAUDE.md"]
+    assert not [i for i in link_items(b) if i.detail]
+
+
+def test_a_cross_device_file_link_below_modules_is_ignored_like_a_same_device_one(
+    w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2: only a directory target is a submodule git dir; a file target is not collected."""
+    fs = _SwapDevice()
+    (w.tmp / "plain").write_text("x")
+    fs.inodes.add(os.stat(w.tmp / "plain").st_ino)
+    mods = Path(w.common) / "modules"
+    mods.mkdir()
+    os.symlink(w.tmp / "plain", mods / "x")
+    monkeypatch.setattr(fsafe, "DEFAULT_FS", fs)
+    b = w.compute()
+    assert not link_items(b, "modules/x")
+    assert not uncovered(b) and not b.has_detail()
+
+
 def test_info_exclude_alternates_and_excludes_file_are_uncovered(w: World, shm: Path) -> None:
     (shm / "x").write_text("x")
     (Path(w.common) / "info").mkdir(exist_ok=True)

@@ -446,7 +446,7 @@ def follow_link(
                 sub = "/".join(rel)
                 got, _ = follow_link(
                     cls, anchor, f"{first.path}/{sub}", f"{display}/{sub}", budget,
-                    uncovered_ok=_inner_ok(cls, rel[-1], uncovered_ok),
+                    uncovered_ok=_inner_ok(cls, f"{display}/{sub}", uncovered_ok),
                     level=level + 1, active=nested,
                 )  # fmt: skip
                 items += got
@@ -463,10 +463,11 @@ def follow_link(
     return [top, *items], data
 
 
-def _inner_ok(cls: str, name: str, inherited: bool) -> bool:
+def _inner_ok(cls: str, display: str, inherited: bool) -> bool:
     """Whether a link found inside a followed directory may be uncovered: in the claude class
-    only a ``CLAUDE*.md`` link (by its own name), else what the directory's position allows."""
-    return _is_claude_md(name) if cls == "claude" else inherited
+    only a ``CLAUDE*.md`` link at an allowed position (see ``_claude_md_ok``), else what the
+    directory's position allows."""
+    return _claude_md_ok(display.split("/")) if cls == "claude" else inherited
 
 
 def follow_inner(
@@ -491,7 +492,7 @@ def follow_inner(
                 f"{abs_root}/{sub}",
                 f"{display_root}/{sub}",
                 budget,
-                uncovered_ok=_inner_ok(cls, rel[-1], uncovered_ok),
+                uncovered_ok=_inner_ok(cls, f"{display_root}/{sub}", uncovered_ok),
                 active=active,
             )
         except Stop:
@@ -801,7 +802,7 @@ class GitCollector:
         try:
             target = tree.readlink(parts)
             with baselinelinks.resolve(self.common, real, self.budget.entry) as first:
-                if first.kind != "dir" and not first.uncovered:
+                if first.kind not in ("dir", "unresolved"):
                     return
                 self.items.append(Item("git", full, None, "symlink", _sha(_enc(target))))
                 if first.uncovered:  # its config and hooks would be read and run: a refusal
@@ -961,6 +962,16 @@ def _is_claude_md(name: str) -> bool:
     return low.startswith("claude") and low.endswith(".md") and len(low) >= len("claude.md")
 
 
+def _claude_md_ok(parts: list[str] | tuple[str, ...]) -> bool:
+    """A ``CLAUDE*.md`` path whose cross-device target may be uncovered: outside every
+    ``.claude`` directory, or a direct child of one. Deeper (commands, agents) it is an
+    executable prompt, not instructions."""
+    if not _is_claude_md(parts[-1]):
+        return False
+    below = [p.casefold() for p in parts[:-1]]
+    return ".claude" not in below or below[-1] == ".claude"
+
+
 def _is_claude_name(name: str) -> bool:
     return name.casefold() in (".claude", ".mcp.json")
 
@@ -1038,7 +1049,7 @@ class ClaudeCollector:
                 if self.spec.links:
                     got, _ = follow_link(
                         "claude", anchor, f"{anchor.path}/{rel}", rel, self.budget,
-                        uncovered_ok=_is_claude_md(e.path[-1]),
+                        uncovered_ok=_claude_md_ok(e.path),
                     )  # fmt: skip
                     self.items += got
             elif e.kind == "file":
