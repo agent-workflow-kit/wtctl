@@ -7,13 +7,18 @@ dir under the admin entry), and hostile edits of everything an agent can write t
 from __future__ import annotations
 
 import os
+import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tests.createlib import script
 from tests.removelib import RR
-from wtctl import removal_submodules
+from wtctl import fsafe, fsafe_child, removal_content, removal_submodules
+from wtctl.gateway import GitResult, run_git
+from wtctl.mirror import Pushed
 
 SUB = "vendor/sub"
 FILE_ALLOW = ["-c", "protocol.file.allow=always"]
@@ -435,9 +440,7 @@ def test_a_path_not_listed_in_gitmodules_stays_a_nested_repo(w: RR, capsys) -> N
     w.g(["rm", "-q", "--cached", "-f", ".gitmodules"], w.wt)
     w.g(["commit", "-q", "-m", "drop gitmodules"], w.wt)
     d = w.st(capsys)
-    assert {"detail": "nested_repo", "path": f"{SUB}/.git"} in details(d) or any(
-        x["path"] == SUB for x in details(d)
-    )
+    assert {"detail": "nested_repo", "path": f"{SUB}/.git"} in details(d), details(d)
     assert d["would_remove"] is False and (sub / ".git").exists()
 
 
@@ -520,3 +523,690 @@ def test_an_orphan_git_dir_below_a_submodule_git_dir_refuses(w: RR, capsys) -> N
         {"detail": x["detail"], "path": x["path"]} for x in details(d)
     ], details(d)
     assert d["would_remove"] is False
+
+
+# -- helpers for the review round ----------------------------------------------------------------
+
+GIT_ID = "-c user.name=t -c user.email=t@example.test"
+
+
+def detached_commit(w: RR, sub: Path, name: str = "g") -> str:
+    """A new commit on a detached HEAD: no branch holds it."""
+    w.g(["checkout", "-q", "--detach"], sub)
+    (sub / f"{name}.txt").write_text(name)
+    w.g(["add", "."], sub)
+    w.g(["commit", "-q", "-m", name], sub)
+    return w.g(["rev-parse", "HEAD"], sub)
+
+
+def side_commit(w: RR, sub: Path, name: str = "g") -> str:
+    """A new commit on top of ``HEAD`` that no ref and no reflog reaches yet."""
+    return w.g(["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", name], sub)
+
+
+def head_of(w: RR, sub: Path) -> str:
+    return w.g(["rev-parse", "HEAD"], sub)
+
+
+def unpushed_shas(d: dict[str, Any]) -> list[str]:
+    return [x["sha"] for x in details(d, "unpushed_head") if x.get("submodule") == SUB]
+
+
+def fake_sub_git(
+    w: RR, match: Callable[[list[str]], bool], reply: Callable[[list[str], dict[str, Any]], Any]
+) -> list[tuple[list[str], dict[str, Any]]]:
+    """Answer the submodule's git commands that ``match`` with ``reply`` (which may raise)."""
+    seen: list[tuple[list[str], dict[str, Any]]] = []
+    gd = f"--git-dir={gitdir_of(w)}"
+
+    def runner(argv: list[str], **kw: Any) -> GitResult:
+        if gd in argv and match(argv):
+            seen.append((list(argv), kw))
+            return reply(argv, kw)  # type: ignore[no-any-return]
+        return run_git(argv, **kw)
+
+    w.git_runner = runner
+    return seen
+
+
+def is_rev_list(kind: str) -> Callable[[list[str]], bool]:
+    """The four rev-list calls of the pushed check: the reflog, a, b and c."""
+
+    def match(argv: list[str]) -> bool:
+        if "rev-list" not in argv:
+            return False
+        if kind == "reflog":
+            return "-g" in argv
+        if kind == "branches":
+            return "--stdin" in argv
+        if kind == "tags":
+            return "--tags" in argv
+        return "--tags" not in argv and "-g" not in argv and "--stdin" not in argv
+
+    return match
+
+
+# -- R1: refs that name something other than a commit ---------------------------------------------
+
+
+def make_object(w: RR, sub: Path, kind: str) -> str:
+    (w.tmp / "payload.txt").write_text("only copy of this data")
+    blob = w.g(["hash-object", "-w", str(w.tmp / "payload.txt")], sub)
+    return blob if kind != "tree" else w.g(["rev-parse", "HEAD^{tree}"], sub)
+
+
+@pytest.mark.parametrize("kind", ["blob", "tree"])
+def test_a_lightweight_tag_of_a_non_commit_refuses(w: RR, capsys, kind: str) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    w.g(["tag", "t", make_object(w, sub, kind)], sub)
+    assert_refused_dirty(w.st(capsys), SUB, "refs")
+
+
+def test_an_annotated_tag_of_a_blob_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    w.g(["tag", "-a", "-m", "m", "a", make_object(w, sub, "blob")], sub)
+    assert_refused_dirty(w.st(capsys), SUB, "refs")
+
+
+def test_a_tag_of_a_tag_of_a_blob_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    w.g(["tag", "-a", "-m", "m", "a", make_object(w, sub, "blob")], sub)
+    w.g(["tag", "-a", "-m", "m", "b", "a"], sub)
+    assert_refused_dirty(w.st(capsys), SUB, "refs")
+
+
+def test_a_blob_under_refs_remotes_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    w.g(["update-ref", "refs/remotes/origin/x", make_object(w, sub, "blob")], sub)
+    assert_refused_dirty(w.st(capsys), SUB, "refs")
+
+
+def test_an_annotated_tag_of_a_pushed_commit_passes(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    w.g(["tag", "-a", "-m", "m", "rel", "HEAD"], sub)
+    d = w.st(capsys)
+    assert (d["would_remove"], d["reason"]) == (True, None), details(d)
+
+
+# -- R3: commits only the reflog still reaches ----------------------------------------------------
+
+
+def test_a_commit_only_the_reflog_reaches_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    recorded = head_of(w, sub)
+    w.g(["checkout", "-q", "-b", "tmp"], sub)
+    (sub / "g.txt").write_text("g")
+    w.g(["add", "."], sub)
+    w.g(["commit", "-q", "-m", "reflog only"], sub)
+    lost = head_of(w, sub)
+    w.g(["checkout", "-q", "main"], sub)
+    w.g(["update-ref", "-d", "refs/heads/tmp"], sub)
+    assert head_of(w, sub) == recorded
+    assert w.g(["rev-list", "--all", "--count"], sub) == "1"  # no ref reaches it any more
+    d = w.st(capsys)
+    assert lost in unpushed_shas(d), details(d, "unpushed_head")
+    assert (d["would_remove"], d["reason"]) == (False, "unpushed")
+
+
+def test_a_reflog_of_only_recorded_history_stays_clean(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    w.g(["checkout", "-q", "--detach", "HEAD~0"], sub)
+    w.g(["checkout", "-q", "main"], sub)
+    assert w.g(["reflog", "show", "--format=%H", "HEAD"], sub)
+    d = w.st(capsys)
+    assert (d["would_remove"], d["reason"]) == (True, None), details(d)
+
+
+def test_a_fresh_checkout_of_an_older_pointer_stays_clean(w: RR, capsys) -> None:  # noqa: ANN001
+    """The reflog of a submodule that was moved to a newer, pushed commit and recorded there."""
+    sub = world_with_sub(w, capsys)
+    (sub / "g.txt").write_text("g")
+    w.g(["add", "."], sub)
+    w.g(["commit", "-q", "-m", "g"], sub)
+    w.g(["push", "-q", "origin", "HEAD:main"], sub)
+    w.g(["add", SUB], w.wt)
+    w.g(["commit", "-q", "-m", "bump"], w.wt)
+    w.push()
+    d = w.st(capsys)
+    assert (d["would_remove"], d["reason"]) == (True, None), details(d)
+
+
+# -- R4: remote-tracking refs vouch for tags and the recorded commit ------------------------------
+
+
+def test_a_tag_reachable_from_a_remote_tracking_ref_passes(w: RR, capsys) -> None:  # noqa: ANN001
+    """Documents the trust model: remote-tracking refs are forgeable but vouch for tags."""
+    sub = world_with_sub(w, capsys)
+    other = side_commit(w, sub)
+    w.g(["tag", "keep", other], sub)
+    w.g(["update-ref", "refs/remotes/origin/other", other], sub)
+    d = w.st(capsys)
+    assert (d["would_remove"], d["reason"]) == (True, None), details(d, "unpushed_head")
+
+
+def test_the_same_tag_without_a_remote_tracking_ref_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    other = side_commit(w, sub)
+    w.g(["tag", "keep", other], sub)
+    d = w.st(capsys)
+    assert unpushed_shas(d) == [other], details(d, "unpushed_head")
+
+
+# -- R7: the pushed rules one by one --------------------------------------------------------------
+
+
+def test_a_tag_on_an_unpushed_commit_that_no_branch_holds_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    lost = side_commit(w, sub)
+    w.g(["tag", "keep", lost], sub)
+    d = w.st(capsys)
+    assert unpushed_shas(d) == [lost], details(d, "unpushed_head")
+
+
+def test_a_recorded_commit_no_remote_tracking_ref_reaches_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    recorded = head_of(w, sub)
+    for ref in w.g(["for-each-ref", "--format=%(refname)", "refs/remotes"], sub).split():
+        w.g(["update-ref", "--no-deref", "-d", ref], sub)
+    d = w.st(capsys)
+    assert unpushed_shas(d) == [recorded], details(d, "unpushed_head")
+
+
+@pytest.mark.parametrize("reflog", [True, False])
+def test_a_detached_head_ahead_of_the_recorded_commit_refuses(
+    w: RR,
+    capsys,
+    reflog: bool,  # noqa: ANN001
+) -> None:
+    sub = world_with_sub(w, capsys)
+    ahead = detached_commit(w, sub)
+    if not reflog:  # without a reflog only HEAD itself names the commit
+        shutil.rmtree(gitdir_of(w) / "logs")
+    d = w.st(capsys)
+    assert unpushed_shas(d) == [ahead], details(d, "unpushed_head")
+
+
+def test_a_branch_ahead_of_the_recorded_commit_refuses_without_any_reflog(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    recorded = head_of(w, sub)
+    ahead = side_commit(w, sub)
+    w.g(["update-ref", "refs/heads/side", ahead], sub)
+    shutil.rmtree(gitdir_of(w) / "logs")
+    assert head_of(w, sub) == recorded
+    d = w.st(capsys)
+    assert unpushed_shas(d) == [ahead], details(d, "unpushed_head")
+
+
+def test_a_recorded_commit_missing_from_the_submodule_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    have = head_of(w, sub)
+    w.g(["update-index", "--cacheinfo", f"160000,{'1' * 40},{SUB}"], w.wt)
+    w.g(["commit", "-q", "-m", "points nowhere"], w.wt)
+    w.push()
+    d = w.st(capsys)
+    assert have in unpushed_shas(d), details(d, "unpushed_head")
+
+
+@pytest.mark.parametrize("text", ["garbage\n", "ref: refs/heads/unborn\n"])
+def test_an_unreadable_head_of_the_submodule_refuses(w: RR, capsys, text: str) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    (gitdir_of(w) / "HEAD").write_text(text)
+    assert_refused_dirty(w.st(capsys), SUB, "unreadable")
+
+
+def test_a_head_that_does_not_resolve_to_a_commit_refuses_unreadable(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    fake_sub_git(
+        w,
+        lambda a: "HEAD^{commit}" in a and "rev-parse" in a,
+        lambda a, kw: GitResult(0, b"not-a-sha\n", b""),
+    )
+    assert_refused_dirty(w.st(capsys), SUB, "unreadable")
+
+
+@pytest.mark.parametrize("kind", ["reflog", "branches", "tags", "recorded"])
+@pytest.mark.parametrize("failure", ["exit", "timeout", "garbage"])
+def test_a_failing_rev_list_refuses_with_refs(w: RR, capsys, kind: str, failure: str) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    answer = {
+        "exit": GitResult(128, b"", b"fatal"),
+        "timeout": GitResult(0, b"", b"", True),
+        "garbage": GitResult(0, b"zz\n", b""),
+    }[failure]
+    seen = fake_sub_git(w, is_rev_list(kind), lambda a, kw: answer)
+    d = w.st(capsys)
+    assert seen, "the rev-list call was never made"
+    assert_refused_dirty(d, SUB, "refs")
+
+
+def test_an_os_error_while_checking_a_submodule_refuses_unreadable(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+
+    def boom(argv: list[str], kw: dict[str, Any]) -> GitResult:
+        raise OSError("disk went away")
+
+    fake_sub_git(w, is_rev_list("recorded"), boom)
+    assert_refused_dirty(w.st(capsys), SUB, "unreadable")
+
+
+# -- R5: the git calls honour the removal deadline ------------------------------------------------
+
+
+def test_git_calls_in_a_submodule_are_capped_by_the_remaining_budget(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world_with_sub(w, capsys)
+    monkeypatch.setattr(fsafe_child.Budget, "remaining", lambda self: 7.0)
+    # (hardened git's own `config --list` probe has a fixed 30 second limit of its own)
+    seen = fake_sub_git(w, lambda a: "--list" not in a, lambda a, kw: run_git(a, **kw))
+    d = w.st(capsys)
+    got = [kw.get("timeout") for _, kw in seen]
+    assert seen and all(t is not None and 0 < t <= 7.0 for t in got), got
+    assert d["would_remove"] is True
+
+
+def expire_after_first_submodule_call(
+    w: RR, monkeypatch: pytest.MonkeyPatch, rel: str = SUB
+) -> None:
+    """The budget has time until the first git command of the submodule has run."""
+    state = {"spent": False}
+    monkeypatch.setattr(
+        fsafe_child.Budget, "remaining", lambda self: 0.0 if state["spent"] else 100.0
+    )
+    gd = f"--git-dir={gitdir_of(w, rel)}"
+
+    def runner(argv: list[str], **kw: Any) -> GitResult:
+        r = run_git(argv, **kw)
+        if gd in argv:
+            state["spent"] = True
+        return r
+
+    w.git_runner = runner
+
+
+def test_an_exhausted_budget_during_a_submodule_check_refuses_with_deadline(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world_with_sub(w, capsys)
+    expire_after_first_submodule_call(w, monkeypatch)
+    assert_refused_dirty(w.st(capsys), SUB, "deadline")
+
+
+def test_submodules_after_a_deadline_are_covered_without_more_findings(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    w.start(capsys)
+    add_sub(w, capsys, bare_origin(w, "one"), "a/one", push=False)
+    add_sub(w, capsys, bare_origin(w, "two"), "b/two")
+    expire_after_first_submodule_call(w, monkeypatch, "a/one")
+    d = w.st(capsys)
+    subs = [x for x in details(d) if x.get("reason") or x["detail"] == "nested_repo"]
+    assert subs == [sub_detail("a/one", "deadline")], subs
+
+
+# -- R2: the step-9 re-check covers the submodules ------------------------------------------------
+
+
+def mutate_sub(w: RR, body: str) -> None:
+    w.top["hooks"] = {"pre-remove": [{"cmd": script(w.tmp / "m.sh", body)}]}
+
+
+def test_a_submodule_edit_after_the_confirmation_refuses_even_forced(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    mutate_sub(w, f"echo edit >> {sub}/f.txt")
+    err = w.refused("--force", human=True)
+    assert err["reason"] == "dirty"
+    assert sub_detail(SUB, "tracked") in err["checks"]["nested_repos"]["details"]
+    assert w.intact() and sub.is_dir()
+
+
+def test_a_new_untracked_file_in_a_submodule_after_the_confirmation_refuses(
+    w: RR,
+    capsys,  # noqa: ANN001
+) -> None:
+    sub = world_with_sub(w, capsys)
+    mutate_sub(w, f"echo n > {sub}/late.txt")
+    err = w.refused("--force", human=True)
+    assert err["reason"] == "dirty"
+    assert sub_detail(SUB, "untracked") in err["checks"]["nested_repos"]["details"]
+    assert w.intact()
+
+
+def test_a_new_commit_in_a_submodule_after_the_confirmation_refuses_unpushed(
+    w: RR,
+    capsys,  # noqa: ANN001
+) -> None:
+    sub = world_with_sub(w, capsys)
+    mutate_sub(w, f"git -C {sub} {GIT_ID} commit -q --allow-empty -m late")
+    err = w.refused("--force", human=True)
+    assert err["reason"] == "unpushed"
+    got = err["checks"]["unpushed_head"]["details"]
+    assert [x["detail"] for x in got] == ["submodule_unpushed"] and got[0]["submodule"] == SUB
+    assert w.intact()
+
+
+def test_a_submodule_finding_already_forced_at_step_six_does_not_refuse_at_step_nine(
+    w: RR,
+    capsys,  # noqa: ANN001
+) -> None:
+    sub = world_with_sub(w, capsys)
+    (sub / "old.txt").write_text("x")  # reported at step 6 and overridden
+    mutate_sub(w, "true")
+    out = w.removed("--force", human=True, tty=False)
+    assert out["record"]["state"] == "removed"
+
+
+def test_an_unchanged_submodule_passes_the_recheck(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    mutate_sub(w, "true")
+    assert w.removed()["record"]["state"] == "removed"
+
+
+# -- R7h: hostile git files and git directories ---------------------------------------------------
+
+
+def test_an_oversized_gitfile_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    set_gitfile(sub, "gitdir: " + "a" * 5000 + "\n")
+    refused_unverified(w.st(capsys))
+
+
+@pytest.mark.parametrize("suffix", [" \n", "\r\n", "\t\n", "\n\n"])
+def test_a_gitfile_naming_the_real_dir_with_trailing_junk_refuses(
+    w: RR,
+    capsys,
+    suffix: str,  # noqa: ANN001
+) -> None:
+    sub = world_with_sub(w, capsys)
+    set_gitfile(sub, f"gitdir: {gitdir_of(w)}{suffix}")
+    refused_unverified(w.st(capsys))
+
+
+def test_a_gitfile_naming_the_real_dir_after_two_spaces_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    set_gitfile(sub, f"gitdir:  {gitdir_of(w)}\n")
+    refused_unverified(w.st(capsys))
+
+
+def test_a_lookalike_git_dir_inside_the_common_dir_but_outside_modules_refuses(
+    w: RR,
+    capsys,  # noqa: ANN001
+) -> None:
+    sub = world_with_sub(w, capsys)
+    look = w.clone / ".git" / "lookalike"
+    shutil.copytree(gitdir_of(w), look)
+    set_gitfile(sub, f"gitdir: {look}\n")
+    refused_unverified(w.st(capsys))
+
+
+def test_a_module_git_dir_whose_objects_is_not_a_directory_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    objects = gitdir_of(w) / "objects"
+    objects.rename(w.tmp / "moved-objects")
+    objects.write_text("not a directory")
+    refused_unverified(w.st(capsys))
+
+
+def test_a_worktrees_directory_in_the_module_git_dir_refuses_with_its_own_reason(
+    w: RR,
+    capsys,  # noqa: ANN001
+) -> None:
+    world_with_sub(w, capsys)
+    (gitdir_of(w) / "worktrees").mkdir()
+    assert_refused_dirty(w.st(capsys), SUB, "worktrees")
+
+
+@pytest.mark.parametrize("as_what", ["dir", "link"])
+def test_info_attributes_that_is_not_a_regular_file_refuses(
+    w: RR,
+    capsys,
+    as_what: str,  # noqa: ANN001
+) -> None:
+    world_with_sub(w, capsys)
+    info = gitdir_of(w) / "info"
+    info.mkdir(exist_ok=True)
+    if as_what == "dir":
+        (info / "attributes").mkdir()
+    else:
+        os.symlink("/dev/null", info / "attributes")
+    assert_refused_dirty(w.st(capsys), SUB, "attributes")
+
+
+def test_info_that_is_a_file_refuses_as_attributes(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    info = gitdir_of(w) / "info"
+    shutil.rmtree(info, ignore_errors=True)
+    info.write_text("not a directory")
+    assert_refused_dirty(w.st(capsys), SUB, "attributes")
+
+
+@pytest.mark.parametrize("as_what", ["dir", "link"])
+def test_alternates_that_is_not_a_regular_file_refuses(
+    w: RR,
+    capsys,
+    as_what: str,  # noqa: ANN001
+) -> None:
+    world_with_sub(w, capsys)
+    info = gitdir_of(w) / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    if as_what == "dir":
+        (info / "alternates").mkdir()
+    else:
+        os.symlink("/dev/null", info / "alternates")
+    refused_unverified(w.st(capsys))
+
+
+def test_an_unopenable_objects_info_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    info = gitdir_of(w) / "objects" / "info"
+    shutil.rmtree(info, ignore_errors=True)
+    info.write_text("not a directory")
+    refused_unverified(w.st(capsys))
+
+
+def test_an_empty_alternates_file_is_not_a_problem(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    info = gitdir_of(w) / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text("")
+    d = w.st(capsys)
+    assert d["checks"]["nested_repos"]["status"] == "pass", details(d)
+
+
+# -- R7i: inside a submodule ----------------------------------------------------------------------
+
+
+def nested_world(w: RR, capsys) -> Path:  # noqa: ANN001
+    w.start(capsys)
+    inner = bare_origin(w, "inner")
+    return add_sub(w, capsys, bare_origin(w, "outer", nested=inner, at="deep"))
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [("not_dir", "tracked"), ("unreadable", "tracked"), ("contents", "gitlink_contents")],
+)
+def test_a_gitlink_state_inside_a_submodule_is_reported(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    reason: str,
+) -> None:
+    nested_world(w, capsys)
+    real = removal_content.Hasher.gitlink_state
+
+    def fake(self: Any, rel: str) -> str:
+        return state if rel == f"{SUB}/deep" else real(self, rel)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(removal_content.Hasher, "gitlink_state", fake)
+    d = w.st(capsys)
+    assert sub_detail(SUB, reason) in details(d), details(d)
+
+
+def test_a_file_written_into_a_deinitialised_nested_submodule_refuses(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = nested_world(w, capsys)
+    w.g(["submodule", "deinit", "-f", "deep"], sub)
+    (sub / "deep" / "x.txt").write_text("hidden from git")
+    d = w.st(capsys)
+    assert sub_detail(SUB, "gitlink_contents") in details(d), details(d)
+
+
+def test_an_unmerged_entry_in_the_submodule_refuses_as_tracked(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    blob = w.g(["rev-parse", "HEAD:f.txt"], sub)
+    index = f"0 {'0' * 40}\tf.txt\n100644 {blob} 1\tf.txt\n100644 {blob} 2\tf.txt\n"
+    w.g(["update-index", "--index-info"], sub, stdin=index.encode())
+    assert_refused_dirty(w.st(capsys), SUB, "tracked")
+
+
+def test_a_file_named_like_a_directory_only_disposable_pattern_is_ignored_content(
+    w: RR,
+    capsys,  # noqa: ANN001
+) -> None:
+    sub = world_with_sub(w, capsys)
+    (gitdir_of(w) / "info").mkdir(exist_ok=True)
+    (gitdir_of(w) / "info" / "exclude").write_text("node_modules\n")
+    (sub / "node_modules").write_text("a file, not a directory")
+    assert_refused_dirty(w.st(capsys), SUB, "ignored")
+
+
+def test_more_refs_than_the_limit_refuse(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world_with_sub(w, capsys)
+    monkeypatch.setattr(removal_submodules, "MAX_REFS", 2)
+    assert_refused_dirty(w.st(capsys), SUB, "refs")
+
+
+def test_submodules_after_the_count_limit_are_covered_without_more_findings(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    w.start(capsys)
+    for i in range(4):
+        add_sub(w, capsys, bare_origin(w, f"s{i}"), f"m/s{i}", push=False)
+    w.push()
+    monkeypatch.setattr(removal_submodules, "MAX_SUBMODULES", 2)
+    d = w.st(capsys)
+    found = [x for x in details(d) if x.get("reason") or x["detail"] == "nested_repo"]
+    assert [x.get("reason") for x in found] == ["too_many"], found
+
+
+def test_a_failure_of_the_whole_walk_is_incomplete(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world_with_sub(w, capsys)
+
+    def boom(self: Any) -> None:
+        raise fsafe.FsafeError("identity", "gone")
+
+    monkeypatch.setattr(removal_submodules._Walk, "run", boom)
+    d = w.st(capsys)
+    assert {"detail": "incomplete", "path": None} in details(d)
+    assert d["would_remove"] is False
+
+
+def test_an_orphan_walk_that_is_cut_short_is_incomplete(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world_with_sub(w, capsys)
+    (gitdir_of(w) / "modules" / "a" / "b").mkdir(parents=True)
+    monkeypatch.setattr(removal_content, "MODULES_MAX_DEPTH", 0)
+    d = w.st(capsys)
+    assert {"detail": "incomplete", "path": None} in details(d), details(d)
+
+
+def test_an_unopenable_modules_directory_below_a_submodule_is_incomplete(w: RR, capsys) -> None:  # noqa: ANN001
+    world_with_sub(w, capsys)
+    os.symlink(w.tmp, gitdir_of(w) / "modules")
+    d = w.st(capsys)
+    assert {"detail": "incomplete", "path": None} in details(d), details(d)
+    assert d["would_remove"] is False
+
+
+def test_entries_below_a_refused_submodule_are_not_reported_again(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = nested_world(w, capsys)
+    set_gitfile(sub, "garbage\n")
+    d = w.st(capsys)
+    assert sub_detail(SUB, "gitdir") in details(d)
+    assert not [x for x in details(d) if "deep" in (x.get("path") or "")], details(d)
+
+
+def test_outcome_covers_exact_entries_and_everything_below_a_refused_directory() -> None:
+    out = removal_submodules.Outcome()
+    out.handled.add(("a", ".git"))
+    out.refused_dirs.add(("r",))
+    assert out.covers(("a", ".git"))
+    assert out.covers(("r", ".git")) and out.covers(("r", "x", "y", ".git"))
+    assert not out.covers(("b", ".git")) and not out.covers(("rr", ".git"))
+    assert not out.covers(("a", "c", ".git"))
+
+
+# -- R7j: the unpushed_head check with submodule findings -----------------------------------------
+
+
+class _Mirror:
+    def __init__(self, pushed: Pushed) -> None:
+        self.answer = pushed
+
+    def is_pushed(self, sha: str, tips: object) -> Pushed:
+        return self.answer
+
+
+def _inputs(
+    extra: list[dict[str, Any]], *, tips: object | None, pushed: Pushed | None = None
+) -> removal_content.Inputs:
+    return removal_content.Inputs(
+        git=None,  # type: ignore[arg-type]
+        state=None,
+        record={},
+        config=None,
+        disposable=[],
+        mirror=_Mirror(pushed) if pushed else None,  # type: ignore[arg-type]
+        tips=tips,  # type: ignore[arg-type]
+        sub_unpushed=extra,
+    )
+
+
+EXTRA = [{"sha": "b" * 40, "detail": "submodule_unpushed", "submodule": SUB}]
+HEAD = "a" * 40
+
+
+def test_submodule_findings_fail_unpushed_head_without_tips() -> None:
+    got = removal_content.unpushed_head(_inputs(EXTRA, tips=None), HEAD)
+    assert got == {"status": "fail", "details": EXTRA}
+
+
+def test_no_tips_and_no_submodule_findings_skips() -> None:
+    assert removal_content.unpushed_head(_inputs([], tips=None), HEAD)["status"] == "skipped"
+
+
+def test_submodule_findings_fail_a_pushed_head() -> None:
+    inp = _inputs(EXTRA, tips=object(), pushed=Pushed(True))
+    assert removal_content.unpushed_head(inp, HEAD) == {"status": "fail", "details": EXTRA}
+
+
+def test_submodule_findings_follow_the_finding_of_an_unpushed_head() -> None:
+    inp = _inputs(EXTRA, tips=object(), pushed=Pushed(False, "not_ancestor"))
+    got = removal_content.unpushed_head(inp, HEAD)
+    assert got["status"] == "fail"
+    assert got["details"] == [{"sha": HEAD, "detail": "not_reachable"}, *EXTRA]
+
+
+def test_a_pushed_head_without_submodule_findings_passes() -> None:
+    inp = _inputs([], tips=object(), pushed=Pushed(True))
+    assert removal_content.unpushed_head(inp, HEAD) == {"status": "pass", "details": []}

@@ -1196,7 +1196,7 @@
                       "gitlink_changed",
                       "gitlink_contents"
                     ],
-                    "description": "With detail submodule on an initialized submodule: gitdir: the .git file or git directory failed verification (not below the expected modules directory, a link, alternates, commondir, claimed twice, malformed); unreadable: a git command or read failed; too_deep, too_many, deadline: a recursion bound was reached; tracked, untracked, ignored, hidden_changes, attributes, stash: the submodule is dirty as in the check of that name; refs: a ref outside refs/heads, refs/remotes, refs/tags, or a ref listing past the bound; worktrees: the submodule git dir has linked worktrees; gitlink_changed: the superproject's index and HEAD disagree on the submodule's commit; gitlink_contents: files below a nested uninitialized gitlink."
+                    "description": "With detail submodule on an initialized submodule: gitdir: the .git file or git directory failed verification (not below the expected modules directory, a link, alternates, commondir, claimed twice, malformed); unreadable: a git command or read failed; too_deep, too_many, deadline: a recursion bound was reached; tracked, untracked, ignored, hidden_changes, attributes, stash: the submodule is dirty as in the check of that name; refs: a ref outside refs/heads, refs/remotes, refs/tags, a branch, tag or remote-tracking ref that does not name a commit (a blob or tree, peeled through annotated tags), a ref or reflog listing past the bound, or a history check that failed; worktrees: the submodule git dir has linked worktrees; gitlink_changed: the superproject's index and HEAD disagree on the submodule's commit; gitlink_contents: files below a nested uninitialized gitlink."
                   }
                 },
                 "additionalProperties": false,
@@ -1335,7 +1335,7 @@
                       "head_moved",
                       "submodule_unpushed"
                     ],
-                    "description": "not_reachable: the commit is missing from the mirror or is not an ancestor of any mirror refs/heads tip; ancestry_unverified: the content-verified ancestry check failed (interface: Reachability); head_moved: HEAD changed after the confirmation (remove step 9; sha is the new HEAD). submodule_unpushed: a submodule's HEAD, a local branch tip or a commit reachable from a tag differs from the commit the superproject's HEAD records, or is not reachable from a remote-tracking ref of the submodule (sha is that commit; submodule names it)."
+                    "description": "not_reachable: the commit is missing from the mirror or is not an ancestor of any mirror refs/heads tip; ancestry_unverified: the content-verified ancestry check failed (interface: Reachability); head_moved: HEAD changed after the confirmation (remove step 9; sha is the new HEAD). submodule_unpushed: a submodule's HEAD, a local branch tip, a commit only the reflog of HEAD or of a local branch reaches, or a commit reachable from a tag differs from the commit the superproject's HEAD records, or is not reachable from a remote-tracking ref of the submodule (sha is that commit; submodule names it)."
                   },
                   "submodule": {
                     "type": "string",

@@ -13,12 +13,15 @@ them is trusted:
 * Every git command goes through the hardened ``Git`` (clean environment, the full override set,
   protocols ``none``, explicit ``--git-dir`` and ``--work-tree``): no hook, filter, fsmonitor or
   network access happens in a submodule.
-* "Pushed" is local and conservative: the submodule's ``HEAD`` and every local branch must lie
-  within the history of the commit the superproject's ``HEAD`` records for it, and that commit
-  must be reachable from a remote-tracking ref of the submodule. The superproject's own pushed
-  check (the mirror)
-  vouches for the recorded commit; remote-tracking refs are forgeable, so they never vouch for
-  anything the superproject does not record.
+* "Pushed" is local and conservative: the submodule's ``HEAD`` and every local branch, and every
+  commit their reflogs still reach, must lie within the history of the commit the superproject's
+  ``HEAD`` records for it. Every branch, tag and remote-tracking ref must name a commit (a tag or
+  ref of a blob or tree would keep an object only the git directory holds). The recorded commit
+  must be reachable from a remote-tracking ref of the submodule, and so must every tag outside
+  the recorded history. Remote-tracking refs are not authenticated (an agent can write any of
+  them): they vouch for tags and for the recorded commit, which the superproject's own pushed
+  check (the mirror) already vouches for, and never for the local ``HEAD`` or a local branch.
+* Every git command is charged to the removal budget and capped by what is left of it.
 * The recursion is bounded in depth, count and time.
 """
 
@@ -27,16 +30,19 @@ from __future__ import annotations
 import dataclasses
 import os
 import posixpath
-from typing import Any
+from typing import Any, cast
 
 from . import fsafe, removal_content
 from .errors import WtctlError
+from .gateway import GitResult
+from .hardgit import DEFAULT_TIMEOUT, Git
 from .ignorematch import Disposable
 from .removal_content import Inputs
 
 MAX_DEPTH = 8
 MAX_SUBMODULES = 128
 MAX_REFS = 1000
+MAX_REFLOG = 100_000  # reflog entries read for the pushed check; more is refused
 POINTER_MAX = 4000  # the walk keeps 4096 bytes of a .git file: more is not a pointer
 
 
@@ -66,6 +72,30 @@ class _Ctx:
     depth: int
 
 
+class _BudgetedGit:
+    """The hardened ``Git`` with every command charged to the removal budget and capped by what
+    is left of it; an exhausted budget refuses the submodule being checked (``deadline``)."""
+
+    def __init__(self, inner: Git, budget: Any) -> None:
+        self.inner = inner
+        self.budget = budget
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def run(self, argv: Any, **kw: Any) -> GitResult:
+        left = self.budget.remaining()
+        if left <= 0:
+            raise _Refuse("deadline")
+        start = self.budget.clock()
+        try:
+            return self.inner.run(
+                argv, **{**kw, "timeout": min(left, kw.get("timeout") or left, DEFAULT_TIMEOUT)}
+            )
+        finally:
+            self.budget.charge(self.budget.clock() - start)
+
+
 class _Refuse(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -78,6 +108,8 @@ def check(inp: Inputs, gits: list[dict[str, Any]]) -> Outcome:
     out = Outcome()
     if not gits:
         return out
+    if inp.budget is not None:
+        inp = dataclasses.replace(inp, git=cast(Git, _BudgetedGit(inp.git, inp.budget)))
     by_path = {tuple(g["path"]): g for g in gits}
     try:
         with (
@@ -88,7 +120,7 @@ def check(inp: Inputs, gits: list[dict[str, Any]]) -> Outcome:
             ) as anchor,
         ):
             _Walk(inp, by_path, hasher, anchor, out).run()
-    except fsafe.FsafeError:
+    except (fsafe.FsafeError, _Refuse):  # _Refuse: the budget ran out outside any submodule
         out.dirty.append({"detail": "incomplete", "path": None})
     return out
 
@@ -168,6 +200,7 @@ class _Walk:
         try:
             self.verified(ctx, gl, parts, g)
         except _Refuse as exc:
+            self.stopped = self.stopped or exc.reason == "deadline"
             self.refuse(parts, exc.reason)
         except (WtctlError, fsafe.FsafeError, OSError):
             self.refuse(parts, "unreadable")
@@ -234,8 +267,6 @@ class _Walk:
         """Open the git directory no-follow from the recorded common directory and look at what
         git would read from it. Returns its identity, the reasons it is refused or dirty, and the
         path of its ``modules`` directory."""
-        if chain and chain[0] == "..":
-            raise fsafe.FsafeError("identity", "the git dir is outside the common dir")
         anchor = self.anchor
         fd = fsafe.open_chain(
             anchor, anchor.fd, chain, owner_uid=os.geteuid(), start_path=anchor.path
@@ -251,15 +282,15 @@ class _Walk:
                     problems.append("gitdir" if name == "commondir" else "worktrees")
             if _kind(anchor, fd, "objects") != "dir":
                 problems.append("gitdir")
-            if self.nonempty(fd, ["objects", "info"], "alternates", must_be_file=True):
+            if self.nonempty(fd, ["objects", "info"], "alternates"):
                 problems.append("gitdir")
-            if self.nonempty(fd, ["info"], "attributes", must_be_file=False):
+            if self.nonempty(fd, ["info"], "attributes"):
                 problems.append("attributes")
         finally:
             os.close(fd)
         return ident, problems, target + "/modules"
 
-    def nonempty(self, fd: int, chain: list[str], name: str, *, must_be_file: bool) -> bool:
+    def nonempty(self, fd: int, chain: list[str], name: str) -> bool:
         """True when ``chain/name`` below ``fd`` exists and is not an empty regular file; a
         directory that cannot be opened (but exists) counts as non-empty."""
         anchor = self.anchor
@@ -345,18 +376,8 @@ class _Walk:
         head = head.strip()
         if not removal_content.SHA.fullmatch(head):
             raise _Refuse("unreadable")
+        reasons += self.ref_names(sub)
         bad: list[str] = []
-        listing = sub.run(
-            ["for-each-ref", f"--count={MAX_REFS + 1}", "--format=%(refname)"],
-            what="for-each-ref",
-        ).decode("utf-8", "surrogateescape")
-        lines = [x for x in listing.split("\n") if x]
-        if len(lines) > MAX_REFS:
-            reasons.append("refs")
-        for ref in lines[:MAX_REFS]:
-            if ref.startswith(("refs/remotes/", "refs/tags/", "refs/heads/")):
-                continue
-            reasons.append("stash" if ref == "refs/stash" else "refs")
         if recorded is not None:
             have = sub.git.run(
                 ["rev-parse", "--verify", "-q", f"{recorded}^{{commit}}"],
@@ -366,15 +387,23 @@ class _Walk:
             if have.timed_out or have.returncode != 0:
                 bad.append(head)  # the recorded commit is not here: nothing vouches for HEAD
             else:
-                # (a) HEAD and every local branch lie within the recorded commit's history;
+                reflog = self.reflog_commits(sub)
+                if reflog is None:
+                    reasons.append("refs")
+                # (a) HEAD, every local branch and every commit their reflogs reach lie within
+                #     the recorded commit's history;
                 # (b) so does every tag, or it is reachable from a remote-tracking ref;
                 # (c) the recorded commit itself is reachable from a remote-tracking ref.
-                for argv in (
-                    ["rev-list", "--max-count=1", head, "--branches", "--not", recorded],
-                    ["rev-list", "--max-count=1", "--tags", "--not", "--remotes", recorded],
-                    ["rev-list", "--max-count=1", recorded, "--not", "--remotes"],
-                ):
-                    r = sub.git.run(argv, git_dir=sub.gitdir, work_tree=sub.path)
+                for argv, stdin in (
+                    (
+                        ["rev-list", "--max-count=1", "--stdin", "--branches", head,
+                         "--not", recorded],
+                        b"".join(c.encode() + b"\n" for c in reflog or ()),
+                    ),
+                    (["rev-list", "--max-count=1", "--tags", "--not", "--remotes", recorded], None),
+                    (["rev-list", "--max-count=1", recorded, "--not", "--remotes"], None),
+                ):  # fmt: skip
+                    r = sub.git.run(argv, git_dir=sub.gitdir, work_tree=sub.path, stdin=stdin)
                     out = r.stdout.decode().strip()
                     if (
                         r.timed_out
@@ -384,8 +413,6 @@ class _Walk:
                         reasons.append("refs")
                     elif out:
                         bad.append(out)
-        if recorded is None:
-            bad = []  # reported as gitlink_changed: not a statement about pushed commits
         for sha in dict.fromkeys(bad):
             self.out.unpushed.append(
                 {
@@ -395,6 +422,49 @@ class _Walk:
                 }
             )
         return reasons
+
+    def ref_names(self, sub: Inputs) -> list[str]:
+        """Reasons from the refs themselves: a namespace nothing vouches for, a stash, too many
+        refs, or a branch, tag or remote-tracking ref that does not name a commit (the rev-list
+        checks never see a blob or tree that only such a ref keeps alive)."""
+        reasons: list[str] = []
+        listing = sub.run(
+            [
+                "for-each-ref",
+                f"--count={MAX_REFS + 1}",
+                "--format=%(refname) %(objecttype) %(*objecttype)",
+            ],
+            what="for-each-ref",
+        ).decode("utf-8", "surrogateescape")
+        lines = [x for x in listing.split("\n") if x]
+        if len(lines) > MAX_REFS:
+            reasons.append("refs")
+        for line in lines[:MAX_REFS]:
+            ref, _, types = line.partition(" ")
+            kind, _, peeled = types.partition(" ")
+            if ref.startswith(("refs/remotes/", "refs/tags/", "refs/heads/")):
+                if (peeled or kind) != "commit":
+                    reasons.append("refs")
+            else:
+                reasons.append("stash" if ref == "refs/stash" else "refs")
+        return reasons
+
+    def reflog_commits(self, sub: Inputs) -> list[str] | None:
+        """The distinct commits the reflogs of ``HEAD`` and of the local branches reach (those of
+        remote-tracking refs are left out: git rewrites them on every fetch); None when they
+        cannot be listed in full."""
+        r = sub.git.run(
+            ["rev-list", "-g", f"--max-count={MAX_REFLOG}", "--branches", "HEAD"],
+            git_dir=sub.gitdir,
+            work_tree=sub.path,
+        )
+        if r.timed_out or r.returncode != 0:
+            return None
+        lines = r.stdout.decode().split("\n")
+        commits = [x for x in lines if x]
+        if len(commits) >= MAX_REFLOG or not all(removal_content.SHA.fullmatch(x) for x in commits):
+            return None
+        return list(dict.fromkeys(commits))
 
     # -- git dirs nobody claims ----------------------------------------------------------------
 
