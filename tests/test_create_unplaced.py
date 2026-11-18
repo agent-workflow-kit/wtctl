@@ -221,6 +221,62 @@ def test_remove_without_confirmation_changes_nothing(
     assert r.code != 0 and w.admin_entries() and branches(w)
 
 
+def test_a_scanner_that_cannot_tell_refuses_and_changes_nothing(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    covered(monkeypatch)
+    w.scanner.fail = True
+    r = w.run("remove", rec["id"], "--yes", human=True)
+    assert r.code != 0 and w.admin_entries() and branches(w)
+
+
+def test_a_failing_admin_deletion_stops_before_the_branch(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import removal_delete
+
+    made(w, monkeypatch)
+    [rec] = w.records()
+    covered(monkeypatch)
+    monkeypatch.setattr(removal_delete, "delete_admin", lambda *a, **k: ("failed", [rec["admin_dir"]]))
+    r = w.run("remove", rec["id"], "--yes", human=True)
+    assert r.json()["error"]["code"] == "partial"
+    assert branches(w) and w.records()[0]["state"] == "partial"
+
+
+def test_a_branch_that_moves_after_the_plan_is_kept(w: TW, monkeypatch: pytest.MonkeyPatch) -> None:
+    from wtctl import worktrees
+
+    made(w, monkeypatch)
+    [rec] = w.records()
+    covered(monkeypatch)
+    ref = branches(w)[0]
+    real = worktrees.delete_created_branch
+
+    def moved(git, common, branch, sha):  # noqa: ANN001, ANN202
+        w.g(["update-ref", ref, w.shas["c2"]])
+        return real(git, common, branch, sha)
+
+    monkeypatch.setattr(worktrees, "delete_created_branch", moved)
+    w.run("remove", rec["id"], "--yes", human=True)
+    assert branches(w) == [ref]  # the compare-and-swap lost
+
+
+def test_status_list_and_show_work_on_an_unplaced_record(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    covered(monkeypatch)
+    for argv in (("status", rec["id"]), ("remove", rec["id"], "--dry-run"), ("show", rec["id"])):
+        r = w.run(*argv, human=True)
+        assert r.code == 0, (argv, r.out, r.err)
+    assert w.run("list", "--all").code == 0
+    assert w.admin_entries() and branches(w)  # read-only
+
+
 # -- reconcile --------------------------------------------------------------------------------
 
 
@@ -298,3 +354,72 @@ def test_a_partial_record_whose_planted_path_is_not_a_mount_is_not_settled_by_re
     monkeypatch.setattr(reconcile_probe, "planted", lambda st, rec: ("other", None))
     out = w.run("reconcile").json()
     assert out["changes"] == [] and w.records()[0]["state"] == "creating"
+
+
+# -- real mounts under a user namespace ---------------------------------------------------------
+
+
+def _userns(tmp_path: Path, script: str, *args: str) -> dict:
+    import json
+    import os
+    import subprocess
+    import sys
+
+    unshare = shutil.which("unshare")
+    if unshare is None:
+        pytest.skip("no unshare")
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    ok = subprocess.run(
+        [unshare, "-Urm", "mount", "-t", "tmpfs", "none", str(probe)],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if ok.returncode != 0:
+        pytest.skip("unprivileged user+mount namespaces are unavailable here")
+    work = tmp_path / "ns"
+    work.mkdir()
+    env = {"PATH": os.environ["PATH"], "HOME": str(work)}
+    r = subprocess.run(
+        [unshare, "-Urm", sys.executable, str(Path(__file__).with_name(script)), str(work), *args],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+@pytest.mark.parametrize("variant", ["after", "before"])
+def test_a_real_mount_between_the_check_and_the_dir_id_open(tmp_path: Path, variant: str) -> None:
+    out = _userns(tmp_path, "unplaced_userns_scenario.py", variant)
+    err = out["create"]["error"]
+    assert out["create"]["code"] == 12 and err["details"]["cause"] == "anchor_changed"
+    assert len(err["details"]["remaining"]) == 3
+    # create: settled, nothing deleted
+    c = out["after_create"]
+    assert c["state"] == "partial" and c["dir_id"] is None
+    assert len(c["admin"]) == 1 and len(c["branches"]) == 1
+    # reconcile finds nothing more to settle and deletes nothing
+    assert out["reconcile"]["changes"] == [] and out["after_reconcile"] == c
+    # remove: the admin entry and the branch go, the mount's content is untouched
+    assert out["remove"]["code"] == 1 and out["remove"]["error"]["code"] == "partial"
+    r = out["after_remove"]
+    assert r["state"] == "partial" and r["admin"] == [] and r["branches"] == []
+    assert r["mount_entries"] == c["mount_entries"]
+    if variant == "before":
+        assert ".git" in r["mount_entries"]  # files wtctl made in a foreign mount stay
+    # repeating changes nothing; forget clears the record and still touches nothing on disk
+    assert out["remove_again"]["code"] == 1 and out["after_remove_again"] == r
+    assert out["forget"]["code"] == 0 and out["after_forget"]["state"] == "forgotten"
+    assert out["after_forget"]["mount_entries"] == c["mount_entries"]
+
+
+def test_a_real_mount_that_is_gone_before_remove_lets_it_finish_normally(tmp_path: Path) -> None:
+    out = _userns(tmp_path, "unplaced_userns_unmount_scenario.py")
+    assert out["create"] == 12 and out["state_before"] == "partial"
+    assert out["remove"] == 0 and out["state"] == "removed"
+    assert out["admin"] == [] and out["branches"] == [] and out["dir_exists"] is False
