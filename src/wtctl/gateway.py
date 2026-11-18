@@ -375,6 +375,7 @@ class DeadlineResult:
     stdout: bytes
     stderr: bytes
     timed_out: bool
+    cancelled: bool = False
 
 
 def run_with_deadline(
@@ -384,8 +385,9 @@ def run_with_deadline(
     timeout: float,
     env: Mapping[str, str] | None = None,
     on_start: Callable[[int], None] | None = None,
+    cancel: threading.Event | None = None,
 ) -> DeadlineResult:
-    """Run ``argv`` (no shell) and SIGKILL it on expiry.
+    """Run ``argv`` (no shell) and SIGKILL it on expiry, or when ``cancel`` is set.
 
     The kill goes to the exact PID of the ``Popen`` this call started (``Popen.kill`` signals
     only a child that has not been reaped), never a pattern or a process group.
@@ -401,16 +403,25 @@ def run_with_deadline(
     try:
         if on_start is not None:
             on_start(proc.pid)
-        try:
-            out, err = proc.communicate(stdin, timeout=max(timeout, 0.0))
-            return DeadlineResult(proc.pid, proc.returncode, out, err, False)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        deadline = time.monotonic() + max(timeout, 0.0)
+        first = True
+        while True:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            step = remaining if cancel is None else min(remaining, 0.1)
             try:
-                out, err = proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:  # still stuck in the kernel: report, never block
-                out, err = b"", b""
-            return DeadlineResult(proc.pid, None, out, err, True)
+                out, err = proc.communicate(stdin if first else None, timeout=step)
+                return DeadlineResult(proc.pid, proc.returncode, out, err, False)
+            except subprocess.TimeoutExpired:
+                first = False
+                cancelled = cancel is not None and cancel.is_set()
+                if not cancelled and time.monotonic() < deadline:
+                    continue
+                proc.kill()
+                try:
+                    out, err = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:  # still stuck in the kernel: report, never block
+                    out, err = b"", b""
+                return DeadlineResult(proc.pid, None, out, err, not cancelled, cancelled)
     except BaseException:
         # on_start raised or we were interrupted: never leave the child running
         proc.kill()

@@ -356,3 +356,43 @@ def test_run_git_kills_and_reaps_the_child_on_an_interrupt(tmp_path: Path) -> No
     pid = int(pidfile.read_text())
     with pytest.raises(ProcessLookupError):  # dead and reaped: no zombie, no sleeping child
         os.kill(pid, 0)
+
+
+def test_run_with_deadline_cancel_kills_the_exact_child() -> None:
+    import threading
+
+    cancel = threading.Event()
+    started: list[int] = []
+
+    def on_start(pid: int) -> None:
+        started.append(pid)
+        threading.Timer(0.3, cancel.set).start()
+
+    t0 = time.monotonic()
+    r = gateway.run_with_deadline(
+        [sys.executable, "-c", "import time; time.sleep(600)"],
+        timeout=60,
+        on_start=on_start,
+        cancel=cancel,
+    )
+    assert r.cancelled and not r.timed_out and r.returncode is None
+    assert time.monotonic() - t0 < 20
+    with pytest.raises(ProcessLookupError):
+        os.kill(r.pid, 0)
+
+
+def test_run_with_deadline_cancel_unset_still_returns_output_and_expires() -> None:
+    import threading
+
+    cancel = threading.Event()
+    ok = gateway.run_with_deadline(
+        [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+        stdin=b"xyz",
+        timeout=30,
+        cancel=cancel,
+    )
+    assert (ok.stdout, ok.cancelled, ok.timed_out) == (b"xyz", False, False)
+    slow = gateway.run_with_deadline(
+        [sys.executable, "-c", "import time; time.sleep(600)"], timeout=0.5, cancel=cancel
+    )
+    assert slow.timed_out and not slow.cancelled
