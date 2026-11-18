@@ -316,3 +316,40 @@ def test_an_admin_entry_naming_another_path_deletes_nothing(
     assert e["details"]["unwound"] is False
     rec = w.records()[0]
     assert rec["state"] == "partial" and (Path(rec["path"]) / ".git").exists()
+
+
+def test_create_refuses_an_empty_directory_that_is_a_real_mount_point(tmp_path: Path) -> None:
+    import json
+    import subprocess
+    import sys
+
+    unshare = shutil.which("unshare")
+    if unshare is None:
+        pytest.skip("no unshare")
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    ok = subprocess.run(
+        [unshare, "-Urm", "mount", "-t", "tmpfs", "none", str(probe)],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if ok.returncode != 0:
+        pytest.skip("unprivileged user+mount namespaces are unavailable here")
+    work = tmp_path / "ns"
+    work.mkdir()
+    script = Path(__file__).with_name("mountroot_userns_scenario.py")
+    env = {"PATH": os.environ["PATH"], "HOME": str(work)}
+    r = subprocess.run(
+        [unshare, "-Urm", sys.executable, str(script), str(work)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["code"] == 20 and out["error"]["reason"] == "path_exists"
+    assert "mount point" in out["error"]["message"]
+    assert out["records"] == 0 and out["admin"] == [] and out["entries"] == []

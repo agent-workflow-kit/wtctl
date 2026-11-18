@@ -631,3 +631,19 @@ def test_bad_repo_id(w: CW, capsys) -> None:  # noqa: ANN001
 def test_unknown_repo_is_not_found(w: CW, capsys) -> None:  # noqa: ANN001
     r = w.cli(capsys, "create", "--repo", "example.test/org/none")
     assert r.code == 10
+
+
+def test_path_that_is_a_mount_point_is_refused_by_the_mount_table(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wtctl import fsafe, gateway
+
+    p = worktree_root(w) / "n1"
+    p.mkdir(parents=True)
+    fake = [gateway.MountEntry(99, str(p.resolve()), "tmpfs", "none")]
+    monkeypatch.setattr(fsafe.Fs, "mount_table", lambda self: fake)
+    err = refused(w.create(capsys, "--name", "n1"), 20, "path_exists")
+    assert "mount point" in err["message"]
+    assert not any(p.iterdir()) and w.records() == []
