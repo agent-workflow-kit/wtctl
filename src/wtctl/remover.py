@@ -42,7 +42,7 @@ from .commands.create import record_object
 from .context import Context, Result
 from .errors import UsageError, WtctlError
 from .gitsetup import open_git, with_filters
-from .hardgit import Git
+from .hardgit import FETCH_CAUSES, Git
 from .mirror import Mirror, Tips
 from .removal_status import DIRTY, ORDER, UNPUSHED, Status
 from .state import LIVE_STATES, TOMBSTONE_STATES, Record, State, clone_lease, record_lease
@@ -266,15 +266,7 @@ class Remover:
             if exc.code not in ("fetch_failed", "auth_required") or not self.o.force:
                 raise
             details = exc.fields.get("details") or {}
-            cause = (
-                details.get("cause")
-                if details.get("cause")
-                in (
-                    "timeout",
-                    "prune_incomplete",
-                )
-                else None
-            )
+            cause = details.get("cause") if details.get("cause") in FETCH_CAUSES else None
             self.checks["fetch"] = {
                 "status": "fail",
                 "details": [{"code": exc.code, "cause": cause, "message": _escape(exc.message)}],

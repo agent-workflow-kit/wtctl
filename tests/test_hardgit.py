@@ -326,7 +326,39 @@ def test_check_version_on_the_installed_git(private_home: Path, tmp_path: Path) 
         (res(128, "Host key verification failed."), FetchKind.AUTH_REQUIRED, None),
         (res(128, "fatal: unable to access: The requested URL returned error: 401"),
          FetchKind.AUTH_REQUIRED, None),
-        (res(128, "fatal: unable to access: Could not resolve host"), FetchKind.FAILED, None),
+        # captured from git 2.34.1 + curl, LC_ALL=C (docs/interface.md, Hardened git)
+        (res(128, "fatal: unable to access 'http://h.invalid/a.git/': Could not resolve host: h.invalid"),
+         FetchKind.FAILED, "network_unreachable"),
+        (res(128, "fatal: unable to access 'https://127.0.0.1:1/a.git/': Failed to connect to 127.0.0.1 port 1 after 0 ms: Connection refused"),
+         FetchKind.FAILED, "network_unreachable"),
+        (res(128, "ssh: Could not resolve hostname h.invalid: Name or service not known\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n"),
+         FetchKind.FAILED, "network_unreachable"),
+        (res(128, "ssh: connect to host 127.0.0.1 port 1: Connection refused\nfatal: Could not read from remote repository.\n"),
+         FetchKind.FAILED, "network_unreachable"),
+        (res(128, "fatal: repository 'http://127.0.0.1:18404/a.git/' not found"),
+         FetchKind.FAILED, "repository_not_found"),
+        (res(128, "fatal: '/nonexistent/x.git' does not appear to be a git repository\nfatal: Could not read from remote repository.\n"),
+         FetchKind.FAILED, "repository_not_found"),
+        (res(128, "fatal: unable to access 'http://127.0.0.1:18429/a.git/': The requested URL returned error: 429"),
+         FetchKind.FAILED, "rate_limited"),
+        # other HTTP statuses stay generic
+        (res(128, "fatal: unable to access 'http://h/a.git/': The requested URL returned error: 503"),
+         FetchKind.FAILED, None),
+        (res(128, "fatal: unable to access 'http://h/a.git/': The requested URL returned error: 4290"),
+         FetchKind.FAILED, None),
+        # server-chosen text never classifies
+        (res(128, "remote: Repository not found.\nfatal: remote error: repository 'x' not found"),
+         FetchKind.FAILED, None),
+        (res(128, "remote: fatal: unable to access 'x': The requested URL returned error: 429"),
+         FetchKind.FAILED, None),
+        (res(128, "fatal: remote error: Could not resolve host: x"), FetchKind.FAILED, None),
+        # a marker mid-line (e.g. inside a ref or path name) is not a git-made line
+        (res(128, "fatal: bad ref name 'ssh: Could not resolve hostname x'"), FetchKind.FAILED, None),
+        # authentication wins over any other marker
+        (res(128, "fatal: repository 'https://h/a.git/' not found\nfatal: Authentication failed for 'https://h/'"),
+         FetchKind.AUTH_REQUIRED, None),
+        # only exit 128 is classified by transport text
+        (res(1, "fatal: repository 'https://h/a.git/' not found"), FetchKind.FAILED, None),
         (res(2), FetchKind.FAILED, None),
         (res(-9, timed_out=True), FetchKind.FAILED, "timeout"),
         (res(0, "error: x", timed_out=True), FetchKind.FAILED, "timeout"),
@@ -379,6 +411,15 @@ def test_outcome_errors_map_to_codes_and_causes() -> None:
     assert e is not None and e.fields["details"] == {"cause": "prune_incomplete"}
     e = outcome_error(classify_fetch(p), p, failure_code="clone_failed")
     assert e is not None and "details" not in e.fields
+    for text, cause in (
+        ("fatal: repository 'https://h/a.git/' not found", "repository_not_found"),
+        ("fatal: unable to access 'https://h/': The requested URL returned error: 429", "rate_limited"),
+        ("fatal: unable to access 'https://h/': Could not resolve host: h", "network_unreachable"),
+    ):
+        r = res(128, text)
+        for code in ("fetch_failed", "clone_failed"):
+            e = outcome_error(classify_fetch(r), r, failure_code=code)
+            assert e is not None and e.code == code and e.fields["details"] == {"cause": cause}
     e = outcome_error(classify_fetch(res(1, "x")), res(1, "x"))
     assert e is not None and e.code == "fetch_failed"
 

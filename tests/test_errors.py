@@ -180,6 +180,12 @@ def test_schema_conditional_rules_are_enforced(code: str, fields: dict[str, obje
         ("not_found", {}),
         ("vetoed", {"hook": "h", "hook_stderr": ""}),
         ("fetch_failed", {"details": {"cause": "prune_incomplete"}}),
+        ("fetch_failed", {"details": {"cause": "network_unreachable"}}),
+        ("fetch_failed", {"details": {"cause": "repository_not_found"}}),
+        ("fetch_failed", {"details": {"cause": "rate_limited"}}),
+        ("clone_failed", {"details": {"cause": "network_unreachable"}}),
+        ("clone_failed", {"details": {"cause": "repository_not_found"}}),
+        ("clone_failed", {"details": {"cause": "rate_limited"}}),
         (
             "refused",
             {"reason": "unlinked", "details": {"cause": "fuse_anchor", "anchors": [{}]}},

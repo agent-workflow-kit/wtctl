@@ -29,6 +29,7 @@ from . import (
 from .context import Context
 from .errors import WtctlError
 from .gitsetup import open_git, with_filters
+from .hardgit import FETCH_CAUSES
 from .mirror import Mirror, Tips
 
 FETCH_LEASE_WAIT = 5  # seconds; status never waits for lease_wait
@@ -209,11 +210,7 @@ class Status:
     def _fetch_failed(self, exc: WtctlError) -> Tips | None:
         code = "auth_required" if exc.code == "auth_required" else "fetch_failed"
         details = exc.fields.get("details") or {}
-        cause = (
-            details.get("cause")
-            if details.get("cause") in ("timeout", "prune_incomplete")
-            else None
-        )
+        cause = details.get("cause") if details.get("cause") in FETCH_CAUSES else None
         self.checks["fetch"] = {
             "status": "fail",
             "details": [{"code": code, "cause": cause, "message": _escape(exc.message)}],

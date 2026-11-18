@@ -130,12 +130,15 @@ def bootstrap_failed_details(record: Any, step: Any, warnings: Sequence[str]) ->
     return details
 
 
+# Transport causes of a failed fetch or clone (hardgit.TRANSPORT_CAUSES; errors.py imports nothing).
+_TRANSPORT_CAUSES = {"network_unreachable", "repository_not_found", "rate_limited"}
+
 # `details.cause` values the schema allows, per code (when the cause is present).
 _CAUSES = {
     "remote_mismatch": {"no_remote"},
-    "clone_failed": {"timeout"},
+    "clone_failed": {"timeout", *_TRANSPORT_CAUSES},
     "create_failed": {"object_format", "anchor_changed", "tree_too_large", "baseline_incomplete"},
-    "fetch_failed": {"timeout", "prune_incomplete"},
+    "fetch_failed": {"timeout", "prune_incomplete", *_TRANSPORT_CAUSES},
 }
 
 # Required `details` members, per code and per refusal reason (schemas/cli/error.json allOf).

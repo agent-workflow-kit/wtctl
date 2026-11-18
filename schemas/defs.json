@@ -883,9 +883,12 @@
                     "enum": [
                       "timeout",
                       "prune_incomplete",
+                      "network_unreachable",
+                      "repository_not_found",
+                      "rate_limited",
                       null
                     ],
-                    "description": "timeout: network_timeout expired; prune_incomplete: git exited 0 but printed an error: line (a --prune that left a stale ref); null otherwise."
+                    "description": "timeout: network_timeout expired; prune_incomplete: git exited 0 but printed an error: line (a --prune that left a stale ref); network_unreachable: the host did not resolve or the connection failed; repository_not_found: the remote has no such repository; rate_limited: the remote answered HTTP 429; null otherwise."
                   },
                   "message": {
                     "type": "string",
