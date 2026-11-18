@@ -205,6 +205,7 @@ COVERED = {
 NO_STATE_DEPENDENCE = {
     "locate": "resolves a repo id to its clone; reads no record",
     "clone": "clones a repo id; reads no record",
+    "browse": "read-only view of the records of every state; its exit never depends on a state",
     "export": "prints audit.jsonl or log.jsonl; reads no record",
     "cron_install": "writes crontab entries; reads no record",
     "cron_uninstall": "removes crontab entries; reads no record",
