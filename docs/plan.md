@@ -170,5 +170,5 @@ Done (0.x, shipped as v0.1.0 to v0.27.1; one release per merged change (PR), plu
 Open:
 
 - **1.0** (stage 6, human-owned): the macOS and WSL checklists (#26, #27), the `live` run (#25), the real-monorepo timing (#28), and the consumers' integration with a deliberate breaking-change commit (#29, architecture §18.3). agent-spawn and review-respond must have used the interface without changes first.
-- **1.x** (additive): recursive submodule checks (#30, done: removing worktrees with initialized submodules without `--force`), sparse-checkout support (#31, done: `create --sparse`, cone only), a `browse` TUI (#32), more fetch-error classifications (#33).
+- **1.x** (additive): recursive submodule checks (#30, done: removing worktrees with initialized submodules without `--force`), sparse-checkout support (#31, done: `create --sparse`, cone only), a `browse` TUI (#32, done: read-only `curses` view, no new dependency), more fetch-error classifications (#33).
 - **2.0**: reserved for a breaking interface change.

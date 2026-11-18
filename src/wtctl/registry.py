@@ -182,6 +182,7 @@ def _cron_install(p: argparse.ArgumentParser) -> None:
 COMMANDS: tuple[Command, ...] = (
     Command("create", ("create",), "create a worktree or throwaway", "#15", _create, dry_run=True),
     Command("list", ("list",), "list records", "#7", _list),
+    Command("browse", ("browse",), "browse records interactively (read-only)", "#32", _list),
     Command("show", ("show",), "print one record", "#7", _target),
     Command("status", ("status",), "report what remove would do", "#19", _status),
     Command("remove", ("remove",), "remove a worktree or throwaway", "#20", _remove, dry_run=True),

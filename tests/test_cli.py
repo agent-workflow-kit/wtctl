@@ -19,6 +19,7 @@ SHA = "a" * 40
 MINIMAL: dict[str, list[str]] = {
     "create": ["create", "--repo", "example.com/o/r"],
     "list": ["list"],
+    "browse": ["browse"],
     "show": ["show", SID],
     "status": ["status", SID],
     "remove": ["remove", SID],

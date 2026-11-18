@@ -29,7 +29,7 @@ def _timestamp(moment: dt.datetime) -> str:
     return f"{moment.year:04d}" + moment.strftime("-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def _age(created: str, now: dt.datetime) -> str:
+def age(created: str, now: dt.datetime) -> str:
     try:
         then = dt.datetime.strptime(created, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=dt.UTC)
     except ValueError:
@@ -50,7 +50,7 @@ def _row(record: Record, now: dt.datetime) -> tuple[str, ...]:
         record["repo"],
         (ref or "-")[:12] if record["object_type"] == "throwaway" else (ref or "-"),
         record["branch"] or "-",
-        _age(record["created"], now),
+        age(record["created"], now),
     )
 
 
