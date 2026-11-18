@@ -28,6 +28,7 @@
    "run=1"
   ],
   "holders": [],
+  "sparse": null,
   "baseline_digest": null,
   "bootstrap": null,
   "created": "<created>",

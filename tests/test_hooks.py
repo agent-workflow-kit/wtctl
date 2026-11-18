@@ -601,6 +601,7 @@ def record(object_type: str = "worktree") -> dict[str, Any]:
         "remote": "origin" if wt else None,
         "labels": [],
         "holders": [],
+        "sparse": None,
         "baseline_digest": "0" * 64 if wt else None,
         "bootstrap": {"state": "none", "steps": [], "created_paths_count": 0} if wt else None,
         "created": TS,

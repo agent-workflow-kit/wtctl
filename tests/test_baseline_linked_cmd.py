@@ -89,7 +89,7 @@ def edit_inside(wt: Path) -> None:
 def test_edits_in_a_linked_worktree_do_not_flip_the_main_record(w: CW, capsys) -> None:  # noqa: ANN001
     wt = linked(w)
     rec = main_record(w, capsys)
-    assert fmt(w, rec["id"]) == 3
+    assert fmt(w, rec["id"]) == 4
     assert any(i["key"] == KEY for i in w.rows(
         'SELECT "key" FROM baseline_items WHERE record_id = ?', rec["id"]
     ))  # fmt: skip
@@ -189,7 +189,7 @@ def test_accept_upgrades_an_old_record_to_format_3(w: CW, capsys, old: int) -> N
     edit_inside(wt)
     err_of(check(w, capsys, rec["id"]), 20, "repo_config_changed")
     good_accept(accept(w, capsys, rec["id"], "--yes"))
-    assert fmt(w, rec["id"]) == 3
+    assert fmt(w, rec["id"]) == 4
     good_check(check(w, capsys, rec["id"]))
     (wt / "CLAUDE.md").write_text("again\n")
     good_check(check(w, capsys, rec["id"]))

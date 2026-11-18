@@ -26,6 +26,7 @@
   "remote": null,
   "labels": [],
   "holders": [],
+  "sparse": null,
   "baseline_digest": null,
   "bootstrap": null,
   "created": "<created>",
