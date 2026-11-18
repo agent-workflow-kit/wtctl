@@ -628,6 +628,27 @@ def test_an_annotated_tag_of_a_pushed_commit_passes(w: RR, capsys) -> None:  # n
     assert (d["would_remove"], d["reason"]) == (True, None), details(d)
 
 
+def test_a_tag_of_a_tag_of_a_pushed_commit_passes(w: RR, capsys) -> None:  # noqa: ANN001
+    sub = world_with_sub(w, capsys)
+    w.g(["tag", "-a", "-m", "m", "a", "HEAD"], sub)
+    w.g(["tag", "-a", "-m", "m", "b", "a"], sub)
+    d = w.st(capsys)
+    assert (d["would_remove"], d["reason"]) == (True, None), details(d)
+
+
+def test_too_many_nested_tags_refuse_with_refs(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sub = world_with_sub(w, capsys)
+    w.g(["tag", "-a", "-m", "m", "a", "HEAD"], sub)
+    w.g(["tag", "-a", "-m", "m", "b", "a"], sub)
+    w.g(["tag", "-a", "-m", "m", "c", "a"], sub)
+    monkeypatch.setattr(removal_submodules, "MAX_TAG_RESOLVES", 1)
+    assert_refused_dirty(w.st(capsys), SUB, "refs")
+
+
 # -- R3: commits only the reflog still reaches ----------------------------------------------------
 
 
@@ -669,6 +690,31 @@ def test_a_fresh_checkout_of_an_older_pointer_stays_clean(w: RR, capsys) -> None
     w.push()
     d = w.st(capsys)
     assert (d["would_remove"], d["reason"]) == (True, None), details(d)
+
+
+def test_a_pushed_commit_only_the_head_reflog_reaches_refuses_as_unpushed(
+    w: RR,
+    capsys,  # noqa: ANN001
+) -> None:
+    """Documents a fail-closed choice: after `git submodule update` moves the pointer sideways
+    (detach at a pushed branch, then back), the old detached HEAD lives only in the HEAD reflog.
+    It is outside the recorded history, so it refuses even though it was pushed; `--force` is
+    required."""
+    sub = world_with_sub(w, capsys)
+    recorded = head_of(w, sub)
+    w.g(["checkout", "-q", "-b", "tmp"], sub)
+    (sub / "g.txt").write_text("g")
+    w.g(["add", "."], sub)
+    w.g(["commit", "-q", "-m", "feat work"], sub)
+    pushed = head_of(w, sub)
+    w.g(["push", "-q", "origin", "tmp:feat"], sub)
+    w.g(["checkout", "-q", "--detach", "origin/feat"], sub)
+    w.g(["checkout", "-q", "main"], sub)
+    w.g(["branch", "-q", "-D", "tmp"], sub)
+    assert head_of(w, sub) == recorded
+    d = w.st(capsys)
+    assert pushed in unpushed_shas(d), details(d, "unpushed_head")
+    assert (d["would_remove"], d["reason"]) == (False, "unpushed")
 
 
 # -- R4: remote-tracking refs vouch for tags and the recorded commit ------------------------------
@@ -1210,3 +1256,26 @@ def test_submodule_findings_follow_the_finding_of_an_unpushed_head() -> None:
 def test_a_pushed_head_without_submodule_findings_passes() -> None:
     inp = _inputs([], tips=object(), pushed=Pushed(True))
     assert removal_content.unpushed_head(inp, HEAD) == {"status": "pass", "details": []}
+
+
+def test_an_incomplete_submodule_recheck_refuses_even_forced(
+    w: RR,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world_with_sub(w, capsys)
+    marker = w.tmp / "hook-ran"
+    mutate_sub(w, f"touch {marker}")
+    real = removal_submodules.check
+
+    def check(inp: Any, gits: Any) -> Any:
+        out = real(inp, gits)
+        if marker.exists():  # the step-9 re-check, after the hook ran
+            out.dirty.append({"detail": "incomplete", "path": None})
+        return out
+
+    monkeypatch.setattr(removal_submodules, "check", check)
+    err = w.refused("--force", human=True)
+    assert err["reason"] == "dirty"
+    assert {"detail": "incomplete", "path": None} in err["checks"]["nested_repos"]["details"]
+    assert w.intact()

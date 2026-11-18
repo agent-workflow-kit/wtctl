@@ -234,13 +234,16 @@ def test_r5_a_spent_budget_does_not_starve_the_deletion(
 ) -> None:
     w.start(capsys)
     monkeypatch.setattr(removalfs, "RUNNER", None)  # the real child
-    real = remover.Remover._pre_hooks
+    real = remover.Remover._recheck
 
-    def spend(self: remover.Remover) -> None:
-        real(self)
+    def spend(self: remover.Remover) -> Any:
+        # the step-9 re-check needs the budget (an incomplete re-check refuses), so the budget
+        # is spent right after it: the deletion must not be starved by it
+        out = real(self)
         self.budget.charge(10_000)
+        return out
 
-    monkeypatch.setattr(remover.Remover, "_pre_hooks", spend)
+    monkeypatch.setattr(remover.Remover, "_recheck", spend)
     d = w.removed()
     assert d["record"]["state"] == "removed" and not w.wt.exists() and not w.admin.exists()
 

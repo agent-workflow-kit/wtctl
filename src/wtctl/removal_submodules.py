@@ -42,6 +42,7 @@ from .removal_content import Inputs
 MAX_DEPTH = 8
 MAX_SUBMODULES = 128
 MAX_REFS = 1000
+MAX_TAG_RESOLVES = 100  # tags of tags resolved one by one; more are refused (``refs``)
 MAX_REFLOG = 100_000  # reflog entries read for the pushed check; more is refused
 POINTER_MAX = 4000  # the walk keeps 4096 bytes of a .git file: more is not a pointer
 
@@ -439,15 +440,29 @@ class _Walk:
         lines = [x for x in listing.split("\n") if x]
         if len(lines) > MAX_REFS:
             reasons.append("refs")
+        resolves = 0
         for line in lines[:MAX_REFS]:
             ref, _, types = line.partition(" ")
             kind, _, peeled = types.partition(" ")
             if ref.startswith(("refs/remotes/", "refs/tags/", "refs/heads/")):
-                if (peeled or kind) != "commit":
+                if peeled == "tag":  # a tag of a tag: %(*objecttype) peels one level only
+                    resolves += 1
+                    if resolves > MAX_TAG_RESOLVES or not self.names_commit(sub, ref):
+                        reasons.append("refs")
+                elif (peeled or kind) != "commit":
                     reasons.append("refs")
             else:
                 reasons.append("stash" if ref == "refs/stash" else "refs")
         return reasons
+
+    def names_commit(self, sub: Inputs, ref: str) -> bool:
+        """True when ``ref`` peels, through any number of tags, to a commit."""
+        r = sub.git.run(
+            ["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+            git_dir=sub.gitdir,
+            work_tree=sub.path,
+        )
+        return not r.timed_out and r.returncode == 0
 
     def reflog_commits(self, sub: Inputs) -> list[str] | None:
         """The distinct commits the reflogs of ``HEAD`` and of the local branches reach (those of

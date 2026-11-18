@@ -69,8 +69,11 @@ def _escape(text: str) -> str:
 
 def _submodule_details(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The findings about submodules: what the step-9 re-check compares (the other
-    ``nested_repos`` findings are not re-checked)."""
-    return [d for d in details if d.get("detail") in ("submodule", "submodule_unpushed")]
+    ``nested_repos`` findings are not re-checked). An ``incomplete`` detail is one: a submodule
+    check that could not finish must not pass the re-check."""
+    return [
+        d for d in details if d.get("detail") in ("submodule", "submodule_unpushed", "incomplete")
+    ]
 
 
 def _details_key(details: list[dict[str, Any]]) -> set[str]:
