@@ -324,8 +324,39 @@ def test_job_close_kills_the_real_child() -> None:
     job = _start_sleeper_job()
     pid = job._pid
     assert pid is not None
-    job.close()
+    # join_timeout=0: the worker has no time to react to the cancel, so only close's own kill
+    # can end the child
+    job.close(join_timeout=0)
     assert _gone(pid)
+
+
+def test_job_close_still_kills_when_the_join_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _start_sleeper_job()
+    pid = job._pid
+    assert pid is not None
+
+    def interrupted(timeout: float | None = None) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(job._thread, "join", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        job.close()
+    assert _gone(pid)
+
+
+def test_job_close_skips_the_kill_for_an_already_reaped_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[int] = []
+    monkeypatch.setattr(browse_status.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(browse_status.threading.Thread, "is_alive", lambda self: True)
+    job = browse_status._Job([sys.executable, "-c", "pass"], 30)
+    job._thread.join(5)
+    job._pid = 2**22 + 12345  # not a child of this process: waitid raises ChildProcessError
+    job.close(join_timeout=0)
+    assert killed == []
 
 
 def test_job_close_kills_the_recorded_pid_when_the_worker_does_not_finish(
@@ -436,6 +467,43 @@ def test_run_maps_an_init_error_to_a_usage_error(
     b = Browser(lambda: ([], []), lambda t: None, now=st.gateway.clock.now)  # type: ignore[arg-type,return-value]
     with pytest.raises(UsageError, match="TERM"):
         browse_ui.run(b)
+
+
+def test_run_keeps_an_ignored_hangup_ignored(st: State, monkeypatch: pytest.MonkeyPatch) -> None:
+    import curses
+    import signal
+
+    seen: dict[str, Any] = {}
+
+    def fake_wrapper(*a: Any, **k: Any) -> None:
+        seen["hup"] = signal.getsignal(signal.SIGHUP)
+        seen["term"] = signal.getsignal(signal.SIGTERM)
+
+    monkeypatch.setattr(curses, "wrapper", fake_wrapper)
+    old = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        b = Browser(lambda: ([], []), lambda t: None, now=st.gateway.clock.now)  # type: ignore[arg-type,return-value]
+        browse_ui.run(b)
+        assert seen["hup"] == signal.SIG_IGN
+        assert seen["term"] is not signal.SIG_IGN
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, old)
+
+
+def test_run_closes_the_browser_before_restoring_the_handlers(
+    st: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import curses
+    import signal
+
+    monkeypatch.setattr(curses, "wrapper", lambda *a, **k: None)
+    b = Browser(lambda: ([], []), lambda t: None, now=st.gateway.clock.now)  # type: ignore[arg-type,return-value]
+    during: list[Any] = []
+    monkeypatch.setattr(b, "close", lambda: during.append(signal.getsignal(signal.SIGTERM)))
+    before = signal.getsignal(signal.SIGTERM)
+    browse_ui.run(b)
+    assert during and during[0] is not before  # close ran while our handler was still installed
 
 
 def test_run_restores_signal_handlers_and_exits_on_sigterm(

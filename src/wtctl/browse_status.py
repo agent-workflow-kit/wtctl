@@ -93,13 +93,23 @@ class _Job:
         interpreter could exit before it polls the cancel event. SIGKILL goes to the exact
         recorded child pid only, and only if the worker has not finished."""
         self._cancel.set()
-        self._thread.join(join_timeout)
-        pid = self._pid
-        if self._thread.is_alive() and pid is not None:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        try:
+            self._thread.join(join_timeout)
+        finally:  # a second interrupt during the join must still reach the kill
+            pid = self._pid
+            if self._thread.is_alive() and pid is not None:
+                self._kill_if_unreaped(pid)
+
+    @staticmethod
+    def _kill_if_unreaped(pid: int) -> None:
+        try:  # still our unreaped child? (a reaped pid may have been reused by another process)
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 class SubprocessStatus:

@@ -442,6 +442,7 @@ def _grandchild_run(
 
     pidfile = tmp_path / "gpid"
     cancel = threading.Event()
+    cancelled_at: list[float] = []
 
     def on_start(pid: int) -> None:
         if not cancel_after_start:
@@ -451,6 +452,7 @@ def _grandchild_run(
             end = time.monotonic() + 30
             while not pidfile.exists() and time.monotonic() < end:
                 time.sleep(0.02)
+            cancelled_at.append(time.monotonic())
             cancel.set()
 
         threading.Thread(target=wait_then_cancel, daemon=True).start()
@@ -463,7 +465,9 @@ def _grandchild_run(
             on_start=on_start,
             cancel=cancel,
         )
-        took = time.monotonic() - t0
+        end = time.monotonic()
+        # cancel runs: measure from the moment the cancel was set, not from before Popen
+        took = end - (cancelled_at[0] if cancelled_at else t0)
     finally:
         if pidfile.exists():  # the grandchild this test started: do not leave it sleeping
             try:
@@ -481,7 +485,7 @@ def test_cancel_reaps_within_the_short_bound_despite_a_grandchild(
     monkeypatch.setattr(gateway, "_CANCEL_REAP_TIMEOUT", 0.3)
     r, took = _grandchild_run(tmp_path, cancel_after_start=True, timeout=60)
     assert r.cancelled and r.stdout == b"" and r.returncode is None
-    assert took < 4  # the long bound would be 6 s
+    assert took < 0.3 + 3  # cancel-to-return: short bound plus margin; the long bound is 6 s
     with pytest.raises(ProcessLookupError):
         os.kill(r.pid, 0)  # the exact child is killed and reaped
 

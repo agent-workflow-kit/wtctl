@@ -111,6 +111,8 @@ def run(browser: Browser) -> None:
     previous: dict[int, Any] = {}
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGHUP, signal.SIGTERM):
+            if signal.getsignal(sig) == signal.SIG_IGN:  # nohup: stay ignored
+                continue
             previous[sig] = signal.signal(sig, _raise_exit)
     try:
         curses.wrapper(_guarded, browser, started)
@@ -125,9 +127,12 @@ def run(browser: Browser) -> None:
             f"(TERM={term!r}): {exc}"
         ) from None
     finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-        browser.close()
+        try:
+            browser.close()  # while our handlers still turn a second SIGTERM into a clean unwind
+        finally:
+            for sig, handler in previous.items():
+                if handler is not None:  # None: a non-Python handler we cannot reinstall
+                    signal.signal(sig, handler)
 
 
 def _key_name(curses: Any, key: Any) -> str | None:
