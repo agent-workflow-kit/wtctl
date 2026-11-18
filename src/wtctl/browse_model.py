@@ -480,7 +480,9 @@ class Browser:
             self._top = self._cursor - rows_h + 1
         self._top = max(min(self._top, len(self._view) - 1), 0)
         for n in range(self._top, min(self._top + rows_h, len(self._view))):
-            lines.append(Line(row(self._view[n].cells), "selected" if n == self._cursor else "normal"))
+            lines.append(
+                Line(row(self._view[n].cells), "selected" if n == self._cursor else "normal")
+            )
         return title, lines, 0
 
     def _detail_title(self, item: _Item) -> str:
@@ -501,18 +503,17 @@ class Browser:
             for k in ("path", "branch", "head", "clone_path"):
                 add(f"{k}: {sanitize(rec.get(k) if rec.get(k) is not None else '-', MAX_FIELD)}")
             return lines[:MAX_DETAIL_LINES]
+        rid = shlex.quote(str(rec.get("id")))
+        add(sanitize(f"to remove: wtctl remove {rid}", MAX_FIELD), "dim")
+        add("  (run it yourself; browse never removes anything)", "dim")
+        lines += self._status_lines(str(rec.get("id")), cols)
+        lines.append(Line(""))
         try:
             text = show_cmd.render_human(rec)
         except (KeyError, TypeError, IndexError):  # a record not in the schema's shape
             text = "\n".join(f"{k}: {v}" for k, v in rec.items() if v is not None)
         for raw in text.split("\n"):
             add(sanitize(raw, MAX_FIELD))
-        rid = shlex.quote(str(rec.get("id")))
-        lines.append(Line(""))
-        add(sanitize(f"to remove: wtctl remove {rid}", MAX_FIELD), "dim")
-        add("  (run it yourself; browse never removes anything)", "dim")
-        lines.append(Line(""))
-        lines += self._status_lines(str(rec.get("id")), cols)
         return lines[:MAX_DETAIL_LINES]
 
     def _status_lines(self, rid: str, cols: int) -> list[Line]:
@@ -535,4 +536,3 @@ class Browser:
             for text in view.outcome.lines[:MAX_STATUS_LINES]:
                 add(text, "normal" if ok else "error")
         return out
-

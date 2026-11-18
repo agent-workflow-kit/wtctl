@@ -51,6 +51,7 @@ wtctl create --throwaway --repo <id> --ref SHA [--source auto|local|remote] [--d
 wtctl list [--repo <id>] [--label k=v]... [--throwaways | --worktrees] [--older-than D] [--state S]... [--all]
 wtctl show <id|path>
 wtctl status <id|path> [--merged-head SHA] [--holder H]
+wtctl browse [--repo <id>] [--label k=v]... [--throwaways | --worktrees] [--older-than D] [--state S]... [--all]
 wtctl remove <id|path> [--merged-head SHA] [--keep-branch] [--holder H] [--force] [--yes]
              [--hook NAME=CMD]... [--override-escalation]
 wtctl bootstrap <id|path> [--copy-env]

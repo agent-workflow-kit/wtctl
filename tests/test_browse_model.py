@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from tests.listhelpers import seed
-from tests.statehelpers import FakeClock, make_state
+from tests.statehelpers import make_state
 from wtctl import browse_model as bm
 from wtctl.record_view import record_object
 
@@ -56,9 +56,7 @@ def browser(
     foreign: list[dict[str, Any]] | None = None,
     starter: FakeStarter | None = None,
 ) -> bm.Browser:
-    return bm.Browser(
-        lambda: (recs, foreign or []), starter or FakeStarter(), now=lambda: NOW
-    )
+    return bm.Browser(lambda: (recs, foreign or []), starter or FakeStarter(), now=lambda: NOW)
 
 
 def text(lines: list[bm.Line]) -> str:
@@ -292,7 +290,9 @@ def test_status_cancel_and_close(records: list[dict[str, Any]]) -> None:
 
 def test_status_is_not_offered_for_foreign_entries() -> None:
     starter = FakeStarter()
-    foreign = [{"foreign": True, "path": "/w/other", "branch": "x", "head": None, "clone_path": "/c"}]
+    foreign = [
+        {"foreign": True, "path": "/w/other", "branch": "x", "head": None, "clone_path": "/c"}
+    ]
     b = browser([], foreign=foreign, starter=starter)
     keys(b, "enter", "s")
     assert starter.targets == []
