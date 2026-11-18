@@ -936,7 +936,10 @@ class Creator:
         """Whether the directory ``child_fd`` is on another device or mount than its parent."""
         if os.fstat(parent_fd).st_dev != os.fstat(child_fd).st_dev:
             return True
-        a, b = gateway.fd_mount_id(parent_fd), gateway.fd_mount_id(child_fd)
+        try:
+            a, b = gateway.fd_mount_id(parent_fd), gateway.fd_mount_id(child_fd)
+        except gateway.MountTableUnavailable:
+            return False  # the device compare above is all there is
         return a is not None and b is not None and a != b
 
     def _transfer(self, lease: Lease, start: str) -> None:

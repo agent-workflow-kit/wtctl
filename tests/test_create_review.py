@@ -578,3 +578,107 @@ def test_a_worktree_dir_that_became_a_mount_point_after_the_add_never_gets_a_dir
     assert "mount point" in err["message"]
     [rec] = w.records()
     assert rec["state"] == "creating" and rec["dir_id"] is None
+
+
+def _dir_fds(tmp_path: Path) -> tuple[int, int]:
+    (tmp_path / "child").mkdir()
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    parent = os.open(tmp_path, flags)
+    return parent, os.open(tmp_path / "child", flags)
+
+
+def test_on_another_mount_is_false_for_a_directory_on_the_same_mount(tmp_path: Path) -> None:
+    from wtctl.commands.create import Creator
+
+    parent, child = _dir_fds(tmp_path)
+    try:
+        assert Creator._on_another_mount(parent, child) is False
+    finally:
+        os.close(parent)
+        os.close(child)
+
+
+def test_on_another_mount_is_true_when_the_mount_ids_differ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import gateway
+    from wtctl.commands.create import Creator
+
+    parent, child = _dir_fds(tmp_path)
+    monkeypatch.setattr(gateway, "fd_mount_id", lambda fd: 1 if fd == parent else 2)
+    try:
+        assert Creator._on_another_mount(parent, child) is True
+    finally:
+        os.close(parent)
+        os.close(child)
+
+
+def test_on_another_mount_is_true_when_the_devices_differ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from wtctl.commands.create import Creator
+
+    parent, child = _dir_fds(tmp_path)
+    real = os.fstat
+    monkeypatch.setattr(
+        os, "fstat", lambda fd: SimpleNamespace(st_dev=7) if fd == child else real(fd)
+    )
+    try:
+        assert Creator._on_another_mount(parent, child) is True
+    finally:
+        os.close(parent)
+        os.close(child)
+
+
+def test_on_another_mount_falls_back_to_the_device_compare_without_a_mount_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import gateway
+    from wtctl.commands.create import Creator
+
+    def unavailable(fd: int) -> int:
+        raise gateway.MountTableUnavailable("no mnt_id")
+
+    monkeypatch.setattr(gateway, "fd_mount_id", unavailable)
+    parent, child = _dir_fds(tmp_path)
+    try:
+        assert Creator._on_another_mount(parent, child) is False
+    finally:
+        os.close(parent)
+        os.close(child)
+
+
+def _no_mount_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wtctl import fsafe, gateway
+
+    def unavailable() -> None:
+        raise gateway.MountTableUnavailable("no table")
+
+    monkeypatch.setattr(fsafe.DEFAULT_FS, "mount_table", unavailable)
+
+
+def test_is_mount_point_falls_back_to_the_device_compare_when_it_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from wtctl.commands.create import Creator
+
+    _no_mount_table(monkeypatch)
+    child = tmp_path / "child"
+    child.mkdir()
+    other_dev = SimpleNamespace(st_dev=os.lstat(tmp_path).st_dev + 1)
+    assert Creator._is_mount_point(str(child), other_dev) is True  # type: ignore[arg-type]
+
+
+def test_is_mount_point_falls_back_to_the_device_compare_when_it_is_the_same(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl.commands.create import Creator
+
+    _no_mount_table(monkeypatch)
+    child = tmp_path / "child"
+    child.mkdir()
+    assert Creator._is_mount_point(str(child), os.lstat(child)) is False
