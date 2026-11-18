@@ -13,9 +13,10 @@ them is trusted:
 * Every git command goes through the hardened ``Git`` (clean environment, the full override set,
   protocols ``none``, explicit ``--git-dir`` and ``--work-tree``): no hook, filter, fsmonitor or
   network access happens in a submodule.
-* "Pushed" is local and conservative: the submodule's ``HEAD``, and every local branch tip, must
-  equal the commit the superproject's ``HEAD`` records for it, and that commit must be reachable
-  from a remote-tracking ref of the submodule. The superproject's own pushed check (the mirror)
+* "Pushed" is local and conservative: the submodule's ``HEAD`` and every local branch must lie
+  within the history of the commit the superproject's ``HEAD`` records for it, and that commit
+  must be reachable from a remote-tracking ref of the submodule. The superproject's own pushed
+  check (the mirror)
   vouches for the recorded commit; remote-tracking refs are forgeable, so they never vouch for
   anything the superproject does not record.
 * The recursion is bounded in depth, count and time.
@@ -187,7 +188,11 @@ class _Walk:
         self.out.gitdirs.add(target)
         sub = dataclasses.replace(
             ctx.inp,
-            record={**ctx.inp.record, "path": os.path.join(self.inp.path, *parts), "admin_dir": target},
+            record={
+                **ctx.inp.record,
+                "path": os.path.join(self.inp.path, *parts),
+                "admin_dir": target,
+            },
         )
         reasons = list(problems)
         if "gitdir" in reasons:
@@ -223,7 +228,9 @@ class _Walk:
                 return target
         raise _Refuse("gitdir")
 
-    def inspect_gitdir(self, chain: list[str], target: str) -> tuple[fsafe.Identity, list[str], str]:
+    def inspect_gitdir(
+        self, chain: list[str], target: str
+    ) -> tuple[fsafe.Identity, list[str], str]:
         """Open the git directory no-follow from the recorded common directory and look at what
         git would read from it. Returns its identity, the reasons it is refused or dirty, and the
         path of its ``modules`` directory."""
@@ -339,41 +346,53 @@ class _Walk:
         if not removal_content.SHA.fullmatch(head):
             raise _Refuse("unreadable")
         bad: list[str] = []
-        if recorded is not None and head != recorded:
-            bad.append(head)
         listing = sub.run(
-            ["for-each-ref", f"--count={MAX_REFS + 1}", "--format=%(objectname) %(refname)"],
+            ["for-each-ref", f"--count={MAX_REFS + 1}", "--format=%(refname)"],
             what="for-each-ref",
         ).decode("utf-8", "surrogateescape")
         lines = [x for x in listing.split("\n") if x]
         if len(lines) > MAX_REFS:
             reasons.append("refs")
-        for line in lines[:MAX_REFS]:
-            sha, _, ref = line.partition(" ")
-            if ref.startswith(("refs/remotes/", "refs/tags/")):
+        for ref in lines[:MAX_REFS]:
+            if ref.startswith(("refs/remotes/", "refs/tags/", "refs/heads/")):
                 continue
-            if ref.startswith("refs/heads/"):
-                if recorded is not None and sha != recorded and removal_content.SHA.fullmatch(sha):
-                    bad.append(sha)
-            elif ref == "refs/stash":
-                reasons.append("stash")
+            reasons.append("stash" if ref == "refs/stash" else "refs")
+        if recorded is not None:
+            have = sub.git.run(
+                ["rev-parse", "--verify", "-q", f"{recorded}^{{commit}}"],
+                git_dir=sub.gitdir,
+                work_tree=sub.path,
+            )
+            if have.timed_out or have.returncode != 0:
+                bad.append(head)  # the recorded commit is not here: nothing vouches for HEAD
             else:
-                reasons.append("refs")
-        r = sub.git.run(
-            ["rev-list", "--max-count=1", head, "--tags", "--not", "--remotes"],
-            git_dir=sub.gitdir,
-            work_tree=sub.path,
-        )
-        out = r.stdout.decode().strip()
-        if r.timed_out or r.returncode != 0 or (out and not removal_content.SHA.fullmatch(out)):
-            reasons.append("refs")
-        elif out:
-            bad.append(out)
+                # (a) HEAD and every local branch lie within the recorded commit's history;
+                # (b) so does every tag, or it is reachable from a remote-tracking ref;
+                # (c) the recorded commit itself is reachable from a remote-tracking ref.
+                for argv in (
+                    ["rev-list", "--max-count=1", head, "--branches", "--not", recorded],
+                    ["rev-list", "--max-count=1", "--tags", "--not", "--remotes", recorded],
+                    ["rev-list", "--max-count=1", recorded, "--not", "--remotes"],
+                ):
+                    r = sub.git.run(argv, git_dir=sub.gitdir, work_tree=sub.path)
+                    out = r.stdout.decode().strip()
+                    if (
+                        r.timed_out
+                        or r.returncode != 0
+                        or (out and not removal_content.SHA.fullmatch(out))
+                    ):
+                        reasons.append("refs")
+                    elif out:
+                        bad.append(out)
         if recorded is None:
             bad = []  # reported as gitlink_changed: not a statement about pushed commits
         for sha in dict.fromkeys(bad):
             self.out.unpushed.append(
-                {"sha": sha, "detail": "submodule_unpushed", "submodule": removal_content._text(rel)}
+                {
+                    "sha": sha,
+                    "detail": "submodule_unpushed",
+                    "submodule": removal_content._text(rel),
+                }
             )
         return reasons
 

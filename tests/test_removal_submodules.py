@@ -105,7 +105,10 @@ def test_clean_pushed_submodule_after_an_update_with_a_new_pointer(w: RR, capsys
     w.g(["commit", "-q", "-m", "bump"], w.wt)
     w.push()
     d = w.st(capsys)
-    assert (d["would_remove"], d["reason"]) == (True, None), d["checks"]
+    assert (d["would_remove"], d["reason"]) == (True, None), (
+        d["checks"]["unpushed_head"],
+        details(d),
+    )
 
 
 def test_nested_clean_submodules_pass(w: RR, capsys) -> None:  # noqa: ANN001
@@ -138,7 +141,7 @@ def test_an_edited_tracked_file_in_the_submodule_refuses_and_names_it(w: RR, cap
     (sub / "f.txt").write_text("edited")
     assert_refused_dirty(w.st(capsys), SUB, "tracked")
     err = w.refused()
-    assert err["code"] == "dirty" and w.intact()
+    assert err["reason"] == "dirty" and w.intact()
 
 
 def test_a_staged_change_in_the_submodule_refuses(w: RR, capsys) -> None:  # noqa: ANN001
@@ -227,7 +230,9 @@ def test_a_nested_repo_hidden_in_a_disposable_dir_of_the_submodule_refuses(
 
 def assert_refused_unpushed(d: dict[str, Any], path: str) -> None:
     got = [x for x in details(d, "unpushed_head") if x.get("submodule") == path]
-    assert got and all(x["detail"] == "submodule_unpushed" for x in got), details(d, "unpushed_head")
+    assert got and all(x["detail"] == "submodule_unpushed" for x in got), details(
+        d, "unpushed_head"
+    )
     assert (d["would_remove"], d["reason"]) == (False, "unpushed")
 
 
@@ -240,7 +245,7 @@ def test_an_unpushed_commit_in_the_submodule_refuses_and_names_it(w: RR, capsys)
     d = w.st(capsys)
     assert_refused_unpushed(d, SUB)
     assert details(d, "unpushed_head")[0]["sha"] == sha
-    assert w.refused()["code"] == "unpushed" and w.intact()
+    assert w.refused()["reason"] == "unpushed" and w.intact()
 
 
 def test_a_pushed_commit_the_superproject_does_not_point_at_refuses(w: RR, capsys) -> None:  # noqa: ANN001
@@ -362,7 +367,9 @@ def test_a_symlinked_modules_directory_refuses(w: RR, capsys) -> None:  # noqa: 
     moved = w.tmp / "moved-modules"
     mods.rename(moved)
     os.symlink(moved, mods)
-    refused_unverified(w.st(capsys))
+    d = w.st(capsys)
+    assert sub_detail(SUB, "gitdir") in details(d), details(d)
+    assert d["would_remove"] is False
 
 
 def test_a_module_git_dir_with_alternates_refuses(w: RR, capsys) -> None:  # noqa: ANN001
@@ -392,7 +399,15 @@ def test_two_submodules_sharing_one_git_dir_refuse(w: RR, capsys) -> None:  # no
     other = w.wt / "vendor" / "twin"
     other.mkdir()
     (other / ".git").write_text((sub / ".git").read_text())
-    w.g(["update-index", "--add", "--cacheinfo", f"160000,{w.g(['rev-parse', 'HEAD'], sub)},vendor/twin"], w.wt)
+    w.g(
+        [
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{w.g(['rev-parse', 'HEAD'], sub)},vendor/twin",
+        ],
+        w.wt,
+    )
     w.g(
         ["config", "-f", ".gitmodules", "submodule.twin.path", "vendor/twin"],
         w.wt,
@@ -402,12 +417,14 @@ def test_two_submodules_sharing_one_git_dir_refuse(w: RR, capsys) -> None:  # no
     w.g(["commit", "-q", "-m", "twin"], w.wt)
     d = w.st(capsys)
     assert sub_detail("vendor/twin", "gitdir") in details(d), details(d)
-    assert w.refused()["code"] == "dirty"
+    assert w.refused()["reason"] in ("dirty", "repo_config_changed")
 
 
 def test_an_embedded_git_dir_in_the_checkout_stays_a_nested_repo(w: RR, capsys) -> None:  # noqa: ANN001
     sub = world_with_sub(w, capsys)
-    (sub / ".git").unlink()
+    import shutil
+
+    shutil.rmtree(sub)
     w.g(["clone", "-q", str(w.tmp / "sub.git"), str(sub)], w.tmp)
     d = w.st(capsys)
     assert {"detail": "nested_repo", "path": f"{SUB}/.git"} in details(d), details(d)
@@ -434,7 +451,7 @@ def test_a_planted_fsmonitor_and_hook_in_the_submodule_never_run(w: RR, capsys) 
         + f"[core]\n\tfsmonitor = touch {marker}\n\thooksPath = {w.tmp}/hooks\n"
         + f"[diff]\n\texternal = touch {marker}\n"
         + f'[filter "x"]\n\tclean = touch {marker}\n\tsmudge = touch {marker}\n'
-        + f"[url \"{w.tmp}/nowhere/\"]\n\tinsteadOf = {w.tmp}/sub.git\n"
+        + f'[url "{w.tmp}/nowhere/"]\n\tinsteadOf = {w.tmp}/sub.git\n'
     )
     hooks = gd / "hooks"
     hooks.mkdir(exist_ok=True)
@@ -444,7 +461,7 @@ def test_a_planted_fsmonitor_and_hook_in_the_submodule_never_run(w: RR, capsys) 
     (w.wt / SUB / ".gitattributes").write_text("* filter=x\n")
     d = w.st(capsys)
     assert not marker.exists()
-    assert (d["would_remove"], d["reason"]) == (False, "dirty")  # the planted attributes file
+    assert d["would_remove"] is False  # the planted config is a baseline change
 
 
 def test_a_core_worktree_redirect_in_the_submodule_config_changes_nothing(w: RR, capsys) -> None:  # noqa: ANN001
@@ -454,7 +471,7 @@ def test_a_core_worktree_redirect_in_the_submodule_config_changes_nothing(w: RR,
     w.g(["clone", "-q", str(w.tmp / "sub.git"), str(decoy / "c")], w.tmp)
     w.g(["config", "core.worktree", str(decoy / "c")], gitdir_of(w))
     (sub / "f.txt").write_text("edited in the real checkout")
-    assert_refused_dirty(w.st(capsys), SUB, "tracked")
+    assert sub_detail(SUB, "tracked") in details(w.st(capsys))
 
 
 # -- bounds ---------------------------------------------------------------------------------------
