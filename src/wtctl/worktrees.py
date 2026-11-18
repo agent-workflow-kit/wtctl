@@ -431,14 +431,12 @@ def sparse_checkout(git: Git, admin_dir: str, path: str, dirs: list[str]) -> Non
         last = r.err.strip().splitlines()[-1:] or ["failed"]
         why = "timed out" if r.timed_out else scrub_urls(last[0])
         raise create_failed(f"sparse checkout failed: {why}")
-    _verify_cone(git, admin_dir, path, dirs)
 
 
-def _verify_cone(git: Git, admin_dir: str, path: str, dirs: list[str]) -> None:
-    """The paths git left out (``S`` in ``ls-files -v``) must be exactly the tracked paths wtctl's
-    own cone excludes. They differ when git matches names more loosely than wtctl (a clone with
-    ``core.ignorecase`` or ``core.precomposeunicode``): later checks trust the cone, so a
-    checkout that disagrees with it is refused here rather than hide a deleted file."""
+def cone_agrees(git: Git, admin_dir: str, path: str, dirs: list[str]) -> bool | None:
+    """Whether the paths git left out (``S`` in ``ls-files -v``) are exactly the tracked paths
+    wtctl's own cone excludes; None when that cannot be computed (callers treat it as a
+    disagreement)."""
     r = git.run(
         ["ls-files", "-v", "-z"],
         git_dir=admin_dir,
@@ -447,15 +445,26 @@ def _verify_cone(git: Git, admin_dir: str, path: str, dirs: list[str]) -> None:
         timeout=ADD_TIMEOUT,
     )
     if r.returncode != 0 or r.timed_out:
-        raise create_failed("sparse checkout failed: cannot list the index")
+        return None
     try:
         tagged = parse_ls_files_tagged(r.stdout)
-    except PorcelainError as exc:
-        raise create_failed(f"sparse checkout failed: {exc}") from exc
+    except PorcelainError:
+        return None
     cone = sparse.Cone(dirs)
     left_out = {p for tag, p in tagged if tag == "S"}
     want = {p for _tag, p in tagged if not cone.includes(p)}
-    if left_out != want:
+    return left_out == want
+
+
+def verify_cone(git: Git, admin_dir: str, path: str, dirs: list[str]) -> None:
+    """The paths git left out (``S`` in ``ls-files -v``) must be exactly the tracked paths wtctl's
+    own cone excludes. They differ when git matches names more loosely than wtctl (a clone with
+    ``core.ignorecase`` or ``core.precomposeunicode``): later checks trust the cone, so a
+    checkout that disagrees with it is refused here rather than hide a deleted file."""
+    agrees = cone_agrees(git, admin_dir, path, dirs)
+    if agrees is None:
+        raise create_failed("sparse checkout failed: cannot list the index")
+    if not agrees:
         raise create_failed(
             "sparse checkout does not match the requested directories "
             "(case or unicode folding in the clone's git configuration?)"

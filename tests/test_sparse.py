@@ -467,6 +467,43 @@ def test_case_folding_checkout_that_disagrees_with_the_cone_fails_create(w: SW, 
     assert [x["state"] for x in w.records()] == ["creating"]
 
 
+def test_a_failed_cone_check_does_not_survive_reconcile_as_a_trusted_cone(w: SW, capsys) -> None:  # noqa: ANN001
+    """The failed create leaves `creating`; reconcile adopts it, and a file deleted in the
+    case-folded directory must not read as clean: the cone is dropped, so the skip-worktree
+    tag hides a change instead of being trusted."""
+    from tests.removallib import FakeScanner
+
+    w.scanner = FakeScanner()
+    w.g(["config", "core.ignorecase", "true"])
+    r = w.create(capsys, "--branch", "x", "--sparse", "A/B", "--no-bootstrap")
+    assert r.code == 12, (r.out, r.err)
+    rid = w.records()[0]["id"]
+    assert w.rows("SELECT dir FROM sparse_dirs WHERE record_id = ?", rid) == []
+    rc = w.cli(capsys, "reconcile")
+    assert rc.code == 0, (rc.out, rc.err)
+    rec = w.records()[0]
+    assert rec["state"] == "active"
+    (Path(rec["path"]) / "a/b/deep.txt").unlink()
+    d = w.st(capsys, target=rid)
+    assert d["would_remove"] is False, d
+
+
+def test_reconcile_drops_a_recorded_cone_the_checkout_disagrees_with(w: SW, capsys) -> None:  # noqa: ANN001
+    """A create killed after recording the cone but before verifying it: reconcile re-runs the
+    comparison and adopts the record without the cone."""
+    from tests.removallib import FakeScanner
+
+    w.scanner = FakeScanner()
+    w.g(["config", "core.ignorecase", "true"])
+    assert w.create(capsys, "--branch", "x", "--sparse", "A/B", "--no-bootstrap").code == 12
+    rid = w.records()[0]["id"]
+    w.db_exec("INSERT INTO sparse_dirs(record_id, dir) VALUES (?, ?)", rid, "A/B")
+    assert w.cli(capsys, "reconcile").code == 0
+    assert w.rows("SELECT dir FROM sparse_dirs WHERE record_id = ?", rid) == []
+    (Path(w.records()[0]["path"]) / "a/b/deep.txt").unlink()
+    assert w.st(capsys, target=rid)["would_remove"] is False
+
+
 def test_case_folding_agreeing_checkout_is_accepted(w: SW, capsys) -> None:  # noqa: ANN001
     w.g(["config", "core.ignorecase", "true"])
     w.sparse_start(capsys, "a/b")

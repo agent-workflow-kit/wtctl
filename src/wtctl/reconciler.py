@@ -317,6 +317,7 @@ class Reconciler:
         )
         if baseline.has_detail():
             return self.uncomputable(rec, admin, links.dir_id, info, baseline)
+        cone_ok = self.cone_trusted(rec, admin)
         if self.dry:
             self.changes.append(
                 {"id": rec["id"], "from": "creating", "to": "active", "action": "adopt_after_crash"}
@@ -338,10 +339,21 @@ class Reconciler:
             bootstrap_state="interrupted",
         )  # fmt: skip
         if done:
+            if not cone_ok:
+                self.state.set_sparse(rec["id"], [])
             self.report("adopted_after_crash", id=rec["id"], path=rec["path"])
         else:  # lost a race: reset what this call wrote, and only that (never an adopter's)
             self.state.unclaim_creating(rec["id"], admin_dir=admin, dir_id=links.dir_id)
         return done
+
+    def cone_trusted(self, rec: Record, admin: str) -> bool:
+        """A recorded cone is kept only when the checkout agrees with it (the create that died
+        may not have verified it); otherwise it is dropped on adoption so the skip-worktree
+        paths report hidden changes."""
+        dirs = self.state.sparse_dirs(rec["id"])
+        if not dirs:
+            return True
+        return worktrees.cone_agrees(self.git, admin, rec["path"], dirs) is True
 
     def uncomputable(
         self,

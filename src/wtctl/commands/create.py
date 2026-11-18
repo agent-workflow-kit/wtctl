@@ -847,6 +847,13 @@ class Creator:
                 # the cone for the content checks of the `creating` record's cleanup
                 self.state.set_sparse(record["id"], self.o.sparse)
                 worktrees.sparse_checkout(git, info.admin_dir, self.path, self.o.sparse)
+                try:
+                    worktrees.verify_cone(git, info.admin_dir, self.path, self.o.sparse)
+                except BaseException:
+                    # the checkout disagrees with the cone: a cone that is not trusted must not
+                    # be left for reconcile to adopt (the S tags then report hidden changes)
+                    self.state.set_sparse(record["id"], [])
+                    raise
         except BaseException as exc:
             if added:
                 # The worktree exists: branch, directory and the `creating` record stay for
