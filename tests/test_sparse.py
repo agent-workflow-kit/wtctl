@@ -57,6 +57,38 @@ def test_hostile_directories_are_refused(bad: str) -> None:
         sparse.normalize([bad])
 
 
+@pytest.mark.parametrize("bad", ["a\x7fb", "a\x1fb", "a\x00b", "\x1f"])
+def test_control_characters_are_refused_exactly(bad: str) -> None:
+    with pytest.raises(UsageError):
+        sparse.normalize([bad])
+
+
+def test_a_space_is_a_plain_character_inside_a_component() -> None:
+    assert sparse.normalize(["a b"]) == ["a b"]  # 0x20 is the first accepted code point
+
+
+def test_length_limits_are_exact() -> None:
+    assert (sparse.MAX_DIRS, sparse.MAX_DIR_LENGTH, sparse.MAX_COMPONENT) == (256, 1024, 255)
+    # 255 + 255 + 255 + 254 + 1 = 1020 bytes of names plus 4 separators = exactly 1024
+    d1024 = "/".join(["x" * 255] * 3 + ["x" * 254, "y"])
+    assert len(d1024.encode()) == 1024
+    assert sparse.normalize_dir(d1024) == d1024
+    d1025 = d1024 + "z"
+    assert len(d1025.encode()) == 1025
+    with pytest.raises(UsageError):
+        sparse.normalize_dir(d1025)
+    assert sparse.normalize_dir("x" * 255) == "x" * 255
+    with pytest.raises(UsageError):
+        sparse.normalize_dir("x" * 256)
+    assert sparse.normalize_dir("é" * 127) == "é" * 127  # 254 bytes
+    assert sparse.normalize_dir("a/" + "x" * 255) == "a/" + "x" * 255
+    with pytest.raises(UsageError):
+        sparse.normalize_dir("a/" + "x" * 256)
+    assert len(sparse.normalize([f"d{i}" for i in range(256)])) == 256
+    with pytest.raises(UsageError):
+        sparse.normalize([f"d{i}" for i in range(257)])
+
+
 def test_too_many_and_none_are_refused() -> None:
     with pytest.raises(UsageError):
         sparse.normalize([])
@@ -531,3 +563,203 @@ def test_a_submodule_of_a_sparse_worktree_has_no_cone_of_its_own(w: SW, capsys) 
     detail = {"detail": "submodule", "path": "vendor/sub", "reason": "hidden_changes"}
     assert detail in d["checks"]["nested_repos"]["details"], d["checks"]["nested_repos"]
     assert (d["would_remove"], d["reason"]) == (False, "dirty")
+
+
+# -- round 1b: mutation gaps ---------------------------------------------------------------------
+
+
+def test_assume_unchanged_outside_the_cone_without_the_skip_bit_is_found(
+    w: SW,
+    capsys,  # noqa: ANN001
+) -> None:
+    """Git shows ``h`` for assume-unchanged (``S`` wins when both bits are set), so only a path
+    whose skip bit is cleared exercises the tag; ``h`` must never be read as the checkout's own."""
+    w.sparse_start(capsys, "a/b")
+    w.g(["update-index", "--no-skip-worktree", "f/three.txt"], w.wt)
+    w.g(["update-index", "--assume-unchanged", "f/three.txt"], w.wt)
+    tags = w.g(["ls-files", "-v", "f/three.txt"], w.wt)
+    assert tags.startswith("h "), tags
+    d = w.st(capsys)
+    assert ("f/three.txt", "hidden_changes") in paths(d, "tracked")
+    assert d["reason"] == "dirty"
+    assert w.refused()["reason"] == "dirty"
+    assert w.intact()
+
+
+def test_private_index_ignores_sparse_settings_of_the_repo(w: SW, capsys) -> None:  # noqa: ANN001
+    """Each sparse key an agent can set is overridden for the private index, so it holds every
+    tracked path with no skip-worktree bit, as a non-sparse repository would give. (With git 2.34
+    none of the three keys changes what update-index or status do to such an index, so dropping an
+    override is not observable here; this pins the contract for any git that does differ.)"""
+    from tests.vectorlib import GIT
+    from wtctl import removal_content
+    from wtctl.gateway import Gateway
+    from wtctl.hardgit import Git
+
+    w.sparse_start(capsys, "a/b")
+    git = Git(Gateway(), GIT, str(w.home))
+    keys = ("core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse")
+    for key in keys:
+        w.g(["config", key, "true"])
+    inp = removal_content.Inputs(git=git, state=None, record=w.record, config=None, disposable=[])  # type: ignore[arg-type]
+    full = sorted(w.tracked())
+    with removal_content.private_index(inp) as index:
+        got = git.run(
+            ["ls-files", "-v", "-z"],
+            git_dir=w.record["admin_dir"],
+            work_tree=w.record["path"],
+            index_file=index,
+            overrides=tuple((k, "false") for k in keys),
+        )
+    assert got.returncode == 0, got.err
+    entries = [e for e in got.stdout.decode().split("\0") if e]
+    assert sorted(e[2:] for e in entries) == full
+    assert {e[0] for e in entries} == {"H"}
+
+
+@pytest.mark.parametrize("how", ["edit", "delete"])
+def test_status_and_remove_see_a_changed_pattern_file(w: SW, capsys, how: str) -> None:  # noqa: ANN001
+    w.sparse_start(capsys, "a/b")
+    pf = w.admin / "info" / "sparse-checkout"
+    if how == "edit":
+        pf.write_text(pf.read_text() + "/f/\n")
+    else:
+        pf.unlink()
+    d = w.st(capsys)
+    assert d["checks"]["baseline"]["status"] == "fail"
+    assert any(
+        x["path"].endswith("/info/sparse-checkout") for x in d["checks"]["baseline"]["details"]
+    )
+    assert d["reason"] == "repo_config_changed"
+    assert w.refused()["reason"] == "repo_config_changed"
+    assert w.intact()
+
+
+def _format_3_with_a_planted_pattern_file(w: SW, capsys) -> Path:  # noqa: ANN001
+    """A record whose baseline predates the pattern-file item, and a pattern file git made later."""
+    w.start_built(capsys, bootstrap=False)
+    w.db_exec("INSERT OR REPLACE INTO baseline_meta(record_id, format) VALUES (?, 3)", w.rid)
+    (w.admin / "info").mkdir(exist_ok=True)
+    pf = w.admin / "info" / "sparse-checkout"
+    pf.write_text("/*\n")
+    return pf
+
+
+def test_status_of_a_format_3_baseline_ignores_the_pattern_file(w: SW, capsys) -> None:  # noqa: ANN001
+    _format_3_with_a_planted_pattern_file(w, capsys)
+    d = w.st(capsys)
+    assert d["checks"]["baseline"]["status"] == "pass"
+    assert d["would_remove"] is True
+
+
+def test_remove_of_a_format_3_baseline_ignores_the_pattern_file(w: SW, capsys) -> None:  # noqa: ANN001
+    _format_3_with_a_planted_pattern_file(w, capsys)
+    w.removed()
+    assert not w.wt.exists()
+
+
+def test_bootstrap_rerun_keeps_a_format_3_baseline_comparable(w: SW, capsys) -> None:  # noqa: ANN001
+    """The re-recorded baseline of a format 3 record is a format 3 baseline: it must not gain the
+    pattern-file item, or the next compare (which does not collect it) would report a change."""
+    _format_3_with_a_planted_pattern_file(w, capsys)
+    w.repo_cfg["bootstrap"] = {"steps": [{"argv": ["/bin/true"]}]}
+    r = w.cli(capsys, "bootstrap", w.rid, human=True)
+    assert r.code == 0, (r.out, r.err)
+    assert not [
+        x
+        for x in w.rows("SELECT path FROM baseline_items WHERE record_id = ?", w.rid)
+        if x["path"].endswith("/info/sparse-checkout")
+    ]
+    assert w.cli(capsys, "baseline", "check", w.rid).code == 0
+
+
+def test_bootstrap_rerun_of_a_sparse_worktree_records_and_detects_the_pattern_file(
+    w: SW,
+    capsys,  # noqa: ANN001
+) -> None:
+    w.sparse_start(capsys, "a/b")
+    w.repo_cfg["bootstrap"] = {"steps": [{"argv": ["/bin/true"]}]}
+    r = w.cli(capsys, "bootstrap", w.rid, human=True)
+    assert r.code == 0, (r.out, r.err)
+    assert w.cli(capsys, "baseline", "check", w.rid).code == 0
+    pf = w.admin / "info" / "sparse-checkout"
+    pf.write_text(pf.read_text() + "/f/\n")
+    assert w.cli(capsys, "baseline", "check", w.rid).code == 20
+
+
+# -- sparse_checkout (worktrees.py): the file is created, never reused, and git is told it is a cone
+
+
+class _StopGit:
+    """A stand-in for the hardened git that records the one call and fails it."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(self, args: list[str], **kw: Any) -> Any:  # noqa: ANN401
+        from wtctl.gateway import GitResult
+
+        self.calls.append((list(args), kw))
+        return GitResult(returncode=1, stdout=b"", stderr=b"stop")
+
+
+def _race_in(monkeypatch: pytest.MonkeyPatch, make: Any) -> None:  # noqa: ANN401
+    """Let `make(info_dir)` run right after sparse_checkout made the info directory, as a
+    concurrent writer in the agent-writable admin area could."""
+    import os
+
+    from wtctl import worktrees
+
+    real = os.mkdir
+
+    def mkdir(path: str, mode: int = 0o777) -> None:
+        real(path, mode)
+        make(Path(path))
+
+    monkeypatch.setattr(worktrees.os, "mkdir", mkdir)
+
+
+def test_sparse_checkout_tells_git_to_use_cone_mode(tmp_path: Path) -> None:
+    from wtctl import worktrees
+
+    git = _StopGit()
+    with pytest.raises(Exception, match="sparse checkout failed"):
+        worktrees.sparse_checkout(git, str(tmp_path), str(tmp_path / "wt"), ["a"])  # type: ignore[arg-type]
+    [(args, kw)] = git.calls
+    assert args == ["read-tree", "-m", "-u", "HEAD"]
+    assert dict(kw["overrides"]) == {
+        "core.sparseCheckout": "true",
+        "core.sparseCheckoutCone": "true",
+    }
+    assert (tmp_path / "info" / "sparse-checkout").read_bytes() == sparse.pattern_file(["a"])
+
+
+def test_sparse_checkout_refuses_a_pattern_file_that_appears_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import worktrees
+    from wtctl.errors import WtctlError
+
+    _race_in(monkeypatch, lambda info: (info / "sparse-checkout").write_text("planted\n"))
+    git = _StopGit()
+    with pytest.raises(WtctlError) as ei:
+        worktrees.sparse_checkout(git, str(tmp_path), str(tmp_path / "wt"), ["a"])  # type: ignore[arg-type]
+    assert ei.value.code == "create_failed" and "info/sparse-checkout" in str(ei.value)
+    assert git.calls == []
+    assert (tmp_path / "info" / "sparse-checkout").read_text() == "planted\n"
+
+
+def test_sparse_checkout_refuses_a_symlink_in_place_of_the_pattern_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import worktrees
+    from wtctl.errors import WtctlError
+
+    target = tmp_path / "victim"
+    target.write_text("keep\n")
+    _race_in(monkeypatch, lambda info: (info / "sparse-checkout").symlink_to(target))
+    git = _StopGit()
+    with pytest.raises(WtctlError) as ei:
+        worktrees.sparse_checkout(git, str(tmp_path), str(tmp_path / "wt"), ["a"])  # type: ignore[arg-type]
+    assert ei.value.code == "create_failed"
+    assert git.calls == [] and target.read_text() == "keep\n"

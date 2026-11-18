@@ -74,3 +74,26 @@ def test_record_lookup_helpers(st: State) -> None:
     assert st.live_records_for_repo("other/x/y") == []
     with pytest.raises(WtctlError):
         st.transition("wt-aaaaaaaa", "creating", "active")
+
+
+def test_set_sparse_replaces_the_previous_cone(st: State) -> None:
+    put(st, "wt-aaaaaaaa", state="creating")
+    st.set_sparse("wt-aaaaaaaa", ["a", "b"])
+    st.set_sparse("wt-aaaaaaaa", ["c"])
+    assert st.sparse_dirs("wt-aaaaaaaa") == ["c"]
+
+
+def test_sparse_dirs_go_with_the_record(st: State) -> None:
+    put(st, "wt-aaaaaaaa", state="creating")
+    st.set_sparse("wt-aaaaaaaa", ["a", "b"])
+    assert st.delete_record("wt-aaaaaaaa", expected="creating") is True
+    assert st._conn.execute("SELECT count(*) FROM sparse_dirs").fetchone()[0] == 0
+
+
+def test_two_records_may_have_the_same_cone_directory(st: State) -> None:
+    put(st, "wt-aaaaaaaa")
+    put(st, "wt-bbbbbbbb", path="/w/other", name="other")
+    st.set_sparse("wt-aaaaaaaa", ["same"])
+    st.set_sparse("wt-bbbbbbbb", ["same"])
+    assert st.sparse_dirs("wt-aaaaaaaa") == ["same"]
+    assert st.sparse_dirs("wt-bbbbbbbb") == ["same"]
