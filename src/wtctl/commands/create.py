@@ -14,7 +14,17 @@ import sqlite3
 import stat
 from typing import Any
 
-from .. import baselinesvc, bootstrapper, fsafe, hooks, naming, repobaseline, unwind, worktrees
+from .. import (
+    baselinesvc,
+    bootstrapper,
+    fsafe,
+    gateway,
+    hooks,
+    naming,
+    repobaseline,
+    unwind,
+    worktrees,
+)
 from .. import labels as labelmod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError, bootstrap_failed_details
@@ -560,12 +570,35 @@ class Creator:
                 ) from None
             if occupied:
                 raise WtctlError("refused", f"{path} already exists", reason="path_exists")
+            if self._is_mount_point(path, st):
+                raise WtctlError(
+                    "refused",
+                    f"{path} is a mount point; a worktree root must not be one (unmount it or "
+                    "choose another path)",
+                    reason="path_exists",
+                )
         for known in self._known_dirs():
             self._check_nesting(path, known)
         private = [str(state_path().parent), self.config.effective_throwaway_root]
         for d in private:
             if _within(path, os.path.realpath(d)):
                 raise UsageError(f"{path} lies inside {d}")
+
+    @staticmethod
+    def _is_mount_point(path: str, st: os.stat_result) -> bool:
+        """Whether the existing empty directory ``path`` is a mount point: listed in the mount
+        table, or on another device than its parent. Such a root would be the walk anchor with a
+        ``dir_id`` no walk may open, so a ``partial`` record could never be finished."""
+        try:
+            table = fsafe.DEFAULT_FS.mount_table()
+        except gateway.MountTableUnavailable:
+            table = None
+        if table and any(m.mount_point == path for m in table):
+            return True
+        try:
+            return os.lstat(os.path.dirname(path)).st_dev != st.st_dev
+        except OSError:
+            return False
 
     @staticmethod
     def _check_nesting(path: str, known: str) -> None:
@@ -877,8 +910,17 @@ class Creator:
                             message=f"a parent of {self.path} was replaced while git created it",
                             changed=False,
                         ) from None
+                    mounted = self._on_another_mount(fd, nfd)
                     os.close(fd)
                     fd = nfd
+                    if mounted:
+                        raise self._root_error(
+                            root,
+                            recorded,
+                            None,
+                            message=f"{self.path} became a mount point while it was created",
+                            changed=False,
+                        )
                 try:
                     dotgit = os.stat(".git", dir_fd=fd, follow_symlinks=False)
                 except OSError:
@@ -888,6 +930,14 @@ class Creator:
                 return identity_str(os.fstat(fd))
             finally:
                 os.close(fd)
+
+    @staticmethod
+    def _on_another_mount(parent_fd: int, child_fd: int) -> bool:
+        """Whether the directory ``child_fd`` is on another device or mount than its parent."""
+        if os.fstat(parent_fd).st_dev != os.fstat(child_fd).st_dev:
+            return True
+        a, b = gateway.fd_mount_id(parent_fd), gateway.fd_mount_id(child_fd)
+        return a is not None and b is not None and a != b
 
     def _transfer(self, lease: Lease, start: str) -> None:
         cid = self.res.recorded_id

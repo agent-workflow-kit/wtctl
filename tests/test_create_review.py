@@ -565,3 +565,16 @@ def test_t5_the_kept_message_scrubs_urls(w: CW) -> None:
 
     err = refused(cli_spy(w, Spy(after=leak)), 12)
     assert "s3cret" not in err["message"]
+
+
+def test_a_worktree_dir_that_became_a_mount_point_after_the_add_never_gets_a_dir_id(
+    w: CW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl.commands.create import Creator
+
+    monkeypatch.setattr(Creator, "_on_another_mount", staticmethod(lambda p, c: True))
+    err = refused(cli_spy(w, Spy()), 12)
+    assert err["code"] == "create_failed" and err["details"]["cause"] == "anchor_changed"
+    assert "mount point" in err["message"]
+    [rec] = w.records()
+    assert rec["state"] == "creating" and rec["dir_id"] is None
