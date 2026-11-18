@@ -245,46 +245,8 @@ class Reconciler:
         return rec["branch"] if r.returncode == 0 and not r.timed_out else None
 
     def planted(self, rec: Record) -> tuple[str, str | None]:
-        """What is at the planned path: ``absent``, ``unknown`` (cannot tell), ``other`` or
-        ``worktree`` with the admin directory its ``.git`` file names. Read with no-follow
-        descriptors from the recorded worktree root."""
-        base, path = rec["base_dir"], rec["path"]
-        ident = self.state.anchor_identity(base) if base else None
-        rel = os.path.relpath(path, base) if base else ".."
-        if not base or ident is None or rel in (".", "..") or rel.startswith(("../", "/")):
-            return "unknown", None
-        parts = rel.split(os.sep)
-        try:
-            with fsafe.open_anchor(base, expected=reconcile_probe._ident(ident)) as anchor:
-                try:
-                    pfd = fsafe.open_chain(anchor, anchor.fd, parts[:-1], start_path=anchor.path)
-                except fsafe.FsafeError as exc:
-                    return (
-                        ("absent", None)
-                        if exc.kind in ("missing", "not_dir")
-                        else ("unknown", None)
-                    )
-                try:
-                    try:
-                        anchor.fs.lstat_at(pfd, parts[-1])
-                    except FileNotFoundError:
-                        return "absent", None
-                    try:
-                        wfd = fsafe.open_dir(anchor, pfd, parts[-1])
-                    except fsafe.FsafeError:
-                        return "other", None
-                    try:
-                        text = linkcheck._read_small(anchor, wfd, ".git")
-                    except fsafe.FsafeError:
-                        return "other", None
-                    finally:
-                        os.close(wfd)
-                finally:
-                    os.close(pfd)
-        except fsafe.FsafeError:
-            return "unknown", None
-        named = linkcheck._pointer_value(text, "gitdir: ")
-        return ("worktree", named) if named else ("other", None)
+        """What is at the planned path (``reconcile_probe.planted``)."""
+        return reconcile_probe.planted(self.state, rec)
 
     def creating_worktree(self, rec: Record) -> None:
         kind, admin = self.planted(rec)
@@ -296,7 +258,41 @@ class Reconciler:
             return
         if kind == "worktree" and admin is not None and self.reclaim(rec, admin):
             return
+        if kind == "mount" and self.unplaced(rec):
+            return
         self.report("abandoned", id=rec["id"], path=rec["path"])
+
+    def unplaced(self, rec: Record) -> bool:
+        """The planned path is a mount point (one placed after create's check): it is never
+        opened, so no ``dir_id`` can be recorded, and reconcile deletes nothing. When the clone has
+        the admin entry git made for the path, the record becomes ``partial`` with that entry and
+        the sha the branch was created at (the first entry of the worktree's HEAD reflog), so
+        ``remove`` can clear the admin entry and the branch, never the directory. Returns whether
+        the record was settled."""
+        admin = worktrees.admin_for_path(rec["common_dir"], rec["path"])
+        if admin is None:
+            return False
+        info = worktrees.inspect_existing(self.git, rec["common_dir"], admin)
+        made = worktrees.reflog_first(admin)
+        note = (
+            f"{rec['path']} is a mount point and could not be verified: nothing in it was "
+            "touched. `wtctl remove` clears the admin entry and the branch, `wtctl forget` the "
+            "record"
+        )
+        updates: dict[str, Any] = {
+            "admin_dir": admin,
+            "head_at_create": made or info.head,
+            "reflog_start_ts": self.state.timestamp(),
+            "reflog_start_sha": info.reflog_start_sha,
+            "stash_ids": info.stash_ids,
+            "last_error": note[:500],
+        }
+        if made is None:  # the creation sha is unknown: the branch is then never deleted
+            updates["created_branch"] = False
+        if self.move(rec, "creating", "partial", "abandon_unplaced", **updates):
+            extra = {"branch": rec["branch"]} if rec["created_branch"] and rec["branch"] else {}
+            self.report("abandoned", id=rec["id"], path=rec["path"], message=note, **extra)
+        return True
 
     def reclaim(self, rec: Record, admin: str) -> bool:
         """Adopt a worktree whose creator died after ``git worktree add``: its ``.git`` file names

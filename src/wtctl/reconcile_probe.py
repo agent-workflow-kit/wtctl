@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from . import fsafe, fsafe_child, removal_delete, removalfs
+from . import fsafe, fsafe_child, linkcheck, removal_delete, removalfs
 from .errors import WtctlError
 from .locate import Resolver
 
@@ -178,3 +178,46 @@ def repair_pointers(
     if res.timed_out:
         return "the pointer rewrite did not finish in time"
     return res.error.message if res.error else "the pointer rewrite failed"
+
+
+def planted(state: Any, rec: dict[str, Any]) -> tuple[str, str | None]:
+    """What is at the planned path: ``absent``, ``unknown`` (cannot tell), ``mount`` (a mount
+    point: it is never opened), ``other`` or ``worktree`` with the admin directory its ``.git`` file names. Read with no-follow
+    descriptors from the recorded worktree root."""
+    base, path = rec["base_dir"], rec["path"]
+    ident = state.anchor_identity(base) if base else None
+    rel = os.path.relpath(path, base) if base else ".."
+    if not base or ident is None or rel in (".", "..") or rel.startswith(("../", "/")):
+        return "unknown", None
+    parts = rel.split(os.sep)
+    try:
+        with fsafe.open_anchor(base, expected=_ident(ident)) as anchor:
+            try:
+                pfd = fsafe.open_chain(anchor, anchor.fd, parts[:-1], start_path=anchor.path)
+            except fsafe.FsafeError as exc:
+                return (
+                    ("absent", None)
+                    if exc.kind in ("missing", "not_dir")
+                    else ("unknown", None)
+                )
+            try:
+                try:
+                    anchor.fs.lstat_at(pfd, parts[-1])
+                except FileNotFoundError:
+                    return "absent", None
+                try:
+                    wfd = fsafe.open_dir(anchor, pfd, parts[-1])
+                except fsafe.FsafeError as exc:
+                    return ("mount", None) if exc.kind == "mount_point" else ("other", None)
+                try:
+                    text = linkcheck._read_small(anchor, wfd, ".git")
+                except fsafe.FsafeError:
+                    return "other", None
+                finally:
+                    os.close(wfd)
+            finally:
+                os.close(pfd)
+    except fsafe.FsafeError:
+        return "unknown", None
+    named = linkcheck._pointer_value(text, "gitdir: ")
+    return ("worktree", named) if named else ("other", None)

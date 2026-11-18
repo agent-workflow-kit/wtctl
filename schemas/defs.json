@@ -1558,7 +1558,7 @@
               "type": "null"
             }
           ],
-          "description": "The worktree or throwaway directory's (st_dev, st_ino), recorded at create (a throwaway's after its mkdir), adopt or a reclaim after a crash; checked before wtctl deletes the directory or rewrites its pointers. null only while creating, and in a gone or forgotten tombstone of a record that never left creating."
+          "description": "The worktree or throwaway directory's (st_dev, st_ino), recorded at create (a throwaway's after its mkdir), adopt or a reclaim after a crash; checked before wtctl deletes the directory or rewrites its pointers. null while creating, in a gone or forgotten tombstone of a record that never left creating, and in a worktree record that create or reconcile settled as partial because a mount covered the directory (nothing in it was verified or touched; `remove` clears only its admin entry and branch, and that record may end removed)."
         },
         "base_dir": {
           "oneOf": [
@@ -1986,7 +1986,31 @@
             "properties": {
               "head_at_create": {
                 "$ref": "#/$defs/sha"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "object_type": {
+                "const": "worktree"
               },
+              "state": {
+                "not": {
+                  "enum": [
+                    "creating",
+                    "partial",
+                    "removed",
+                    "gone",
+                    "forgotten"
+                  ]
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
               "dir_id": {
                 "$ref": "#/$defs/dev_ino"
               }
@@ -2008,8 +2032,14 @@
                     "forgotten"
                   ]
                 }
+              },
+              "dir_id": {
+                "type": "string"
               }
-            }
+            },
+            "required": [
+              "dir_id"
+            ]
           },
           "then": {
             "properties": {

@@ -577,7 +577,7 @@ def test_a_worktree_dir_that_became_a_mount_point_after_the_add_never_gets_a_dir
     assert err["code"] == "create_failed" and err["details"]["cause"] == "anchor_changed"
     assert "mount point" in err["message"]
     [rec] = w.records()
-    assert rec["state"] == "creating" and rec["dir_id"] is None
+    assert rec["state"] == "partial" and rec["dir_id"] is None  # settled, see test_create_unplaced
 
 
 def _dir_fds(tmp_path: Path) -> tuple[int, int]:
