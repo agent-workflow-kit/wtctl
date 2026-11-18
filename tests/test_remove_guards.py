@@ -665,12 +665,15 @@ def test_t14_prune_incomplete_exits_12_and_a_forced_removal_overrides_it(w: RR, 
     assert d["checks"]["fetch"]["details"][0]["cause"] == "prune_incomplete"
 
 
+_ACC = b"fatal: unable to access 'https://x/': "
+
+
 @pytest.mark.parametrize(
     "stderr,cause",
     [
         (b"fatal: repository 'https://x/r.git/' not found\n", "repository_not_found"),
-        (b"fatal: unable to access 'https://x/': Could not resolve host: x\n", "network_unreachable"),
-        (b"fatal: unable to access 'https://x/': The requested URL returned error: 429\n", "rate_limited"),
+        (_ACC + b"Could not resolve host: x\n", "network_unreachable"),
+        (_ACC + b"The requested URL returned error: 429\n", "rate_limited"),
     ],
 )
 def test_t14_transport_causes_exit_12_and_a_forced_removal_overrides_them(

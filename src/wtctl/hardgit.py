@@ -728,7 +728,8 @@ _NETWORK_UNREACHABLE = re.compile(
     r"|ssh: Could not resolve hostname |ssh: connect to host )"
 )
 _REPOSITORY_NOT_FOUND = re.compile(
-    r"(?:fatal: repository '[^\n]*' not found$|fatal: '[^\n]*' does not appear to be a git repository$)"
+    r"(?:fatal: repository '[^\n]*' not found$"
+    r"|fatal: '[^\n]*' does not appear to be a git repository$)"
 )
 _RATE_LIMITED = re.compile(rf"{_CURL_LINE}The requested URL returned error: 429$")
 TRANSPORT_CAUSES = ("rate_limited", "repository_not_found", "network_unreachable")
