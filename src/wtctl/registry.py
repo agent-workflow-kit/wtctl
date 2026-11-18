@@ -74,6 +74,13 @@ def _create(p: argparse.ArgumentParser) -> None:
     p.add_argument("--holder")
     p.add_argument("--no-bootstrap", action="store_true")
     p.add_argument("--copy-env", action="store_true")
+    p.add_argument(
+        "--sparse",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="check out only DIR (cone sparse checkout; repeatable)",
+    )
     p.add_argument("--source", choices=["auto", "local", "remote"])
     p.add_argument("--depth", type=int)
     _label(p)

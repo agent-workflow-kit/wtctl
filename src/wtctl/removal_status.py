@@ -135,6 +135,7 @@ class Status:
             hooks_path=baselinesvc.hooks_recorded_path(items),
             links=baselinesvc.follows_links(self.state, r["id"]),
             linked=baselinesvc.skips_linked(self.state, r["id"]),
+            sparse=baselinesvc.covers_sparse(self.state, r["id"]),
             git=self.git,
         )
         current = baselinesvc.compute(spec)

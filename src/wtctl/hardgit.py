@@ -134,6 +134,11 @@ CALLER_OVERRIDE_KEYS = frozenset(
         "core.trustctime",
         "core.ignorestat",
         "core.splitindex",
+        # sparse checkouts: create's one-shot `read-tree -mu` applies the cone, and the content
+        # checks force it off so an agent-set value changes nothing (interface.md, Sparse checkouts)
+        "core.sparsecheckout",
+        "core.sparsecheckoutcone",
+        "index.sparse",
     }
 )
 NETWORK_OVERRIDES: tuple[tuple[str, str], ...] = (

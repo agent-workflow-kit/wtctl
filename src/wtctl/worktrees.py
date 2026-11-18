@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from . import urls
+from . import sparse, urls
 from .errors import UsageError, WtctlError
 from .gitsetup import private_dir
 from .hardgit import Git, PorcelainError, WorktreeEntry, parse_config_list, parse_worktree_list
@@ -363,6 +363,7 @@ class AddSpec:
     path: str
     branch: str | None  # an existing branch (this call created it, for a new one); None: detached
     start: str | None  # the commit of a detached worktree
+    no_checkout: bool = False  # a sparse worktree is populated afterwards by `sparse_checkout`
 
 
 # `worktree add` may check out a large tree: the longest git call create makes.
@@ -372,16 +373,57 @@ ADD_TIMEOUT = 600
 def worktree_add(git: Git, common_dir: str, spec: AddSpec) -> None:
     """``git worktree add`` (protocols ``none``, filters honored per ``create.allow_filters``).
     A branch is always the existing-branch form: it was created before, create-only."""
+    flags = ["--no-checkout"] if spec.no_checkout else []
     if spec.branch is not None:
-        args = ["worktree", "add", "--", spec.path, spec.branch]
+        args = ["worktree", "add", *flags, "--", spec.path, spec.branch]
     else:
         assert spec.start is not None
-        args = ["worktree", "add", "--detach", "--", spec.path, spec.start]
+        args = ["worktree", "add", *flags, "--detach", "--", spec.path, spec.start]
     r = git.run(args, git_dir=common_dir, cwd=common_dir, honor_filters=True, timeout=ADD_TIMEOUT)
     if r.returncode != 0 or r.timed_out:
         last = r.err.strip().splitlines()[-1:] or ["failed"]
         why = "timed out" if r.timed_out else scrub_urls(last[0])
         raise create_failed(f"git worktree add failed: {why}")
+
+
+SPARSE_ON = (("core.sparseCheckout", "true"), ("core.sparseCheckoutCone", "true"))
+
+
+def sparse_checkout(git: Git, admin_dir: str, path: str, dirs: list[str]) -> None:
+    """Populate a worktree added with ``--no-checkout`` as a cone checkout of ``dirs``.
+
+    wtctl writes the pattern file itself (``sparse.pattern_file``, validated directories only,
+    never an argv or a shell) into the new admin entry and runs one ``read-tree -mu HEAD`` with
+    the sparse settings given for that command alone: nothing is written to any git config, so
+    no other worktree of the clone and no other record's baseline is affected.
+    """
+    info = os.path.join(admin_dir, "info")
+    try:
+        os.mkdir(info, 0o755)
+        fd = os.open(
+            os.path.join(info, "sparse-checkout"),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+        )
+    except OSError as exc:
+        raise create_failed(f"cannot write info/sparse-checkout: {exc.strerror}") from exc
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(sparse.pattern_file(dirs))
+    except OSError as exc:
+        raise create_failed(f"cannot write info/sparse-checkout: {exc.strerror}") from exc
+    r = git.run(
+        ["read-tree", "-m", "-u", "HEAD"],
+        git_dir=admin_dir,
+        work_tree=path,
+        honor_filters=True,
+        overrides=SPARSE_ON,
+        timeout=ADD_TIMEOUT,
+    )
+    if r.returncode != 0 or r.timed_out:
+        last = r.err.strip().splitlines()[-1:] or ["failed"]
+        why = "timed out" if r.timed_out else scrub_urls(last[0])
+        raise create_failed(f"sparse checkout failed: {why}")
 
 
 @dataclass(frozen=True)

@@ -17,7 +17,7 @@ from .errors import UsageError, WtctlError
 from .hardgit import Git
 from .locate import describe_mount
 from .repobaseline import Baseline, Item, Spec
-from .state import BASELINE_FORMAT, LINKS_BASELINE_FORMAT
+from .state import BASELINE_FORMAT, LINKED_BASELINE_FORMAT, LINKS_BASELINE_FORMAT
 
 # The collector runner: ``fsafe_child.run_op`` (a child process under the walk deadline) unless
 # a test substitutes ``repobaseline.inproc``.
@@ -100,6 +100,7 @@ def spec_for(
     rebind_hooks: bool = False,
     links: bool = True,
     linked: bool = True,
+    sparse: bool = True,
     git: Git | LazyGit | None = None,
 ) -> Spec:
     return Spec(
@@ -116,6 +117,7 @@ def spec_for(
         rebind_hooks=rebind_hooks,
         links=links,
         linked=linked,
+        sparse=sparse,
         listed=listed_worktrees(git, record["common_dir"]) if linked and git is not None else [],
     )
 
@@ -147,6 +149,13 @@ def skips_linked(state: Any, record_id: str) -> bool:
     """Whether the record's baseline is compared with the collector that skips verified linked
     worktrees (format 3). A format 1 or 2 baseline was recorded with their content in it and is
     compared by the collector that recorded it (docs/interface.md, Baseline, Format)."""
+    return bool(state.baseline_format(record_id) >= LINKED_BASELINE_FORMAT)
+
+
+def covers_sparse(state: Any, record_id: str) -> bool:
+    """Whether the record's baseline includes the admin entry's ``info/sparse-checkout`` (format
+    4). An older baseline is compared by the collector that recorded it, so a worktree made
+    sparse by git itself, before wtctl covered the file, does not fail by itself."""
     return bool(state.baseline_format(record_id) >= BASELINE_FORMAT)
 
 
@@ -239,6 +248,7 @@ def verify_unchanged(
         hooks_path=hooks_recorded_path(items),
         links=follows_links(state, record["id"]),
         linked=skips_linked(state, record["id"]),
+        sparse=covers_sparse(state, record["id"]),
         git=git,
     )
     current = compute(spec)
@@ -280,6 +290,7 @@ def record_current(
     *,
     links: bool = True,
     linked: bool = True,
+    sparse: bool = True,
     git: Git | LazyGit | None = None,
 ) -> Baseline:
     """The baseline of a worktree that was just made or just bootstrapped, from the record's own
@@ -292,6 +303,7 @@ def record_current(
             dir_id=record["dir_id"],
             links=links,
             linked=linked,
+            sparse=sparse,
             git=git,
         )
     )

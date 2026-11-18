@@ -22,7 +22,7 @@ import re
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-from . import bootstrapper, fsafe, removalfs, worktrees
+from . import bootstrapper, fsafe, removalfs, sparse, worktrees
 from .errors import WtctlError
 from .fsafe import escape_for_details
 from .gitsetup import private_dir
@@ -51,6 +51,10 @@ PRIVATE_INDEX_OVERRIDES = (
     ("core.ignoreStat", "false"),
     # a split index would write sharedindex.* files into the real git dir
     ("core.splitIndex", "false"),
+    # an agent-set sparse-checkout setting must not change what the private index shows
+    ("core.sparseCheckout", "false"),
+    ("core.sparseCheckoutCone", "false"),
+    ("index.sparse", "false"),
 )
 REFLOG_MAX_BYTES = 64 * 1024 * 1024
 STASH_REF = "refs/stash"
@@ -86,6 +90,12 @@ class Inputs:
     # unpushed_head details about submodules, found by nested_repos (which runs first)
     sub_unpushed: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     _pushed: dict[str, Pushed] = dataclasses.field(default_factory=dict)
+
+    def cone(self) -> sparse.Cone | None:
+        """The cone of a sparse worktree, from wtctl's own record (never from the admin area,
+        which an agent can write); None for a full checkout."""
+        dirs = self.state.sparse_dirs(self.record["id"])
+        return None if dirs is None else sparse.Cone(dirs)
 
     @property
     def gitdir(self) -> str:
@@ -165,13 +175,24 @@ def _bad(raw: str) -> bool:
 
 
 def hidden_entries(inp: Inputs) -> list[str]:
-    """Paths tagged assume-unchanged or skip-worktree in the worktree's own index."""
+    """Paths tagged assume-unchanged or skip-worktree in the worktree's own index. In a sparse
+    worktree a plain skip-worktree tag (``S``) on a path the recorded cone leaves out is what the
+    checkout put there and is not reported; the same tag inside the cone, and any
+    assume-unchanged tag, still is."""
     out = inp.run(["ls-files", "-v", "-z"], what="ls-files -v")
     try:
         tagged = parse_ls_files_tagged(out)
     except PorcelainError as exc:
         raise WtctlError("internal", f"unreadable git ls-files output: {exc}") from exc
-    return sorted({path for tag, path in tagged if hidden_index_flag(tag)})
+    cone = inp.cone()
+    return sorted(
+        {
+            path
+            for tag, path in tagged
+            if hidden_index_flag(tag)
+            and not (tag == "S" and cone is not None and not cone.includes(path))
+        }
+    )
 
 
 # -- the bootstrap-created set -------------------------------------------------------------------
@@ -310,6 +331,7 @@ def tracked_untracked_ignored(inp: Inputs) -> dict[str, dict[str, Any]]:
     untracked: list[dict[str, Any]] = []
     ignored: list[dict[str, Any]] = []
     hidden = hidden_entries(inp)
+    cone = inp.cone()
     gitlinks = gitlink_paths(inp)
     with private_index(inp) as index, Hasher(inp.record) as hasher:
         for rel in gitlinks:  # a file or link where a submodule's directory belongs
@@ -317,6 +339,16 @@ def tracked_untracked_ignored(inp: Inputs) -> dict[str, dict[str, Any]]:
                 tracked.append({"path": _text(rel), "detail": "changed"})
         for e in _status(inp, index, ["--untracked-files=all", "--ignored=no"]):
             if e.kind in ("1", "2", "u"):
+                if (
+                    cone is not None
+                    and e.kind == "1"
+                    and e.xy == ".D"
+                    and not cone.includes(e.path)
+                ):
+                    # the private index has no skip-worktree bits, so every file the sparse
+                    # checkout left out looks deleted; a path outside the cone is absent by design
+                    # (a staged change, or an edit of a file that is there, is still reported)
+                    continue
                 tracked.append({"path": _text(e.path), "detail": "changed"})
             elif e.kind == "?":
                 rel = e.path

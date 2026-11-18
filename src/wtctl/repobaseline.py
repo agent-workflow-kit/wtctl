@@ -97,6 +97,8 @@ class Spec:
     links: bool = True  # follow symlinks (baseline format 2); False is the legacy format 1
     # skip verified linked worktrees beneath the walk (baseline format 3), of those git listed
     linked: bool = True
+    # include the admin entry's info/sparse-checkout when it exists (baseline format 4)
+    sparse: bool = True
     listed: list[str] = field(default_factory=list)
 
 
@@ -959,6 +961,9 @@ class GitCollector:
         if admin and admin_ok:
             self._add_leaf(f"{admin}/commondir")
             self._add_leaf(f"{admin}/gitdir")
+            if self.spec.sparse:
+                # git reads it only for a sparse checkout, and then it decides which files exist
+                self._add_leaf(f"{admin}/info/sparse-checkout")
             self._modules(admin, self._admin_fd)
 
 
