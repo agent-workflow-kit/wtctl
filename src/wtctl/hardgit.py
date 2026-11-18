@@ -763,10 +763,19 @@ class FetchOutcome:
 _SERVER_TEXT_PREFIXES = ("remote:", "fatal: remote error:", "fatal: protocol error:")
 
 
+def _stderr_lines(err: str) -> list[str]:
+    """git's stderr lines: split on ``\\n`` only (one trailing ``\\r`` stripped per line).
+
+    ``str.splitlines`` also breaks on \\x0b, \\x0c, \\x1c-\\x1e, \\x85, U+2028/2029 and a lone
+    ``\\r``, which would let text inside a ``remote:`` line start a fake unprefixed line.
+    """
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in err.split("\n")]
+
+
 def _auth_lines(err: str) -> list[str]:
     """Lines that may carry an authentication marker: never a ``remote:`` line, which is text
     the server chose (a malicious remote could print any marker)."""
-    return [ln for ln in err.splitlines() if not ln.startswith(_SERVER_TEXT_PREFIXES)]
+    return [ln for ln in _stderr_lines(err) if not ln.startswith(_SERVER_TEXT_PREFIXES)]
 
 
 def classify_fetch(result: GitResult) -> FetchOutcome:
@@ -775,13 +784,13 @@ def classify_fetch(result: GitResult) -> FetchOutcome:
         return FetchOutcome(FetchKind.FAILED, "timeout")
     err = result.err
     if result.returncode == 0:
-        if any(line.startswith("error:") for line in err.splitlines()):
+        if any(line.startswith("error:") for line in _stderr_lines(err)):
             return FetchOutcome(FetchKind.FAILED, "prune_incomplete")
         return FetchOutcome(FetchKind.OK)
     if result.returncode == 1:
         # Newer git (2.56) exits 1 where older git exits 0 for a prune blocked by a ref lock.
         if "error: could not delete reference" in err and any(
-            line.lstrip().startswith("- [deleted]") for line in err.splitlines()
+            line.lstrip().startswith("- [deleted]") for line in _stderr_lines(err)
         ):
             return FetchOutcome(FetchKind.FAILED, "prune_incomplete")
         if any(marker in err for marker in LOCK_MARKERS):
@@ -839,7 +848,7 @@ def outcome_error(
     cause = outcome.cause
     if failure_code == "clone_failed" and cause == "prune_incomplete":
         cause = None
-    lines = result.err.strip().splitlines()
+    lines = _stderr_lines(result.err.strip()) if result.err.strip() else []
     if cause == "prune_incomplete":
         # exit 0 with an `error:` line: that line is the reason, not whatever git printed last
         lines = [ln for ln in lines if ln.startswith("error:")] or lines
@@ -847,7 +856,9 @@ def outcome_error(
     elif cause in TRANSPORT_CAUSES:
         # the line that classified it, not the "Could not read from remote repository" trailer
         pattern = dict(_TRANSPORT_PATTERNS)[cause]
-        lines = [ln for ln in _auth_lines("\n".join(lines)) if pattern.match(ln)] or lines
+        lines = [
+            ln for ln in lines if not ln.startswith(_SERVER_TEXT_PREFIXES) and pattern.match(ln)
+        ] or lines
         tail = lines[0][:200]
     else:
         tail = lines[-1][:200] if lines else "no output"

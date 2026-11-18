@@ -407,6 +407,24 @@ def test_a_refused_connection_is_network_unreachable_end_to_end(
     assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, "network_unreachable")
 
 
+def test_a_refused_ssh_connection_is_network_unreachable_end_to_end(
+    mirror: Path, private_home: Path
+) -> None:
+    if shutil.which("ssh") is None:
+        pytest.skip("needs an ssh binary")
+    with socket.socket() as s:  # a port nothing listens on, freed right away
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"ssh://127.0.0.1:{port}/x"
+    cfg = Config()
+    auth = prepare_network_auth(cfg, url, environ={}, gateway=Gateway(), warn=lambda m: None)
+    git = Git(Gateway(), GIT, str(private_home))
+    result = ls_remote(git, mirror, cfg, auth, url)
+    assert "ssh: connect to host" in result.err, result.err
+    outcome = classify_fetch(result)
+    assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, "network_unreachable")
+
+
 # -- #13: separator, owned config, the token-rejected message ---------------------------------
 
 

@@ -493,8 +493,9 @@ class Mirror:
     def refresh(self, lease: Lease) -> Refresh:
         """Fetch the remote's branches (commits only), learn its default branch, return the tips.
 
-        Raises ``fetch_failed`` (``details.cause`` ``timeout`` or ``prune_incomplete`` where it
-        applies), ``auth_required`` or ``remote_mismatch`` (an unusable URL).
+        Raises ``fetch_failed`` (``details.cause`` one of :data:`wtctl.hardgit.FETCH_CAUSES` where
+        it applies: ``timeout``, ``prune_incomplete`` or a transport cause),
+        ``auth_required`` or ``remote_mismatch`` (an unusable URL).
         """
         self._require_lease(lease)
         created = self.ensure(lease)

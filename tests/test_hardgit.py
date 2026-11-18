@@ -14,6 +14,7 @@ from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway, GitResult, run_git
 from wtctl.hardgit import (
     FETCH_CAUSES,
+    TRANSPORT_CAUSES,
     FetchKind,
     Git,
     PorcelainError,
@@ -900,3 +901,77 @@ def test_the_error_module_allows_exactly_the_fetch_causes() -> None:
 
     assert errors._CAUSES["fetch_failed"] == set(FETCH_CAUSES)
     assert errors._CAUSES["clone_failed"] == set(FETCH_CAUSES) - {"prune_incomplete"}
+
+
+# -- review round 1 (#33) ------------------------------------------------------------------------
+
+# Characters `str.splitlines` treats as line ends but git does not: inside a `remote:` line they
+# must not start a fake unprefixed line.
+_FAKE_BREAKS = ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r"]
+_SERVER_PAYLOADS = [
+    ("repository_not_found", "fatal: repository 'x' not found"),
+    ("network_unreachable", "fatal: unable to access 'http://h/': Could not resolve host: h"),
+    ("rate_limited", "fatal: unable to access 'http://h/': The requested URL returned error: 429"),
+    ("AUTH", "fatal: Authentication failed for 'http://h/'"),
+]
+
+
+@pytest.mark.parametrize("brk", _FAKE_BREAKS, ids=[repr(b) for b in _FAKE_BREAKS])
+@pytest.mark.parametrize("cause,payload", _SERVER_PAYLOADS)
+def test_odd_line_breaks_inside_a_remote_line_do_not_forge_a_line(
+    brk: str, cause: str, payload: str
+) -> None:
+    out = classify_fetch(res(128, "remote: hi" + brk + payload))
+    assert (out.kind, out.cause) == (FetchKind.FAILED, None)
+
+
+def test_a_real_newline_still_separates_lines_and_a_trailing_cr_is_stripped() -> None:
+    assert classify_fetch(res(128, "x\r\n" + NOT_FOUND + "\r\n")).cause == "repository_not_found"
+
+
+@pytest.mark.parametrize("brk", _FAKE_BREAKS, ids=[repr(b) for b in _FAKE_BREAKS])
+def test_the_message_line_is_not_split_on_odd_breaks(brk: str) -> None:
+    forged = "fatal: unable to access 'http://forged/': The requested URL returned error: 429"
+    err = "remote: hi" + brk + forged + "\n" + HTTP_ERR + "429\n" + NO_READ
+    r = res(128, err)
+    e = outcome_error(classify_fetch(r), r)
+    assert e is not None and e.message == f"git failed ({HTTP_ERR}429)"
+
+
+@pytest.mark.parametrize(
+    "stderr,matching",
+    [
+        (
+            "fatal: unable to access 'http://h/a.git/': Could not resolve host: h\n" + NO_READ,
+            "fatal: unable to access 'http://h/a.git/': Could not resolve host: h",
+        ),
+        (
+            "ssh: connect to host h port 22: Connection refused\n" + NO_READ,
+            "ssh: connect to host h port 22: Connection refused",
+        ),
+        (
+            "ssh: Could not resolve hostname h: Name or service not known\n" + NO_READ,
+            "ssh: Could not resolve hostname h: Name or service not known",
+        ),
+        # the matching line is not the first
+        (
+            "warning: something first\n" + NOT_FOUND + "\n" + NO_READ,
+            NOT_FOUND,
+        ),
+        (
+            "fatal: '/x/y.git' does not appear to be a git repository\n" + NO_READ,
+            "fatal: '/x/y.git' does not appear to be a git repository",
+        ),
+        # a curl line after a `remote:` line
+        (
+            "remote: Not so fast\n" + HTTP_ERR + "429\n" + NO_READ,
+            HTTP_ERR + "429",
+        ),
+    ],
+)
+def test_a_transport_failure_message_is_the_matching_line(stderr: str, matching: str) -> None:
+    r = res(128, stderr)
+    outcome = classify_fetch(r)
+    assert outcome.cause in TRANSPORT_CAUSES
+    e = outcome_error(outcome, r)
+    assert e is not None and e.message == f"git failed ({matching})"
