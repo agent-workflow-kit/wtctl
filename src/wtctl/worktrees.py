@@ -18,7 +18,14 @@ from typing import NamedTuple
 from . import sparse, urls
 from .errors import UsageError, WtctlError
 from .gitsetup import private_dir
-from .hardgit import Git, PorcelainError, WorktreeEntry, parse_config_list, parse_worktree_list
+from .hardgit import (
+    Git,
+    PorcelainError,
+    WorktreeEntry,
+    parse_config_list,
+    parse_ls_files_tagged,
+    parse_worktree_list,
+)
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 _HEAD_LINE = re.compile(r"([0-9a-f]{40}) (refs/heads/[^\n]+)\Z")
@@ -424,6 +431,35 @@ def sparse_checkout(git: Git, admin_dir: str, path: str, dirs: list[str]) -> Non
         last = r.err.strip().splitlines()[-1:] or ["failed"]
         why = "timed out" if r.timed_out else scrub_urls(last[0])
         raise create_failed(f"sparse checkout failed: {why}")
+    _verify_cone(git, admin_dir, path, dirs)
+
+
+def _verify_cone(git: Git, admin_dir: str, path: str, dirs: list[str]) -> None:
+    """The paths git left out (``S`` in ``ls-files -v``) must be exactly the tracked paths wtctl's
+    own cone excludes. They differ when git matches names more loosely than wtctl (a clone with
+    ``core.ignorecase`` or ``core.precomposeunicode``): later checks trust the cone, so a
+    checkout that disagrees with it is refused here rather than hide a deleted file."""
+    r = git.run(
+        ["ls-files", "-v", "-z"],
+        git_dir=admin_dir,
+        work_tree=path,
+        honor_filters=True,
+        timeout=ADD_TIMEOUT,
+    )
+    if r.returncode != 0 or r.timed_out:
+        raise create_failed("sparse checkout failed: cannot list the index")
+    try:
+        tagged = parse_ls_files_tagged(r.stdout)
+    except PorcelainError as exc:
+        raise create_failed(f"sparse checkout failed: {exc}") from exc
+    cone = sparse.Cone(dirs)
+    left_out = {p for tag, p in tagged if tag == "S"}
+    want = {p for _tag, p in tagged if not cone.includes(p)}
+    if left_out != want:
+        raise create_failed(
+            "sparse checkout does not match the requested directories "
+            "(case or unicode folding in the clone's git configuration?)"
+        )
 
 
 @dataclass(frozen=True)

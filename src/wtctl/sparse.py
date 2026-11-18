@@ -16,6 +16,9 @@ from .errors import UsageError
 MAX_DIRS = 256
 MAX_DIR_LENGTH = 1024
 MAX_COMPONENT = 255
+# The pattern file is a baseline item (a file larger than the baseline reader accepts would fail
+# create after the work is done), so the request is bounded here, before anything is written.
+MAX_PATTERN_BYTES = 1024 * 1024
 # What a gitignore-style pattern line would read as syntax, plus backslash.
 _FORBIDDEN = frozenset('*?[]\\!#"')
 
@@ -63,7 +66,8 @@ def normalize_dir(raw: str) -> str:
 
 def normalize(dirs: list[str]) -> list[str]:
     """The sorted, de-duplicated cone directories, without any that lies below another one (it
-    adds nothing and git writes no pattern for it). At least one, at most ``MAX_DIRS``."""
+    adds nothing and git writes no pattern for it). At least one, at most ``MAX_DIRS``, and a
+    pattern file of at most ``MAX_PATTERN_BYTES``."""
     if not dirs:
         raise UsageError("--sparse needs at least one directory")
     if len(dirs) > MAX_DIRS:
@@ -73,6 +77,8 @@ def normalize(dirs: list[str]) -> list[str]:
     for d in seen:
         if not any(d.startswith(k + "/") for k in kept):
             kept.append(d)
+    if len(pattern_file(kept)) > MAX_PATTERN_BYTES:
+        raise UsageError(f"--sparse: the pattern file would exceed {MAX_PATTERN_BYTES} bytes")
     return kept
 
 

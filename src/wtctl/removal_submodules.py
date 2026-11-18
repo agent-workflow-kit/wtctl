@@ -222,6 +222,7 @@ class _Walk:
         self.out.gitdirs.add(target)
         sub = dataclasses.replace(
             ctx.inp,
+            submodule=True,
             record={
                 **ctx.inp.record,
                 "path": os.path.join(self.inp.path, *parts),

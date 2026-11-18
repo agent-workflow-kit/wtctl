@@ -90,10 +90,14 @@ class Inputs:
     # unpushed_head details about submodules, found by nested_repos (which runs first)
     sub_unpushed: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     _pushed: dict[str, Pushed] = dataclasses.field(default_factory=dict)
+    # a submodule's checkout is never sparse by wtctl; it must not inherit its parent's cone
+    submodule: bool = False
 
     def cone(self) -> sparse.Cone | None:
         """The cone of a sparse worktree, from wtctl's own record (never from the admin area,
-        which an agent can write); None for a full checkout."""
+        which an agent can write); None for a full checkout and for a submodule."""
+        if self.submodule:
+            return None
         dirs = self.state.sparse_dirs(self.record["id"])
         return None if dirs is None else sparse.Cone(dirs)
 

@@ -392,7 +392,18 @@ def test_a_format_3_baseline_ignores_the_pattern_file(w: SW, capsys) -> None:  #
     w.db_exec("INSERT OR REPLACE INTO baseline_meta(record_id, format) VALUES (?, 3)", w.rid)
     (w.admin / "info").mkdir(exist_ok=True)
     (w.admin / "info" / "sparse-checkout").write_text("/*\n")
-    assert w.cli(capsys, "baseline", "check", w.rid).code == 0
+    r = w.cli(capsys, "baseline", "check", w.rid)
+    assert r.code == 0
+    d = r.json()
+    validate("wtctl/cli/baseline-check.json", d)
+    assert d["format"] == 3
+    assert [i["path"].endswith("/info/sparse-checkout") for i in d["new_coverage"]] == [True]
+
+
+def test_a_current_format_baseline_has_no_format_notice(w: SW, capsys) -> None:  # noqa: ANN001
+    w.sparse_start(capsys, "a/b")
+    d = w.cli(capsys, "baseline", "check", w.rid).json()
+    assert "format" not in d and "new_coverage" not in d
 
 
 def test_a_current_format_baseline_notices_a_planted_pattern_file(w: SW, capsys) -> None:  # noqa: ANN001
@@ -412,3 +423,74 @@ def test_git_made_sparse_worktree_still_needs_force(w: SW, capsys) -> None:  # n
     d = w.st(capsys)
     assert d["checks"]["tracked"]["status"] == "fail"
     assert {x for _, x in paths(d, "tracked")} >= {"hidden_changes"}
+
+
+# -- round 1 review ----------------------------------------------------------------------------
+
+
+def test_cone_size_cap_is_a_usage_error_before_anything_is_written(w: SW, capsys) -> None:  # noqa: ANN001
+    """Valid-looking deep directories would make a pattern file far past the baseline's file
+    limit; the request is refused up front, with exit 2 and nothing written."""
+    deep = "/".join("y" * 200 for _ in range(4))
+    dirs = [f"{'x' * 200}/{i}/{deep}" for i in range(256)]
+    with pytest.raises(UsageError):
+        sparse.normalize(dirs)
+    before = w.snapshot()
+    r = w.create(capsys, "--branch", "x", *[a for d in dirs for a in ("--sparse", d)])
+    assert r.code == 2, (r.out, r.err)
+    assert w.snapshot() == before
+
+
+def test_pattern_file_size_cap_leaves_ordinary_requests_alone() -> None:
+    assert len(sparse.pattern_file(sparse.normalize(["a/b"]))) < sparse.MAX_PATTERN_BYTES
+
+
+def test_create_with_bootstrap_keeps_a_current_baseline(w: SW, capsys) -> None:  # noqa: ANN001
+    w.start_built(capsys, "--sparse", "a/b", bootstrap=True)
+    assert w.record["sparse"] == ["a/b"]
+    assert w.rows("SELECT format FROM baseline_meta WHERE record_id = ?", w.rid)[0]["format"] == 4
+    assert w.cli(capsys, "baseline", "check", w.rid).code == 0
+    d = w.st(capsys)
+    assert d["would_remove"] is True and d["reason"] is None
+
+
+def test_case_folding_checkout_that_disagrees_with_the_cone_fails_create(w: SW, capsys) -> None:  # noqa: ANN001
+    """With core.ignorecase git checks out a/b for the request A/B while wtctl's cone says it is
+    outside: create fails (the record stays `creating` for reconcile, as for any failure after
+    the worktree was added) rather than record a cone that could hide a deleted file."""
+    w.g(["config", "core.ignorecase", "true"])
+    r = w.create(capsys, "--branch", "x", "--sparse", "A/B", "--no-bootstrap")
+    assert r.code == 12, (r.out, r.err)
+    e = r.json()["error"]
+    assert e["code"] == "create_failed"
+    assert "does not match the requested directories" in e["message"]
+    assert [x["state"] for x in w.records()] == ["creating"]
+
+
+def test_case_folding_agreeing_checkout_is_accepted(w: SW, capsys) -> None:  # noqa: ANN001
+    w.g(["config", "core.ignorecase", "true"])
+    w.sparse_start(capsys, "a/b")
+    assert "a/b/deep.txt" in w.disk()
+    assert w.skipped() == w.tracked() - {p for p in w.tracked() if sparse.Cone(["a/b"]).includes(p)}
+
+
+def test_a_submodule_of_a_sparse_worktree_has_no_cone_of_its_own(w: SW, capsys) -> None:  # noqa: ANN001
+    """A skip-worktree bit on a submodule file is a hidden change even when the file's path
+    inside the submodule would be outside the parent's cone."""
+    from tests.test_removal_submodules import FILE_ALLOW, add_sub, bare_origin
+
+    origin = bare_origin(w, "sub")
+    src = w.tmp / "sub-src"
+    (src / "d").mkdir()
+    (src / "d" / "x.txt").write_text("x")
+    w.g(["add", "."], src)
+    w.g(["commit", "-q", "-m", "more"], src)
+    w.g(["push", "-q", str(origin), "main"], src)
+    del FILE_ALLOW
+    w.sparse_start(capsys, "vendor/sub")
+    sub = add_sub(w, capsys, origin)
+    w.g(["update-index", "--skip-worktree", "d/x.txt"], sub)
+    d = w.st(capsys)
+    detail = {"detail": "submodule", "path": "vendor/sub", "reason": "hidden_changes"}
+    assert detail in d["checks"]["nested_repos"]["details"], d["checks"]["nested_repos"]
+    assert (d["would_remove"], d["reason"]) == (False, "dirty")

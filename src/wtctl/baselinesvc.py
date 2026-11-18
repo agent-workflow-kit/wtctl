@@ -264,10 +264,10 @@ def new_coverage(
     current: Baseline,
     git: Git | LazyGit | None = None,
 ) -> list[dict[str, Any]]:
-    """For a format 1 or 2 record whose baseline matched: what a ``baseline accept`` would change
+    """For a format 1 to 3 record whose baseline matched: what a ``baseline accept`` would change
     (the current collector's items that the recording one did not emit, or emitted differently),
-    as ``baseline_item`` rows. Empty for a format 3 record."""
-    if skips_linked(state, record["id"]):
+    as ``baseline_item`` rows. Empty for a format 4 record."""
+    if covers_sparse(state, record["id"]):
         return []
     items = recorded_items(state, record["id"])
     full = compute(
