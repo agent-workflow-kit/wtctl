@@ -1167,7 +1167,7 @@
                       "mount_point",
                       "incomplete"
                     ],
-                    "description": "nested_repo: a .git found at path (not a recorded bootstrap_nested entry); submodule: the .git file of an initialized submodule (listed in .gitmodules at HEAD, pointing under <admin_dir>/modules/ or <common>/modules/), files below a gitlink path that has no .git (path: the gitlink), or a git dir under <admin_dir>/modules or <common>/modules (path: its absolute path); v1 has no recursive check, so only a human --force removes it; mount_point: a mount point below the worktree root (a directory on another device or, on Linux, another mount), which no walk crosses; incomplete: the walk exceeded remove.nested_scan_limit (path null)."
+                    "description": "nested_repo: a .git found at path (not a recorded bootstrap_nested entry); submodule: an initialized submodule that is refused (path: the submodule; reason says why, see interface.md Content checks), a .git file of a submodule listed in .gitmodules at HEAD that no gitlink of the index accounts for, files below a gitlink path that has no .git (path: the gitlink), or a git dir under <admin_dir>/modules or <common>/modules that no checked submodule claims (path: its absolute path); a clean, pushed submodule passes; mount_point: a mount point below the worktree root (a directory on another device or, on Linux, another mount), which no walk crosses; incomplete: the walk exceeded remove.nested_scan_limit (path null)."
                   },
                   "path": {
                     "type": [
@@ -1177,6 +1177,26 @@
                     "minLength": 1,
                     "x-untrusted": true,
                     "description": "Untrusted: a path inside the worktree, relative to its root; agents choose such names."
+                  },
+                  "reason": {
+                    "enum": [
+                      "gitdir",
+                      "unreadable",
+                      "too_deep",
+                      "too_many",
+                      "deadline",
+                      "tracked",
+                      "untracked",
+                      "ignored",
+                      "hidden_changes",
+                      "attributes",
+                      "stash",
+                      "refs",
+                      "worktrees",
+                      "gitlink_changed",
+                      "gitlink_contents"
+                    ],
+                    "description": "With detail submodule on an initialized submodule: gitdir: the .git file or git directory failed verification (not below the expected modules directory, a link, alternates, commondir, claimed twice, malformed); unreadable: a git command or read failed; too_deep, too_many, deadline: a recursion bound was reached; tracked, untracked, ignored, hidden_changes, attributes, stash: the submodule is dirty as in the check of that name; refs: a ref outside refs/heads, refs/remotes, refs/tags, or a ref listing past the bound; worktrees: the submodule git dir has linked worktrees; gitlink_changed: the superproject's index and HEAD disagree on the submodule's commit; gitlink_contents: files below a nested uninitialized gitlink."
                   }
                 },
                 "additionalProperties": false,
@@ -1312,9 +1332,16 @@
                     "enum": [
                       "not_reachable",
                       "ancestry_unverified",
-                      "head_moved"
+                      "head_moved",
+                      "submodule_unpushed"
                     ],
-                    "description": "not_reachable: the commit is missing from the mirror or is not an ancestor of any mirror refs/heads tip; ancestry_unverified: the content-verified ancestry check failed (interface: Reachability); head_moved: HEAD changed after the confirmation (remove step 9; sha is the new HEAD)."
+                    "description": "not_reachable: the commit is missing from the mirror or is not an ancestor of any mirror refs/heads tip; ancestry_unverified: the content-verified ancestry check failed (interface: Reachability); head_moved: HEAD changed after the confirmation (remove step 9; sha is the new HEAD). submodule_unpushed: a submodule's HEAD, a local branch tip or a commit reachable from a tag differs from the commit the superproject's HEAD records, or is not reachable from a remote-tracking ref of the submodule (sha is that commit; submodule names it)."
+                  },
+                  "submodule": {
+                    "type": "string",
+                    "minLength": 1,
+                    "x-untrusted": true,
+                    "description": "Untrusted: with detail submodule_unpushed, the submodule's path relative to the worktree root."
                   }
                 },
                 "additionalProperties": false,

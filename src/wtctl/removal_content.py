@@ -83,6 +83,8 @@ class Inputs:
     merged_head: str | None = None
     budget: Any = None
     warnings: list[str] = dataclasses.field(default_factory=list)
+    # unpushed_head details about submodules, found by nested_repos (which runs first)
+    sub_unpushed: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     _pushed: dict[str, Pushed] = dataclasses.field(default_factory=dict)
 
     @property
@@ -409,10 +411,16 @@ def nested_repos(inp: Inputs) -> dict[str, Any]:
     for parts in res.value["mounts"]:
         details.append({"detail": "mount_point", "path": _text("/".join(parts))})
     gits = [g for g in res.value["gits"] if g["path"] != [".git"]]
+    gits = [g for g in gits if "/".join(g["path"]) not in created.nested]
+    from . import removal_submodules
+
+    sub = removal_submodules.check(inp, gits)
+    inp.sub_unpushed = sub.unpushed
+    details += sub.dirty
     subs: set[str] | None = None
     for g in gits:
         rel = "/".join(g["path"])
-        if rel in created.nested:
+        if sub.covers(tuple(g["path"])):
             continue
         parent = "/".join(g["path"][:-1])
         kind = "nested_repo"
@@ -422,7 +430,7 @@ def nested_repos(inp: Inputs) -> dict[str, Any]:
             if parent in subs and _points_into_modules(g["content"], inp, parent):
                 kind = "submodule"
         details.append({"detail": kind, "path": _text(rel)})
-    details += gitlink_contents(inp) + module_git_dirs(inp)
+    details += gitlink_contents(inp) + module_git_dirs(inp, sub.gitdirs)
     details.sort(key=lambda d: (d["detail"], d["path"] or ""))
     return check("fail" if details else "pass", details)
 
@@ -448,7 +456,9 @@ def gitlink_contents(inp: Inputs) -> list[dict[str, Any]]:
 MODULES_MAX_DEPTH = 64
 
 
-def module_git_dirs(inp: Inputs) -> list[dict[str, Any]]:
+def module_git_dirs(
+    inp: Inputs, accounted: frozenset[str] | set[str] = frozenset()
+) -> list[dict[str, Any]]:
     """Git dirs below ``<admin_dir>/modules`` and ``<common>/modules``: a submodule's repository
     lives there, with any commits not pushed anywhere, and removal deletes the admin entry whether
     or not the submodule's checkout (and so its ``.git`` file) is still there."""
@@ -476,7 +486,9 @@ def module_git_dirs(inp: Inputs) -> list[dict[str, Any]]:
                     os.close(fd)
     except fsafe.FsafeError:
         incomplete = True
-    out: list[dict[str, Any]] = [{"detail": "submodule", "path": _text(p)} for p in found]
+    out: list[dict[str, Any]] = [
+        {"detail": "submodule", "path": _text(p)} for p in found if p not in accounted
+    ]
     if incomplete:
         out.append({"detail": "incomplete", "path": None})
     return out
@@ -594,12 +606,13 @@ def merged_head_ok(inp: Inputs, head: str) -> bool:
 
 
 def unpushed_head(inp: Inputs, head: str) -> dict[str, Any]:
+    extra = [dict(d) for d in inp.sub_unpushed]
     if inp.tips is None:
-        return skipped()
+        return check("fail", extra) if extra else skipped()
     p = inp.pushed(head)
     if p.pushed or merged_head_ok(inp, head):
-        return check("pass")
-    return check("fail", [{"sha": head, "detail": _pushed_detail(p)}])
+        return check("fail", extra) if extra else check("pass")
+    return check("fail", [{"sha": head, "detail": _pushed_detail(p)}, *extra])
 
 
 def _epoch(ts: str) -> float | None:
