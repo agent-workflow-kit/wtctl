@@ -968,7 +968,7 @@
                       "hidden_changes",
                       "attributes"
                     ],
-                    "description": "attributes: the clone's info/attributes file (path info/attributes) is not empty; git applies it to every worktree and it can make an edit invisible to git status (only a human --force removes such a worktree in v1). changed: a staged, unstaged or conflicted change reported by git status, or a file, link or special file where a gitlink's directory belongs; hidden_changes: the index entry has the assume-unchanged or skip-worktree bit (ls-files -v tag lowercase, S or s), which hides edits from git status (also every path outside a sparse-checkout cone; only a human --force removes such a worktree in v1)."
+                    "description": "attributes: the clone's info/attributes file (path info/attributes) is not empty; git applies it to every worktree and it can make an edit invisible to git status (only a human --force removes such a worktree in v1). changed: a staged, unstaged or conflicted change reported by git status, or a file, link or special file where a gitlink's directory belongs; hidden_changes: the index entry has the assume-unchanged or skip-worktree bit (ls-files -v tag lowercase, S or s), which hides edits from git status (also every path outside the cone of a sparse checkout git made; a worktree made by create --sparse excludes the paths outside its recorded cone, see interface.md Sparse checkouts)."
                   }
                 },
                 "additionalProperties": false,

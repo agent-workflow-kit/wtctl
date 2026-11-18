@@ -70,9 +70,7 @@ def test_normalize_trims_sorts_dedups_and_drops_nested() -> None:
 
 
 def test_pattern_file_is_what_git_writes_for_a_cone() -> None:
-    assert sparse.pattern_file(["a/b", "c"]).decode() == (
-        "/*\n!/*/\n/a/\n!/a/*/\n/a/b/\n/c/\n"
-    )
+    assert sparse.pattern_file(["a/b", "c"]).decode() == ("/*\n!/*/\n/a/\n!/a/*/\n/a/b/\n/c/\n")
 
 
 def test_cone_membership() -> None:
@@ -237,7 +235,7 @@ def test_a_missing_directory_is_fine_and_leaves_the_top_files(w: SW, capsys) -> 
     assert w.st(capsys)["would_remove"] is True
 
 
-# -- content checks: nothing hides behind the skip-worktree bits ------------------------------------
+# -- content checks: nothing hides behind the skip-worktree bits ---
 
 
 def test_edit_inside_the_cone_is_dirty(w: SW, capsys) -> None:  # noqa: ANN001
@@ -404,7 +402,7 @@ def test_a_current_format_baseline_notices_a_planted_pattern_file(w: SW, capsys)
     assert w.cli(capsys, "baseline", "check", w.rid).code == 20
 
 
-# -- a worktree that git made sparse is not a wtctl cone ---------------------------------------------
+# -- a worktree that git made sparse is not a wtctl cone ---
 
 
 def test_git_made_sparse_worktree_still_needs_force(w: SW, capsys) -> None:  # noqa: ANN001

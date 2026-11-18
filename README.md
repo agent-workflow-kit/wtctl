@@ -45,7 +45,7 @@ wtctl extract <id> --files-from changed.txt --dest /tmp/review-out
 
 ```text
 wtctl create --repo <id> [--branch B | --detach] [--base BRANCH] [--ref SHA] [--name N] [--holder H]
-             [--label k=v]... [--no-bootstrap] [--copy-env] [--hook NAME=CMD]... [--override-escalation]
+             [--label k=v]... [--no-bootstrap] [--copy-env] [--sparse DIR]... [--hook NAME=CMD]... [--override-escalation]
 wtctl create --throwaway --repo <id> --ref SHA [--source auto|local|remote] [--depth N] [--label k=v]...
              [--hook NAME=CMD]... [--override-escalation]
 wtctl list [--repo <id>] [--label k=v]... [--throwaways | --worktrees] [--older-than D] [--state S]... [--all]
