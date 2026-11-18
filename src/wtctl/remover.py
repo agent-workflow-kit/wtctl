@@ -67,6 +67,15 @@ def _escape(text: str) -> str:
     return fsafe.escape_for_details(text)
 
 
+def _submodule_details(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The findings about submodules: what the step-9 re-check compares (the other
+    ``nested_repos`` findings are not re-checked). An ``incomplete`` detail is one: a submodule
+    check that could not finish must not pass the re-check."""
+    return [
+        d for d in details if d.get("detail") in ("submodule", "submodule_unpushed", "incomplete")
+    ]
+
+
 def _details_key(details: list[dict[str, Any]]) -> set[str]:
     return {json.dumps(d, sort_keys=True) for d in details}
 
@@ -335,6 +344,12 @@ class Remover:
         self.overridden = [n for n in removal_status.FORCEABLE if n in self.overridden]
         for name in (*RECHECKED, "held"):
             self.step6[name] = _details_key(self.checks[name]["details"])
+        self.step6["nested_repos"] = _details_key(
+            _submodule_details(self.checks["nested_repos"]["details"])
+        )
+        self.step6["unpushed_head"] = _details_key(
+            _submodule_details(self.checks["unpushed_head"]["details"])
+        )
 
     # -- step 7 -------------------------------------------------------------------------------
 
@@ -439,6 +454,9 @@ class Remover:
             head = removal_content.head_sha(inp)
             results = removal_content.tracked_untracked_ignored(inp)
             results["stash"] = removal_content.stash(inp, head)
+            nested = removal_content.nested_repos(inp)
+            sub_dirty = _submodule_details(nested["details"])
+            sub_unpushed = _submodule_details(inp.sub_unpushed)
         except fsafe.FsafeError as exc:
             raise self._unlinked(
                 f"{_escape(self.rec['path'])} changed while it was re-checked ({exc.kind})"
@@ -455,9 +473,25 @@ class Remover:
             if added:
                 new = True
                 shown[name] = {"status": "fail", "details": added}
+        added = [
+            d for d in sub_dirty if json.dumps(d, sort_keys=True) not in self.step6["nested_repos"]
+        ]
+        if added:
+            new = True
+            shown["nested_repos"] = {"status": "fail", "details": added}
         if new:
             self.checks.update(shown)
             raise self._refuse("dirty", f"{self.rid} changed after the checks: new changes found")
+        added = [
+            d
+            for d in sub_unpushed
+            if json.dumps(d, sort_keys=True) not in self.step6["unpushed_head"]
+        ]
+        if added:
+            self.checks["unpushed_head"] = {"status": "fail", "details": added}
+            raise self._refuse(
+                "unpushed", f"a submodule of {self.rid} has commits that are not pushed"
+            )
         if head != self.head:
             self.checks["unpushed_head"] = {
                 "status": "fail",

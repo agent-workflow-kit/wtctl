@@ -413,7 +413,7 @@ def test_nested_repo_recorded_by_bootstrap_is_exempt(w: RW, capsys) -> None:  # 
     assert [x["path"] for x in d["checks"]["nested_repos"]["details"]] == ["node_modules/.git"]
 
 
-def test_initialized_submodule_is_reported_as_submodule(w: RW, capsys, tmp_path: Path) -> None:  # noqa: ANN001
+def test_initialized_clean_submodule_is_checked_not_refused(w: RW, capsys, tmp_path: Path) -> None:  # noqa: ANN001
     w.start(capsys)
     sub = tmp_path / "subsrc"
     sub.mkdir()
@@ -426,9 +426,8 @@ def test_initialized_submodule_is_reported_as_submodule(w: RW, capsys, tmp_path:
     )
     w.g(["commit", "-q", "-m", "add submodule"], w.wt)
     d = w.st(capsys)
-    assert {"detail": "submodule", "path": "vendor/sub/.git"} in d["checks"]["nested_repos"][
-        "details"
-    ]
+    # checked recursively since #30 (tests/test_removal_submodules.py): clean and pushed passes
+    assert d["checks"]["nested_repos"] == {"status": "pass", "details": []}
 
 
 def test_a_dotgit_file_pointing_outside_modules_is_a_nested_repo_not_a_submodule(  # noqa: ANN201
