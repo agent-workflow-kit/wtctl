@@ -645,6 +645,11 @@ def test_too_many_nested_tags_refuse_with_refs(
     w.g(["tag", "-a", "-m", "m", "a", "HEAD"], sub)
     w.g(["tag", "-a", "-m", "m", "b", "a"], sub)
     w.g(["tag", "-a", "-m", "m", "c", "a"], sub)
+    # Newer git peels nested tags fully in %(*objecttype), so the one-by-one resolve path (and its
+    # cap) is unreachable there; only older git reports a tag-of-a-tag as `tag`.
+    peeled = w.g(["for-each-ref", "--format=%(*objecttype)", "refs/tags/b"], sub)
+    if peeled != "tag":
+        pytest.skip("git peels nested tags fully; the one-by-one resolve path is unreachable")
     monkeypatch.setattr(removal_submodules, "MAX_TAG_RESOLVES", 1)
     assert_refused_dirty(w.st(capsys), SUB, "refs")
 
