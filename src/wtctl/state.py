@@ -139,12 +139,24 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 format INTEGER NOT NULL)""",
         ),
     ),
+    (
+        3,
+        (
+            # the cone directories of a sparse worktree (docs/interface.md, Sparse checkouts);
+            # no row: the worktree is not sparse
+            """CREATE TABLE sparse_dirs (
+                record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                dir TEXT NOT NULL, PRIMARY KEY (record_id, dir))""",
+        ),
+    ),
 )
 
 # The format of every baseline wtctl records now; a record without a baseline_meta row is 1.
 # 2: symlink targets are followed (#64, #68); 3: verified linked worktrees beneath the walked tree
 # are skipped and recorded as ``linked-worktree`` items (#71).
-BASELINE_FORMAT = 3
+# 4: the admin entry's ``info/sparse-checkout`` is an item when it exists (#31).
+BASELINE_FORMAT = 4
+LINKED_BASELINE_FORMAT = 3
 LINKS_BASELINE_FORMAT = 2
 LEGACY_BASELINE_FORMAT = 1
 
@@ -446,7 +458,26 @@ class State:
             r[0]
             for r in self._conn.execute("SELECT holder FROM holders WHERE record_id = ?", (rid,))
         )
+        rec["sparse"] = self.sparse_dirs(rid)
         return rec
+
+    def sparse_dirs(self, record_id: str) -> list[str] | None:
+        """The cone directories of a sparse worktree, sorted; None when it is not sparse."""
+        dirs = sorted(
+            r[0]
+            for r in self._conn.execute(
+                "SELECT dir FROM sparse_dirs WHERE record_id = ?", (record_id,)
+            )
+        )
+        return dirs or None
+
+    def set_sparse(self, record_id: str, dirs: list[str]) -> None:
+        with self._txn() as c:
+            c.execute("DELETE FROM sparse_dirs WHERE record_id = ?", (record_id,))
+            c.executemany(
+                "INSERT INTO sparse_dirs(record_id, dir) VALUES (?, ?)",
+                [(record_id, d) for d in dirs],
+            )
 
     def label_rows(self, record_id: str) -> list[labelmod.Pair]:
         return [

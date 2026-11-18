@@ -580,7 +580,7 @@ def test_golden_json_shape(w: CW, capsys) -> None:  # noqa: ANN001
         "name": "golden", "branch": "wt/golden", "created_branch": True,
         "base": "refs/heads/main", "base_sha": w.shas["c3"], "head_at_create": w.shas["c3"],
         "ref": None, "source": None, "depth": None, "fetch_url": str(w.remote),
-        "remote": "origin", "labels": ["k=v"], "holders": ["h"],
+        "remote": "origin", "labels": ["k=v"], "holders": ["h"], "sparse": None,
         "bootstrap": {"state": "none", "steps": [], "created_paths_count": 0},
         "missing_since": None, "removed_at": None, "last_error": None,
     }  # fmt: skip

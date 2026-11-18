@@ -127,6 +127,7 @@ def _rerecord(ctx: Context, record: Record, git: Git) -> Record:
         record,
         links=baselinesvc.follows_links(ctx.state, record["id"]),
         linked=baselinesvc.skips_linked(ctx.state, record["id"]),
+        sparse=baselinesvc.covers_sparse(ctx.state, record["id"]),
         git=git,
     )
     if current.has_detail():

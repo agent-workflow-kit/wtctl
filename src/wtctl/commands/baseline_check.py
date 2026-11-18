@@ -26,8 +26,8 @@ def run(ctx: Context) -> Result:
         "recorded_digest": baselinesvc.recorded_digest(record),
     }
     notice = f"{record['name']}: baseline unchanged"
-    if not baselinesvc.skips_linked(ctx.state, record["id"]):
-        # a format 1 or 2 baseline: unchanged by its own rules; say what accept would newly cover
+    if not baselinesvc.covers_sparse(ctx.state, record["id"]):
+        # a format 1 to 3 baseline: unchanged by its own rules; say what accept would newly cover
         data["format"] = ctx.state.baseline_format(record["id"])
         added = baselinesvc.new_coverage(ctx.config, ctx.state, record, current, git)
         if added:

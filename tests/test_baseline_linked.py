@@ -604,3 +604,25 @@ def test_lazy_git_caches_a_failed_open() -> None:
         lazy.get()
     assert len(attempts) == 1
     assert second.value is first.value
+
+
+class _Formats:
+    def __init__(self, fmt: int) -> None:
+        self.fmt = fmt
+
+    def baseline_format(self, record_id: str) -> int:
+        return self.fmt
+
+
+@pytest.mark.parametrize(
+    ("fmt", "links", "linked", "sparse"),
+    [(1, False, False, False), (2, True, False, False), (3, True, True, False),
+     (4, True, True, True)],
+)  # fmt: skip
+def test_each_baseline_format_turns_on_exactly_its_own_coverage(
+    fmt: int, links: bool, linked: bool, sparse: bool
+) -> None:
+    st = _Formats(fmt)
+    assert baselinesvc.follows_links(st, "r") is links
+    assert baselinesvc.skips_linked(st, "r") is linked
+    assert baselinesvc.covers_sparse(st, "r") is sparse

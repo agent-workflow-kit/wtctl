@@ -28,6 +28,7 @@
   "holders": [
    "agent-1"
   ],
+  "sparse": null,
   "baseline_digest": "<baseline_digest>",
   "bootstrap": {
    "state": "none",

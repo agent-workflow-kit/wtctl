@@ -938,3 +938,18 @@ def test_adopt_json_output_validates(w: CW, capsys) -> None:  # noqa: ANN001
     r = adopt(w, capsys, foreign(w))
     validate("wtctl/cli/adopt.json", r.json())
     validate("wtctl/cli/record.json", r.json()["record"])
+
+
+def test_adopting_a_git_made_sparse_worktree_records_no_cone(w: CW, capsys) -> None:  # noqa: ANN001
+    """Conservative reading (#31): adopt records it, but as a full checkout. wtctl keeps no cone
+    for it, so every skip-worktree entry is reported by the content checks (hidden_changes)."""
+    path = foreign(w)
+    w.g(["sparse-checkout", "set", "--no-cone", "c1.txt"], path)
+    rec = rec_of(w, capsys, path)
+    assert rec["sparse"] is None and rec["owned"] is False
+    assert w.cli(capsys, "baseline", "check", rec["id"]).code == 0
+    r = w.cli(capsys, "status", rec["id"])
+    assert r.code == 0
+    tracked = r.json()["checks"]["tracked"]
+    assert tracked["status"] == "fail"
+    assert "hidden_changes" in {d["detail"] for d in tracked["details"]}

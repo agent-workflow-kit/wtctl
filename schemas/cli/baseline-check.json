@@ -21,9 +21,10 @@
     "format": {
       "enum": [
         1,
-        2
+        2,
+        3
       ],
-      "description": "Present only for a record whose baseline was recorded in an older format: 1 before symlink targets were covered, 2 before verified linked worktrees beneath the worktree were skipped. It is compared by the collector that recorded it; baseline accept re-records it as format 3."
+      "description": "Present only for a record whose baseline was recorded in an older format: 1 before symlink targets were covered, 2 before verified linked worktrees beneath the worktree were skipped, 3 before the admin entry's info/sparse-checkout was covered. It is compared by the collector that recorded it; baseline accept re-records it as format 4."
     },
     "uncovered": {
       "type": "array",
@@ -40,7 +41,7 @@
       "items": {
         "$ref": "../defs.json#/$defs/baseline_item"
       },
-      "description": "Only with format, and only when not empty: the items a baseline accept would add or change (symlink targets, linked-worktree items and the directory items that stop listing a linked worktree); one with a detail would block it. A notice, never a failure."
+      "description": "Only with format, and only when not empty: the items a baseline accept would add or change (symlink targets, linked-worktree items, the directory items that stop listing a linked worktree and the info/sparse-checkout item); one with a detail would block it. A notice, never a failure."
     }
   },
   "additionalProperties": false,

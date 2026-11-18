@@ -358,11 +358,14 @@ def test_real_concurrent_upgrade_of_a_version_1_database(tmp_path: Path, worker:
     conn.close()
     procs = [spawn(worker, "open", "-") for _ in range(8)]
     outs = finish(procs)
-    assert all(o.startswith("open 2") for o in outs)
+    assert all(o.startswith(f"open {len(MIGRATIONS)}") for o in outs)
     check = sqlite3.connect(path)
     try:
-        assert check.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 2
+        assert check.execute("SELECT max(version) FROM schema_version").fetchone()[0] == len(
+            MIGRATIONS
+        )
         check.execute("SELECT count(*) FROM baseline_meta")
+        check.execute("SELECT count(*) FROM sparse_dirs")
     finally:
         check.close()
 

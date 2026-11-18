@@ -39,7 +39,7 @@ def test_open_from_empty_creates_every_table(tmp_path: Path) -> None:
     assert {
         "records", "holders", "labels", "stash_ids", "baseline_items", "bootstrap_paths",
         "bootstrap_nested", "bootstrap_runs", "clones", "anchors", "leases", "schema_version",
-        "ids",
+        "ids", "sparse_dirs",
     } <= names  # fmt: skip
     assert st.schema_version == len(MIGRATIONS)
 

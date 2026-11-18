@@ -85,6 +85,7 @@ def parse_options(ctx: Context) -> Options:
         (a.holder, "--holder"),
         (a.copy_env, "--copy-env"),
         (a.no_bootstrap, "--no-bootstrap"),
+        (a.sparse or None, "--sparse"),
     ):
         if value not in (None, False):
             raise UsageError(f"{flag} is not accepted with --throwaway")

@@ -26,6 +26,7 @@ from .. import (
     worktrees,
 )
 from .. import labels as labelmod
+from .. import sparse as sparsemod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError, bootstrap_failed_details
 from ..gitsetup import open_git, with_filters
@@ -54,8 +55,8 @@ EMPTY_BOOTSTRAP = {"state": "none", "steps": [], "created_paths_count": 0}
 FIELDS = (
     "id object_type owned state repo clone_path common_dir common_id admin_dir dir_id base_dir "
     "root_id path name branch created_branch base base_sha head_at_create ref source depth "
-    "fetch_url remote labels holders baseline_digest bootstrap created updated missing_since "
-    "removed_at last_error"
+    "fetch_url remote labels holders sparse baseline_digest bootstrap created updated "
+    "missing_since removed_at last_error"
 ).split()
 
 
@@ -88,6 +89,7 @@ class Options:
     no_bootstrap: bool
     copy_env: bool
     override_escalation: bool
+    sparse: list[str]  # normalized cone directories; empty: a full checkout
 
 
 def _no_option_like(value: str, what: str) -> None:
@@ -113,6 +115,7 @@ def parse_options(ctx: Context) -> Options:
     if a.branch is not None:
         _no_option_like(a.branch, "--branch")
     labelmod.merge_labels((), a.label)
+    sparse_dirs = sparsemod.normalize(a.sparse) if a.sparse else []
     hook_flags = hooks.parse_hook_flags(a.hook)
     for name in hook_flags:
         if name not in CREATE_HOOKS:
@@ -130,6 +133,7 @@ def parse_options(ctx: Context) -> Options:
         no_bootstrap=a.no_bootstrap,
         copy_env=a.copy_env,
         override_escalation=a.override_escalation,
+        sparse=sparse_dirs,
     )
 
 
@@ -812,7 +816,12 @@ class Creator:
                 worktrees.write_upstream(
                     self.git, common, plan.branch, self.settings.remote, written
                 )
-            spec = AddSpec(self.path, plan.branch, None if plan.branch else start)
+            spec = AddSpec(
+                self.path,
+                plan.branch,
+                None if plan.branch else start,
+                no_checkout=bool(self.o.sparse),
+            )
             try:
                 worktrees.worktree_add(git, common, spec)
             finally:
@@ -833,6 +842,18 @@ class Creator:
                 reflog_start_sha=info.reflog_start_sha,
             )
             self.state.set_stash_ids(record["id"], info.stash_ids)
+            if self.o.sparse:
+                # recorded before the files are written, so a create that dies half-way leaves
+                # the cone for the content checks of the `creating` record's cleanup
+                self.state.set_sparse(record["id"], self.o.sparse)
+                worktrees.sparse_checkout(git, info.admin_dir, self.path, self.o.sparse)
+                try:
+                    worktrees.verify_cone(git, info.admin_dir, self.path, self.o.sparse)
+                except BaseException:
+                    # the checkout disagrees with the cone: a cone that is not trusted must not
+                    # be left for reconcile to adopt (the S tags then report hidden changes)
+                    self.state.set_sparse(record["id"], [])
+                    raise
         except BaseException as exc:
             if added:
                 # The worktree exists: branch, directory and the `creating` record stay for
@@ -1227,6 +1248,7 @@ class Creator:
             **fields,
             "labels": labelmod.render(labelmod.merge_labels((), self.o.labels)),
             "holders": [self.o.holder] if self.o.holder else [],
+            "sparse": list(self.o.sparse) or None,
             "bootstrap_state": "none",
             "created": now,
             "updated": now,

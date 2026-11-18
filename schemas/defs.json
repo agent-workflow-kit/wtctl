@@ -968,7 +968,7 @@
                       "hidden_changes",
                       "attributes"
                     ],
-                    "description": "attributes: the clone's info/attributes file (path info/attributes) is not empty; git applies it to every worktree and it can make an edit invisible to git status (only a human --force removes such a worktree in v1). changed: a staged, unstaged or conflicted change reported by git status, or a file, link or special file where a gitlink's directory belongs; hidden_changes: the index entry has the assume-unchanged or skip-worktree bit (ls-files -v tag lowercase, S or s), which hides edits from git status (also every path outside a sparse-checkout cone; only a human --force removes such a worktree in v1)."
+                    "description": "attributes: the clone's info/attributes file (path info/attributes) is not empty; git applies it to every worktree and it can make an edit invisible to git status (only a human --force removes such a worktree in v1). changed: a staged, unstaged or conflicted change reported by git status, or a file, link or special file where a gitlink's directory belongs; hidden_changes: the index entry has the assume-unchanged or skip-worktree bit (ls-files -v tag lowercase, S or s), which hides edits from git status (also every path outside the cone of a sparse checkout git made; a worktree made by create --sparse excludes the paths outside its recorded cone, see interface.md Sparse checkouts)."
                   }
                 },
                 "additionalProperties": false,
@@ -1698,6 +1698,25 @@
           "uniqueItems": true,
           "description": "Sorted holders added by create --holder and adopt --holder (owned and adopted worktrees); remove refuses held while another holder remains. Empty for throwaways."
         },
+        "sparse": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "minItems": 1,
+              "maxItems": 256,
+              "uniqueItems": true
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The cone directories of a sparse worktree made by create --sparse (sorted, normalized, none below another): only the top directory's files, everything below these directories and the files directly in the directories leading to them are checked out. Null for a full checkout, for an adopted worktree and for throwaways."
+        },
         "baseline_digest": {
           "oneOf": [
             {
@@ -1785,6 +1804,7 @@
         "remote",
         "labels",
         "holders",
+        "sparse",
         "baseline_digest",
         "bootstrap",
         "created",
@@ -1851,6 +1871,9 @@
               },
               "holders": {
                 "maxItems": 0
+              },
+              "sparse": {
+                "type": "null"
               },
               "ref": {
                 "$ref": "#/$defs/sha"

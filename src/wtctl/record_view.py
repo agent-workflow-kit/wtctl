@@ -10,8 +10,8 @@ from .state import Record, State
 FIELDS = (
     "id object_type owned state repo clone_path common_dir common_id admin_dir dir_id base_dir "
     "root_id path name branch created_branch base base_sha head_at_create ref source depth "
-    "fetch_url remote labels holders baseline_digest bootstrap created updated missing_since "
-    "removed_at last_error"
+    "fetch_url remote labels holders sparse baseline_digest bootstrap created updated "
+    "missing_since removed_at last_error"
 ).split()
 
 
