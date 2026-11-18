@@ -378,6 +378,24 @@ class DeadlineResult:
     cancelled: bool = False
 
 
+_REAP_TIMEOUT = 10.0  # seconds to collect a killed child's output (expiry, and every other kill)
+_CANCEL_REAP_TIMEOUT = 1.0  # the same after a cancel: the caller is waiting to quit
+
+
+def _reap_and_close(proc: subprocess.Popen[bytes]) -> None:
+    """Wait (bounded) for the exact, already killed child and close its pipes."""
+    try:
+        proc.wait(timeout=_REAP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        pass
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
 def run_with_deadline(
     argv: list[str],
     *,
@@ -417,24 +435,21 @@ def run_with_deadline(
                 if not cancelled and time.monotonic() < deadline:
                     continue
                 proc.kill()
+                # A cancel (the user quit or pressed `c`) must not wait long for a grandchild
+                # that keeps the pipes open: only the exact child is signalled (a git process it
+                # started is not), so reap it, drop the pipes and report empty output.
+                reap = _CANCEL_REAP_TIMEOUT if cancelled else _REAP_TIMEOUT
                 try:
-                    out, err = proc.communicate(timeout=10)
+                    out, err = proc.communicate(timeout=reap)
                 except subprocess.TimeoutExpired:  # still stuck in the kernel: report, never block
                     out, err = b"", b""
+                    if cancelled:
+                        _reap_and_close(proc)
                 return DeadlineResult(proc.pid, None, out, err, not cancelled, cancelled)
     except BaseException:
         # on_start raised or we were interrupted: never leave the child running
         proc.kill()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        for pipe in (proc.stdin, proc.stdout, proc.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+        _reap_and_close(proc)
         raise
 
 

@@ -396,3 +396,105 @@ def test_run_with_deadline_cancel_unset_still_returns_output_and_expires() -> No
         [sys.executable, "-c", "import time; time.sleep(600)"], timeout=0.5, cancel=cancel
     )
     assert slow.timed_out and not slow.cancelled
+
+
+_STUBBORN = (
+    "import signal, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "time.sleep(600)\n"
+)  # ignores SIGTERM: only SIGKILL stops it
+
+
+def test_run_with_deadline_kills_a_sigterm_ignoring_child_on_expiry() -> None:
+    r = gateway.run_with_deadline([sys.executable, "-c", _STUBBORN], timeout=1.0)
+    assert r.timed_out
+    with pytest.raises(ProcessLookupError):
+        os.kill(r.pid, 0)
+
+
+def test_run_with_deadline_kills_a_sigterm_ignoring_child_on_cancel() -> None:
+    import threading
+
+    cancel = threading.Event()
+    r = gateway.run_with_deadline(
+        [sys.executable, "-c", _STUBBORN],
+        timeout=60,
+        on_start=lambda pid: threading.Timer(0.5, cancel.set).start(),
+        cancel=cancel,
+    )
+    assert r.cancelled
+    with pytest.raises(ProcessLookupError):
+        os.kill(r.pid, 0)
+
+
+_GRANDCHILD = (
+    "import subprocess, sys, time\n"
+    "g = subprocess.Popen(['sleep', '20'])\n"  # inherits the pipes, outlives the killed child
+    "open(sys.argv[1], 'w').write(str(g.pid))\n"
+    "time.sleep(600)\n"
+)
+
+
+def _grandchild_run(
+    tmp_path: Any, *, cancel_after_start: bool, timeout: float
+) -> tuple[Any, float]:
+    import threading
+
+    pidfile = tmp_path / "gpid"
+    cancel = threading.Event()
+
+    def on_start(pid: int) -> None:
+        if not cancel_after_start:
+            return
+
+        def wait_then_cancel() -> None:
+            end = time.monotonic() + 30
+            while not pidfile.exists() and time.monotonic() < end:
+                time.sleep(0.02)
+            cancel.set()
+
+        threading.Thread(target=wait_then_cancel, daemon=True).start()
+
+    t0 = time.monotonic()
+    try:
+        r = gateway.run_with_deadline(
+            [sys.executable, "-c", _GRANDCHILD, str(pidfile)],
+            timeout=timeout,
+            on_start=on_start,
+            cancel=cancel,
+        )
+        took = time.monotonic() - t0
+    finally:
+        if pidfile.exists():  # the grandchild this test started: do not leave it sleeping
+            try:
+                os.kill(int(pidfile.read_text()), 9)
+            except (ProcessLookupError, ValueError):
+                pass
+    assert pidfile.exists()
+    return r, took
+
+
+def test_cancel_reaps_within_the_short_bound_despite_a_grandchild(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway, "_REAP_TIMEOUT", 6.0)
+    monkeypatch.setattr(gateway, "_CANCEL_REAP_TIMEOUT", 0.3)
+    r, took = _grandchild_run(tmp_path, cancel_after_start=True, timeout=60)
+    assert r.cancelled and r.stdout == b"" and r.returncode is None
+    assert took < 4  # the long bound would be 6 s
+    with pytest.raises(ProcessLookupError):
+        os.kill(r.pid, 0)  # the exact child is killed and reaped
+
+
+def test_timeout_path_keeps_the_long_reap_bound(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gateway, "_REAP_TIMEOUT", 2.0)
+    monkeypatch.setattr(gateway, "_CANCEL_REAP_TIMEOUT", 0.1)
+    r, took = _grandchild_run(tmp_path, cancel_after_start=False, timeout=4)
+    assert r.timed_out and not r.cancelled
+    assert took >= 4 + 1.8  # the grandchild keeps the pipes open for the whole long bound
+
+
+def test_reap_bounds_are_ten_seconds_and_one_second() -> None:
+    assert gateway._REAP_TIMEOUT == 10.0 and gateway._CANCEL_REAP_TIMEOUT == 1.0

@@ -7,9 +7,12 @@ is not a target), so ``browse`` adds no dependency (docs/design.md, D64).
 
 from __future__ import annotations
 
+import codecs
 import locale
 import os
+import signal
 import sys
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -57,16 +60,73 @@ def check_interactive(*, stdin_isatty: bool, env: Mapping[str, str] | None = Non
     )
     if reason is not None:
         raise UsageError(f"`wtctl browse` is interactive only: {reason}")
+    term = (os.environ if env is None else env).get("TERM") or ""
+    _check_terminfo(term)
+
+
+def _check_terminfo(term: str) -> None:
+    """An unknown TERM is a usage error (exit 2), not an internal error from ``initscr``."""
+    import curses
+
+    try:
+        fd = sys.stdout.fileno()
+    except (OSError, ValueError, AttributeError):
+        fd = 1
+    try:
+        curses.setupterm(term, fd)
+    except curses.error as exc:
+        raise UsageError(
+            f"`wtctl browse` is interactive only: TERM is {term!r}, which the terminal "
+            f"database does not know ({exc})"
+        ) from None
+
+
+def _output_encoding() -> str:
+    """The encoding ncurses writes in (the C library's, after ``setlocale``), else ascii."""
+    try:
+        name = locale.nl_langinfo(locale.CODESET)
+        codecs.lookup(name)
+    except (AttributeError, LookupError, ValueError):
+        return "ascii"
+    return name or "ascii"
+
+
+class _Started:
+    drawn = False
+
+
+def _raise_exit(signum: int, _frame: Any) -> None:
+    raise SystemExit(128 + signum)  # unwinds through curses.wrapper and Browser.close
 
 
 def run(browser: Browser) -> None:
     import curses
 
-    locale.setlocale(locale.LC_ALL, "")
-    os.environ.setdefault("ESCDELAY", "25")
     try:
-        curses.wrapper(_guarded, browser)
+        locale.setlocale(locale.LC_CTYPE, "")
+    except locale.Error:  # an uninstalled locale: carry on with the C locale
+        pass
+    os.environ.setdefault("ESCDELAY", "100")  # slow escape sequences must not split into ESC
+    started = _Started()
+    previous: dict[int, Any] = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, _raise_exit)
+    try:
+        curses.wrapper(_guarded, browser, started)
+    except KeyboardInterrupt:  # ^C during terminal setup is a quit too, not a traceback
+        return
+    except curses.error as exc:
+        if started.drawn:
+            raise
+        term = os.environ.get("TERM", "")
+        raise UsageError(
+            f"`wtctl browse` is interactive only: cannot initialize the terminal "
+            f"(TERM={term!r}): {exc}"
+        ) from None
     finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         browser.close()
 
 
@@ -127,14 +187,14 @@ def _draw(curses: Any, scr: Any, lines: list[Line], attrs: dict[str, int], enc: 
     scr.refresh()
 
 
-def _guarded(scr: Any, browser: Browser) -> None:
+def _guarded(scr: Any, browser: Browser, started: _Started) -> None:
     try:
-        _loop(scr, browser)
+        _loop(scr, browser, started)
     except KeyboardInterrupt:  # ^C is a quit, not a traceback
         return
 
 
-def _loop(scr: Any, browser: Browser) -> None:
+def _loop(scr: Any, browser: Browser, started: _Started) -> None:
     import curses
 
     try:
@@ -144,13 +204,14 @@ def _loop(scr: Any, browser: Browser) -> None:
     scr.keypad(True)
     scr.timeout(POLL_MS)
     attrs = _attrs(curses)
-    enc = locale.getpreferredencoding(False) or "ascii"
+    enc = _output_encoding()
     dirty = True
     while True:
         if dirty:
             height, width = scr.getmaxyx()
             _draw(curses, scr, browser.render(height, width), attrs, enc)
             dirty = False
+            started.drawn = True
         try:
             key = scr.get_wch()
         except curses.error:  # timeout: look for a finished status run

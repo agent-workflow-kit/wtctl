@@ -65,11 +65,21 @@ class Term:
                 self.raw += chunk
         return needle in self.raw
 
-    def finish(self, timeout: float = 20) -> int | None:
-        try:
-            return self.proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return None
+    def finish(self, timeout: float = 60) -> int | None:
+        """Wait for exit while draining the pty: a child blocked writing its last bytes into a
+        full pty buffer would otherwise look hung (the cause of a load-dependent flake)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            code = self.proc.poll()
+            if code is not None:
+                return code
+            ready, _, _ = select.select([self.master], [], [], 0.1)
+            if ready:
+                try:
+                    self.raw += os.read(self.master, 65536)
+                except OSError:
+                    pass
+        return None
 
     def close(self) -> None:
         if self.proc.poll() is None:
@@ -126,9 +136,10 @@ def test_browse_navigates_and_quits_cleanly(env: dict[str, str]) -> None:
 def test_ctrl_c_quits_cleanly(env: dict[str, str]) -> None:
     t = Term(env, ["browse"])
     try:
-        assert t.read_until(b"wt-aaaaaaaa")
+        assert t.read_until(b"wt-aaaaaaaa", timeout=60)
+        assert t.read_until(b"q quit", timeout=60)  # the whole first screen is drawn
         t.send(b"\x03")
-        assert t.finish() == 0
+        assert t.finish() == 0, t.raw[-300:]
     finally:
         t.close()
 
@@ -167,3 +178,40 @@ def test_piped_stdout_exits_2(env: dict[str, str]) -> None:
         check=False,
     )
     assert r.returncode == 2 and b"interactive only" in r.stderr
+
+
+def _add_record(tmp_path: Path, id_: str, **kw: object) -> None:
+    s = State(state_path(), make_state(tmp_path / "y").gateway)
+    seed(s, id_, **kw)
+    s.close()
+
+
+def test_uninstalled_locale_does_not_crash(env: dict[str, str]) -> None:
+    t = Term({**env, "LANG": "xx_YY.UTF-8", "LC_ALL": ""}, ["browse"])
+    try:
+        assert t.read_until(b"wt-aaaaaaaa", timeout=60), t.raw[-500:]
+        t.send(b"q")
+        assert t.finish() == 0, t.raw[-500:]
+    finally:
+        t.close()
+
+
+def test_c_locale_shows_non_ascii_as_visible_escapes(tmp_path: Path, env: dict[str, str]) -> None:
+    _add_record(tmp_path, "wt-cccccccc", repo="example.com/o/gamma", name="caf\u00e9")
+    t = Term({**env, "LC_ALL": "C", "LANG": "C"}, ["browse"])
+    try:
+        assert t.read_until(b"caf\\xe9", timeout=60), t.raw[-500:]
+        t.send(b"q")
+        assert t.finish() == 0
+    finally:
+        t.close()
+
+
+def test_unknown_term_is_a_usage_error(env: dict[str, str]) -> None:
+    t = Term({**env, "TERM": "nosuchterm"}, ["browse"])
+    try:
+        assert t.finish() == 2, t.raw[-300:]
+        t.read_until(b"TERM", timeout=5)
+        assert b"nosuchterm" in t.raw
+    finally:
+        t.close()

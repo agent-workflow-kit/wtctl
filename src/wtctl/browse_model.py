@@ -60,17 +60,25 @@ Loader = Callable[[], tuple[list[dict[str, Any]], list[dict[str, Any]]]]
 # --- sanitizing ---------------------------------------------------------------------------
 
 
+# Characters glibc gives width 0 (or that render as blanks) although they are letters or symbols:
+# Hangul fillers and medial jamo, the Hangul and halfwidth Hangul fillers, the braille blank.
+_INVISIBLE_FILLERS = frozenset([0x115F, *range(0x1160, 0x1200), 0x3164, 0xFFA0, 0x2800])
+
+
 def _escape(ch: str) -> str:
     out = _escape_char(ch)  # control, separators, format (bidi) characters, surrogates
     if out != ch:
         return out
     cat = unicodedata.category(ch)
-    if cat in ("Co", "Cn", "Mn", "Me"):  # private/unassigned and zero-width marks (overpaint)
+    if cat in ("Co", "Cn", "Mn", "Me") or ord(ch) in _INVISIBLE_FILLERS:
+        # private/unassigned, zero-width marks (overpaint) and invisible fillers
         return f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}"
     return ch
 
 
 def char_width(ch: str) -> int:
+    if 0x3248 <= ord(ch) <= 0x324F or 0x4DC0 <= ord(ch) <= 0x4DFF:
+        return 2  # glibc counts these two columns although their East Asian width is not W
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
@@ -288,12 +296,17 @@ class Browser:
         for view in self._status.values():
             if view.handle is not None:
                 view.handle.cancel()
+                closer = getattr(view.handle, "close", None)
+                if callable(closer):
+                    closer()  # a real job joins its worker and kills the child if needed
                 view.handle = None
 
     # -- keys -------------------------------------------------------------------------------
 
     def handle_key(self, key: str) -> bool:
         """Apply one key (a single character or a name such as ``down``); False means quit."""
+        if key == "resize":  # a redraw only: it must not clear a message or touch any state
+            return True
         if self._editing:
             self._filter_key(key)
             return True
@@ -378,10 +391,17 @@ class Browser:
             self._reload()
 
     def _reload(self) -> None:
+        open_key = self.selected_id() if self._mode == "detail" else None
         try:
             self._load()
         except WtctlError as err:
             self._say(f"reload failed: {err.message}", error=True)
+            return
+        # finished status results describe the old state: drop them (a running job is kept)
+        self._status = {k: v for k, v in self._status.items() if v.handle is not None}
+        if open_key is not None and self.selected_id() != open_key:
+            self._mode = "list"
+            self._say(f"{open_key} is gone (reloaded {len(self._items)} entries)", error=True)
         else:
             self._say(f"reloaded {len(self._items)} entries")
 
@@ -462,10 +482,10 @@ class Browser:
         ]
 
         def row(cells: Sequence[str]) -> str:
-            parts = [
-                clip(c, widths[n]) + " " * (widths[n] - min(display_width(c), widths[n]))
-                for n, c in enumerate(cells)
-            ]
+            parts = []
+            for n, c in enumerate(cells):
+                shown = c if display_width(c) <= widths[n] else clip(c, widths[n] - 1) + "~"
+                parts.append(shown + " " * (widths[n] - display_width(shown)))
             return "  ".join(parts).rstrip()
 
         lines = [Line(row(HEADERS), "header")]

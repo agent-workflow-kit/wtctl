@@ -434,3 +434,263 @@ def test_json_roundtrip_of_records_is_not_needed_for_rendering(
 ) -> None:
     # records are plain JSON-able dicts (the same objects `list --json` prints)
     json.dumps(records)
+
+
+# --- review round 1 -----------------------------------------------------------------------
+
+
+def test_clipped_table_cells_end_in_a_tilde_and_keep_their_width(
+    records: list[dict[str, Any]],
+) -> None:
+    rec = dict(records[1], name="N" * 200, branch="b" * 100)
+    lines = browser([rec]).render(24, 250)
+    row = next(x for x in lines if x.style == "selected").text
+    assert ("N" * (bm.MAX_CELL - 1) + "~") in row and ("b" * (bm.MAX_CELL - 1) + "~") in row
+    header = lines[1].text
+    assert bm.display_width(row) <= bm.display_width(header) + 3 * bm.MAX_CELL  # columns align
+    assert "N" * bm.MAX_CELL not in row
+
+
+def test_reload_returns_to_the_list_when_the_open_record_is_gone(
+    records: list[dict[str, Any]],
+) -> None:
+    box = {"recs": records}
+    b = bm.Browser(lambda: (box["recs"], []), FakeStarter(), now=lambda: NOW)
+    keys(b, "enter")
+    gone = records[0]["id"]
+    box["recs"] = records[1:]
+    keys(b, "r")
+    out = text(b.render(24, 100))
+    assert "TYPE" in out  # back in the list, not another record's detail
+    assert f"{gone} is gone" in out
+    assert b.selected_id() != gone
+
+
+def test_reload_keeps_the_open_record_when_it_still_exists(records: list[dict[str, Any]]) -> None:
+    b = browser(records)
+    keys(b, "enter", "r")
+    out = text(b.render(40, 100))
+    assert f"id: {records[0]['id']}" in out and "is gone" not in out
+
+
+def test_reload_drops_finished_status_results_but_keeps_a_running_job(
+    records: list[dict[str, Any]],
+) -> None:
+    starter = FakeStarter()
+    b = browser(records, starter=starter)
+    keys(b, "enter", "s")
+    starter.handles[0].outcome = bm.StatusOutcome(True, ("marker-line",))
+    b.tick()
+    keys(b, "r")
+    assert "marker-line" not in text(b.render(40, 100))
+    keys(b, "s")  # runs again
+    assert len(starter.handles) == 2
+    keys(b, "r")  # a running job survives the reload
+    assert "running" in text(b.render(40, 100))
+    b.close()
+    assert starter.handles[1].cancelled
+
+
+def test_a_failed_reload_keeps_finished_status_results(records: list[dict[str, Any]]) -> None:
+    from wtctl.errors import WtctlError
+
+    starter = FakeStarter()
+    fail = {"on": False}
+
+    def loader() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if fail["on"]:
+            raise WtctlError("internal", "boom")
+        return records, []
+
+    b = bm.Browser(loader, starter, now=lambda: NOW)
+    keys(b, "enter", "s")
+    starter.handles[0].outcome = bm.StatusOutcome(True, ("marker-line",))
+    b.tick()
+    fail["on"] = True
+    keys(b, "r")
+    assert "marker-line" in text(b.render(40, 100))
+
+
+@pytest.mark.parametrize("ch", ["ᅟ", "ᅠ", "ᇿ", "ㅤ", "ﾠ", "⠀"])
+def test_invisible_fillers_are_escaped(ch: str) -> None:
+    out = bm.sanitize(f"a{ch}b", 50)
+    assert out == f"a\\u{ord(ch):04x}b"
+
+
+@pytest.mark.parametrize("ch", ["㉈", "㉏", "䷀", "䷿"])
+def test_glibc_wide_characters_count_two_columns(ch: str) -> None:
+    assert bm.char_width(ch) == 2
+    assert bm.display_width("a" + ch) == 3
+
+
+def test_resize_key_leaves_the_message_alone(records: list[dict[str, Any]]) -> None:
+    from wtctl.errors import WtctlError
+
+    calls = {"n": 0}
+
+    def loader() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise WtctlError("internal", "boom")
+        return records, []
+
+    b = bm.Browser(loader, FakeStarter(), now=lambda: NOW)
+    keys(b, "r", "resize")
+    assert "reload failed" in text(b.render(24, 100))
+    keys(b, "enter", "r", "resize")
+    assert "reload failed" in text(b.render(24, 100))
+
+
+# --- sanitizing, in more detail ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expect"),
+    [
+        ("a\x7fb", "a\\x7fb"),
+        ("a͸b", "a\\u0378b"),  # unassigned
+        ("é", "e\\u0301"),  # combining mark (Mn)
+        ("a⃝b", "a\\u20ddb"),  # enclosing mark (Me)
+        ("a\U000e0001b", "a\\U000e0001b"),  # tag (Cf), astral: 8 digits
+        ("a\U000f0000b", "a\\U000f0000b"),  # private use, astral
+    ],
+)
+def test_sanitize_escape_forms(raw: str, expect: str) -> None:
+    assert bm.sanitize(raw, 50) == expect
+
+
+def test_detail_title_and_body_are_sanitized(records: list[dict[str, Any]]) -> None:
+    evil = "x\x1b[2J\x9b‮͸"
+    rec = dict(
+        records[0],
+        id="wt-" + evil,
+        name=evil,
+        branch=evil,
+        state=evil,
+        labels=[evil + "=" + evil],
+    )
+    b = browser([rec])
+    keys(b, "enter")
+    lines = b.render(60, 200)
+    assert "\\x1b[2J" in lines[0].text  # the title shows the escape visibly
+    for ln in lines:
+        for c in ln.text:
+            assert c.isprintable(), repr(ln.text)
+    assert "\\u202e" in text(lines) and "\\u0378" in text(lines)
+
+
+def test_remove_hint_is_shell_quoted() -> None:
+    rec = {
+        "id": "wt-a b'c;d", "object_type": "worktree", "state": "active", "repo": "r/x/y",
+        "name": "n", "ref": None, "branch": None, "created": "2026-01-01T00:00:00.000Z",
+        "labels": [], "path": "/w/x",
+    }  # fmt: skip
+    b = browser([rec])
+    keys(b, "enter")
+    import shlex
+
+    assert f"wtctl remove {shlex.quote(rec['id'])}" in text(b.render(40, 200))
+
+
+def test_filter_hint_and_title_are_sanitized(records: list[dict[str, Any]]) -> None:
+    b = browser(records)
+    b.filter_text = "a\x1b[2J"  # as if typed through a path that bypassed the key filter
+    out = b.render(24, 100)
+    assert all("\x1b" not in x.text for x in out)
+    keys(b, "/")
+    assert all("\x1b" not in x.text for x in b.render(24, 100))
+
+
+def _many(n: int = 60) -> list[dict[str, Any]]:
+    return [
+        {"id": f"wt-{i:08d}", "object_type": "worktree", "state": "active", "repo": "r/x/y",
+         "name": f"n{i}", "ref": None, "branch": None, "created": "2026-01-01T00:00:00.000Z",
+         "labels": [], "path": f"/w/{i}"}
+        for i in range(n)
+    ]  # fmt: skip
+
+
+def test_k_moves_up_and_page_keys_move_by_the_body_minus_one() -> None:
+    b = browser(_many())
+    b.render(20, 100)  # body = 17
+    keys(b, "j", "j", "k")
+    assert b.selected_id() == "wt-00000001"
+    keys(b, "pgdn")
+    assert b.selected_id() == f"wt-{1 + 16:08d}"
+    keys(b, "pgup", "pgup")
+    assert b.selected_id() == "wt-00000000"  # clamps at the top
+    keys(b, "end", "pgdn")
+    assert b.selected_id() == "wt-00000059"  # clamps at the bottom
+
+
+def test_detail_page_and_jump_keys_scroll() -> None:
+    rec = dict(_many(1)[0], last_error="E" * 3000)
+    b = browser([rec])
+    keys(b, "enter")
+    top = text(b.render(10, 40))
+    keys(b, "pgdn")
+    assert text(b.render(10, 40)) != top
+    keys(b, "G")
+    bottom = text(b.render(10, 40))
+    assert bottom != top
+    keys(b, "pgup")
+    assert text(b.render(10, 40)) != bottom
+    keys(b, "g")
+    assert text(b.render(10, 40)) == top
+
+
+def test_filter_matches_the_path_only_there(records: list[dict[str, Any]]) -> None:
+    recs = [dict(r, path="/w/unique-" + r["id"][-4:] + "-zz") for r in records]
+    b = browser(recs)
+    keys(b, "/", *"unique-bbbb", "enter")
+    assert b.visible_ids() == ["wt-bbbbbbbb"]
+
+
+def test_filter_lowercases_only_the_haystack_side_as_designed(
+    records: list[dict[str, Any]],
+) -> None:
+    rec = dict(records[1], name="MixedCaseName")
+    b = browser([rec])
+    keys(b, "/", *"mixedcase", "enter")
+    assert len(b.visible_ids()) == 1
+    keys(b, "/", "esc", "/", *"MIXEDCASE", "enter")
+    assert len(b.visible_ids()) == 1
+
+
+def test_esc_in_the_list_clears_an_applied_filter(records: list[dict[str, Any]]) -> None:
+    b = browser(records)
+    keys(b, "/", *"beta", "enter")
+    assert len(b.visible_ids()) == 1
+    keys(b, "esc")
+    assert len(b.visible_ids()) == 3 and b.filter_text == ""
+
+
+def test_named_and_non_printable_keys_are_not_typed_into_the_filter(
+    records: list[dict[str, Any]],
+) -> None:
+    b = browser(records)
+    keys(b, "/", "down", "pgup", "enter" if False else "home", "\x00", "\t", "\x7f")
+    assert b.filter_text == ""
+
+
+def test_start_status_oserror_shows_cannot_start(records: list[dict[str, Any]]) -> None:
+    def refuse(target: str) -> bm.StatusHandle:
+        raise OSError("no exec")
+
+    b = bm.Browser(lambda: (records, []), refuse, now=lambda: NOW)
+    keys(b, "enter", "s")
+    assert "cannot start" in text(b.render(40, 100))
+
+
+def test_long_cells_are_clipped_to_max_cell(records: list[dict[str, Any]]) -> None:
+    rec = dict(records[0], repo="example.com/o/" + "r" * 300)
+    row = next(x for x in browser([rec]).render(24, 300) if x.style == "selected").text
+    assert "r" * bm.MAX_CELL not in row
+
+
+def test_foreign_entries_are_listed() -> None:
+    foreign = [
+        {"foreign": True, "path": "/w/other", "branch": "zed", "head": None, "clone_path": "/c"}
+    ]
+    out = text(browser([], foreign=foreign).render(24, 100))
+    assert "foreign" in out and "zed" in out and "1/1" in out
