@@ -719,6 +719,27 @@ AUTH_MARKERS = (
 )
 LOCK_MARKERS = ("cannot lock ref", "unable to update local ref")
 
+# Transport causes of an exit 128 that was not an authentication failure (`details.cause`).
+# Each pattern is anchored to the start of a line git or ssh printed (text captured from git
+# 2.34.1 with curl and OpenSSH, LC_ALL=C); `remote:` and `fatal: remote error:` lines never count.
+_CURL_LINE = r"fatal: unable to access '[^\n]*': "
+_NETWORK_UNREACHABLE = re.compile(
+    rf"(?:{_CURL_LINE}(?:Could not resolve host: |Failed to connect to )"
+    r"|ssh: Could not resolve hostname |ssh: connect to host )"
+)
+_REPOSITORY_NOT_FOUND = re.compile(
+    r"(?:fatal: repository '[^\n]*' not found$"
+    r"|fatal: '[^\n]*' does not appear to be a git repository$)"
+)
+_RATE_LIMITED = re.compile(rf"{_CURL_LINE}The requested URL returned error: 429$")
+TRANSPORT_CAUSES = ("rate_limited", "repository_not_found", "network_unreachable")
+FETCH_CAUSES = ("timeout", "prune_incomplete", *TRANSPORT_CAUSES)  # `details.cause` of fetch_failed
+_TRANSPORT_PATTERNS = (
+    ("rate_limited", _RATE_LIMITED),
+    ("repository_not_found", _REPOSITORY_NOT_FOUND),
+    ("network_unreachable", _NETWORK_UNREACHABLE),
+)
+
 
 class FetchKind(enum.Enum):
     OK = "ok"
@@ -730,7 +751,9 @@ class FetchKind(enum.Enum):
 @dataclass(frozen=True)
 class FetchOutcome:
     kind: FetchKind
-    cause: str | None = None  # "timeout" or "prune_incomplete" with FAILED
+    # with FAILED: "timeout", "prune_incomplete" or (exit 128) a transport cause:
+    # "network_unreachable", "repository_not_found" or "rate_limited"
+    cause: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -740,10 +763,19 @@ class FetchOutcome:
 _SERVER_TEXT_PREFIXES = ("remote:", "fatal: remote error:", "fatal: protocol error:")
 
 
+def _stderr_lines(err: str) -> list[str]:
+    """git's stderr lines: split on ``\\n`` only (one trailing ``\\r`` stripped per line).
+
+    ``str.splitlines`` also breaks on \\x0b, \\x0c, \\x1c-\\x1e, \\x85, U+2028/2029 and a lone
+    ``\\r``, which would let text inside a ``remote:`` line start a fake unprefixed line.
+    """
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in err.split("\n")]
+
+
 def _auth_lines(err: str) -> list[str]:
     """Lines that may carry an authentication marker: never a ``remote:`` line, which is text
     the server chose (a malicious remote could print any marker)."""
-    return [ln for ln in err.splitlines() if not ln.startswith(_SERVER_TEXT_PREFIXES)]
+    return [ln for ln in _stderr_lines(err) if not ln.startswith(_SERVER_TEXT_PREFIXES)]
 
 
 def classify_fetch(result: GitResult) -> FetchOutcome:
@@ -752,13 +784,13 @@ def classify_fetch(result: GitResult) -> FetchOutcome:
         return FetchOutcome(FetchKind.FAILED, "timeout")
     err = result.err
     if result.returncode == 0:
-        if any(line.startswith("error:") for line in err.splitlines()):
+        if any(line.startswith("error:") for line in _stderr_lines(err)):
             return FetchOutcome(FetchKind.FAILED, "prune_incomplete")
         return FetchOutcome(FetchKind.OK)
     if result.returncode == 1:
         # Newer git (2.56) exits 1 where older git exits 0 for a prune blocked by a ref lock.
         if "error: could not delete reference" in err and any(
-            line.lstrip().startswith("- [deleted]") for line in err.splitlines()
+            line.lstrip().startswith("- [deleted]") for line in _stderr_lines(err)
         ):
             return FetchOutcome(FetchKind.FAILED, "prune_incomplete")
         if any(marker in err for marker in LOCK_MARKERS):
@@ -768,6 +800,9 @@ def classify_fetch(result: GitResult) -> FetchOutcome:
         lines = _auth_lines(err)
         if any(marker in ln for ln in lines for marker in AUTH_MARKERS):
             return FetchOutcome(FetchKind.AUTH_REQUIRED)
+        for cause, pattern in _TRANSPORT_PATTERNS:
+            if any(pattern.match(ln) for ln in lines):
+                return FetchOutcome(FetchKind.FAILED, cause)
         return FetchOutcome(FetchKind.FAILED)
     return FetchOutcome(FetchKind.FAILED)
 
@@ -801,7 +836,8 @@ def outcome_error(
     """The error for a failed outcome (``None`` when it succeeded).
 
     ``failure_code`` is ``fetch_failed`` or ``clone_failed`` (a clone's timeout has the cause
-    ``timeout`` too; ``prune_incomplete`` only exists for fetches).
+    ``timeout`` too, and so are the transport causes; ``prune_incomplete`` only exists for
+    fetches).
     """
     if outcome.ok:
         return None
@@ -812,10 +848,17 @@ def outcome_error(
     cause = outcome.cause
     if failure_code == "clone_failed" and cause == "prune_incomplete":
         cause = None
-    lines = result.err.strip().splitlines()
+    lines = _stderr_lines(result.err.strip()) if result.err.strip() else []
     if cause == "prune_incomplete":
         # exit 0 with an `error:` line: that line is the reason, not whatever git printed last
         lines = [ln for ln in lines if ln.startswith("error:")] or lines
+        tail = lines[0][:200]
+    elif cause in TRANSPORT_CAUSES:
+        # the line that classified it, not the "Could not read from remote repository" trailer
+        pattern = dict(_TRANSPORT_PATTERNS)[cause]
+        lines = [
+            ln for ln in lines if not ln.startswith(_SERVER_TEXT_PREFIXES) and pattern.match(ln)
+        ] or lines
         tail = lines[0][:200]
     else:
         tail = lines[-1][:200] if lines else "no output"

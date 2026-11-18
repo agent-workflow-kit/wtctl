@@ -13,6 +13,8 @@ from wtctl import hardgit
 from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway, GitResult, run_git
 from wtctl.hardgit import (
+    FETCH_CAUSES,
+    TRANSPORT_CAUSES,
     FetchKind,
     Git,
     PorcelainError,
@@ -326,7 +328,6 @@ def test_check_version_on_the_installed_git(private_home: Path, tmp_path: Path) 
         (res(128, "Host key verification failed."), FetchKind.AUTH_REQUIRED, None),
         (res(128, "fatal: unable to access: The requested URL returned error: 401"),
          FetchKind.AUTH_REQUIRED, None),
-        (res(128, "fatal: unable to access: Could not resolve host"), FetchKind.FAILED, None),
         (res(2), FetchKind.FAILED, None),
         (res(-9, timed_out=True), FetchKind.FAILED, "timeout"),
         (res(0, "error: x", timed_out=True), FetchKind.FAILED, "timeout"),
@@ -335,6 +336,64 @@ def test_check_version_on_the_installed_git(private_home: Path, tmp_path: Path) 
 def test_classify_fetch(result: GitResult, kind: FetchKind, cause: str | None) -> None:
     out = classify_fetch(result)
     assert (out.kind, out.cause) == (kind, cause)
+
+
+# Transport causes. Texts are captured from git 2.34.1 (curl, OpenSSH), LC_ALL=C, with the hosts
+# shortened; `ACCESS` is git's prefix for a curl failure.
+ACCESS = "fatal: unable to access 'http://h/a.git/': "
+HTTP_ERR = ACCESS + "The requested URL returned error: "
+NO_READ = "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct\n"
+NOT_FOUND = "fatal: repository 'http://h/a.git/' not found"
+NOT_GIT = "fatal: '/x/y.git' does not appear to be a git repository\n"
+
+
+@pytest.mark.parametrize(
+    "stderr,cause",
+    [
+        (ACCESS + "Could not resolve host: h", "network_unreachable"),
+        (
+            ACCESS + "Failed to connect to h port 1 after 0 ms: Connection refused",
+            "network_unreachable",
+        ),
+        (ACCESS + "Failed to connect to h port 443: Network is unreachable", "network_unreachable"),
+        (
+            "ssh: Could not resolve hostname h: Name or service not known\n" + NO_READ,
+            "network_unreachable",
+        ),
+        ("ssh: connect to host h port 1: Connection refused\n" + NO_READ, "network_unreachable"),
+        (NOT_FOUND, "repository_not_found"),
+        (NOT_GIT + NO_READ, "repository_not_found"),
+        (HTTP_ERR + "429", "rate_limited"),
+        # a rate limit named before a missing repository wins (fixed order)
+        (NOT_FOUND + "\n" + HTTP_ERR + "429", "rate_limited"),
+        # other statuses and transport errors stay generic
+        (HTTP_ERR + "503", None),
+        (HTTP_ERR + "4290", None),
+        (HTTP_ERR + "404x", None),
+        (ACCESS + "SSL certificate problem: self signed certificate", None),
+        # server-chosen text never classifies
+        ("remote: Repository not found.\nfatal: remote error: repository 'x' not found", None),
+        ("remote: " + HTTP_ERR + "429", None),
+        ("fatal: remote error: Could not resolve host: x", None),
+        ("fatal: protocol error: " + NOT_FOUND, None),
+        # a marker mid-line (inside a ref or path name) is not a line git made
+        ("fatal: bad ref name 'ssh: Could not resolve hostname x'", None),
+        ("fatal: bad ref name '" + NOT_FOUND + "'", None),
+        # authentication wins over any other marker
+        (NOT_FOUND + "\nfatal: Authentication failed for 'http://h/'", "AUTH"),
+    ],
+)
+def test_classify_transport_causes(stderr: str, cause: str | None) -> None:
+    out = classify_fetch(res(128, stderr))
+    if cause == "AUTH":
+        assert out.kind is FetchKind.AUTH_REQUIRED and out.cause is None
+    else:
+        assert (out.kind, out.cause) == (FetchKind.FAILED, cause)
+
+
+@pytest.mark.parametrize("code", [1, 2, 255])
+def test_transport_text_only_classifies_an_exit_128(code: int) -> None:
+    assert classify_fetch(res(code, NOT_FOUND)).cause is None
 
 
 def test_a_line_merely_containing_error_is_not_a_prune_failure() -> None:
@@ -379,6 +438,18 @@ def test_outcome_errors_map_to_codes_and_causes() -> None:
     assert e is not None and e.fields["details"] == {"cause": "prune_incomplete"}
     e = outcome_error(classify_fetch(p), p, failure_code="clone_failed")
     assert e is not None and "details" not in e.fields
+    for text, cause in (
+        ("fatal: repository 'https://h/a.git/' not found", "repository_not_found"),
+        (
+            "fatal: unable to access 'https://h/': The requested URL returned error: 429",
+            "rate_limited",
+        ),
+        ("fatal: unable to access 'https://h/': Could not resolve host: h", "network_unreachable"),
+    ):
+        r = res(128, text)
+        for code in ("fetch_failed", "clone_failed"):
+            e = outcome_error(classify_fetch(r), r, failure_code=code)
+            assert e is not None and e.code == code and e.fields["details"] == {"cause": cause}
     e = outcome_error(classify_fetch(res(1, "x")), res(1, "x"))
     assert e is not None and e.code == "fetch_failed"
 
@@ -823,3 +894,84 @@ def test_prune_blocked_by_packed_refs_lock_in_real_git(
     assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, "prune_incomplete")
     e = outcome_error(outcome, r)
     assert e is not None and "could not delete reference" in e.message
+
+
+def test_the_error_module_allows_exactly_the_fetch_causes() -> None:
+    from wtctl import errors
+
+    assert errors._CAUSES["fetch_failed"] == set(FETCH_CAUSES)
+    assert errors._CAUSES["clone_failed"] == set(FETCH_CAUSES) - {"prune_incomplete"}
+
+
+# -- review round 1 (#33) ------------------------------------------------------------------------
+
+# Characters `str.splitlines` treats as line ends but git does not: inside a `remote:` line they
+# must not start a fake unprefixed line.
+_FAKE_BREAKS = ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r"]
+_SERVER_PAYLOADS = [
+    ("repository_not_found", "fatal: repository 'x' not found"),
+    ("network_unreachable", "fatal: unable to access 'http://h/': Could not resolve host: h"),
+    ("rate_limited", "fatal: unable to access 'http://h/': The requested URL returned error: 429"),
+    ("AUTH", "fatal: Authentication failed for 'http://h/'"),
+]
+
+
+@pytest.mark.parametrize("brk", _FAKE_BREAKS, ids=[repr(b) for b in _FAKE_BREAKS])
+@pytest.mark.parametrize("cause,payload", _SERVER_PAYLOADS)
+def test_odd_line_breaks_inside_a_remote_line_do_not_forge_a_line(
+    brk: str, cause: str, payload: str
+) -> None:
+    out = classify_fetch(res(128, "remote: hi" + brk + payload))
+    assert (out.kind, out.cause) == (FetchKind.FAILED, None)
+
+
+def test_a_real_newline_still_separates_lines_and_a_trailing_cr_is_stripped() -> None:
+    assert classify_fetch(res(128, "x\r\n" + NOT_FOUND + "\r\n")).cause == "repository_not_found"
+
+
+@pytest.mark.parametrize("brk", _FAKE_BREAKS, ids=[repr(b) for b in _FAKE_BREAKS])
+def test_the_message_line_is_not_split_on_odd_breaks(brk: str) -> None:
+    forged = "fatal: unable to access 'http://forged/': The requested URL returned error: 429"
+    err = "remote: hi" + brk + forged + "\n" + HTTP_ERR + "429\n" + NO_READ
+    r = res(128, err)
+    e = outcome_error(classify_fetch(r), r)
+    assert e is not None and e.message == f"git failed ({HTTP_ERR}429)"
+
+
+@pytest.mark.parametrize(
+    "stderr,matching",
+    [
+        (
+            "fatal: unable to access 'http://h/a.git/': Could not resolve host: h\n" + NO_READ,
+            "fatal: unable to access 'http://h/a.git/': Could not resolve host: h",
+        ),
+        (
+            "ssh: connect to host h port 22: Connection refused\n" + NO_READ,
+            "ssh: connect to host h port 22: Connection refused",
+        ),
+        (
+            "ssh: Could not resolve hostname h: Name or service not known\n" + NO_READ,
+            "ssh: Could not resolve hostname h: Name or service not known",
+        ),
+        # the matching line is not the first
+        (
+            "warning: something first\n" + NOT_FOUND + "\n" + NO_READ,
+            NOT_FOUND,
+        ),
+        (
+            "fatal: '/x/y.git' does not appear to be a git repository\n" + NO_READ,
+            "fatal: '/x/y.git' does not appear to be a git repository",
+        ),
+        # a curl line after a `remote:` line
+        (
+            "remote: Not so fast\n" + HTTP_ERR + "429\n" + NO_READ,
+            HTTP_ERR + "429",
+        ),
+    ],
+)
+def test_a_transport_failure_message_is_the_matching_line(stderr: str, matching: str) -> None:
+    r = res(128, stderr)
+    outcome = classify_fetch(r)
+    assert outcome.cause in TRANSPORT_CAUSES
+    e = outcome_error(outcome, r)
+    assert e is not None and e.message == f"git failed ({matching})"

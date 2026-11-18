@@ -665,6 +665,31 @@ def test_t14_prune_incomplete_exits_12_and_a_forced_removal_overrides_it(w: RR, 
     assert d["checks"]["fetch"]["details"][0]["cause"] == "prune_incomplete"
 
 
+_ACC = b"fatal: unable to access 'https://x/': "
+
+
+@pytest.mark.parametrize(
+    "stderr,cause",
+    [
+        (b"fatal: repository 'https://x/r.git/' not found\n", "repository_not_found"),
+        (_ACC + b"Could not resolve host: x\n", "network_unreachable"),
+        (_ACC + b"The requested URL returned error: 429\n", "rate_limited"),
+    ],
+)
+def test_t14_transport_causes_exit_12_and_a_forced_removal_overrides_them(
+    w: RR,  # noqa: ANN001
+    capsys,  # noqa: ANN001
+    stderr: bytes,
+    cause: str,
+) -> None:
+    w.start(capsys)
+    failing_fetch(w, GitResult(128, b"", stderr))
+    err = w.refused(code=12)
+    assert err["code"] == "fetch_failed" and err["details"] == {"cause": cause}
+    d = w.removed("--force", human=True)
+    assert d["checks"]["fetch"]["details"][0]["cause"] == cause
+
+
 def test_t14_the_holders_seen_at_step_6_pass_the_recheck_when_forced(w: RR, capsys) -> None:  # noqa: ANN001
     w.start(capsys, "--holder", "agent-1")
     mutate(w, "true")  # the hook runs between the step-6 checks and the step-9 re-check

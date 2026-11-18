@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 
-from tests.schemacheck import SCHEMAS, validate
+from tests.schemacheck import SCHEMAS, _registry, validate
 from wtctl.errors import EXIT_CODES, WtctlError
 
 # Copied from docs/interface.md, "Errors" (code -> exit); deliberately not derived from the code.
@@ -180,6 +181,12 @@ def test_schema_conditional_rules_are_enforced(code: str, fields: dict[str, obje
         ("not_found", {}),
         ("vetoed", {"hook": "h", "hook_stderr": ""}),
         ("fetch_failed", {"details": {"cause": "prune_incomplete"}}),
+        ("fetch_failed", {"details": {"cause": "network_unreachable"}}),
+        ("fetch_failed", {"details": {"cause": "repository_not_found"}}),
+        ("fetch_failed", {"details": {"cause": "rate_limited"}}),
+        ("clone_failed", {"details": {"cause": "network_unreachable"}}),
+        ("clone_failed", {"details": {"cause": "repository_not_found"}}),
+        ("clone_failed", {"details": {"cause": "rate_limited"}}),
         (
             "refused",
             {"reason": "unlinked", "details": {"cause": "fuse_anchor", "anchors": [{}]}},
@@ -188,3 +195,40 @@ def test_schema_conditional_rules_are_enforced(code: str, fields: dict[str, obje
 )
 def test_valid_combinations_construct(code: str, fields: dict[str, object]) -> None:
     WtctlError(code, "x", **fields)
+
+
+# -- fetch/clone causes against the schemas (#33) ------------------------------------------------
+
+_NEW_CAUSES = ["network_unreachable", "repository_not_found", "rate_limited"]
+
+
+@pytest.mark.parametrize(
+    ("code", "cause"),
+    [("clone_failed", c) for c in ["timeout", *_NEW_CAUSES]]
+    + [("fetch_failed", c) for c in ["timeout", "prune_incomplete", *_NEW_CAUSES]],
+)
+def test_fetch_and_clone_causes_validate_against_error_json(code: str, cause: str) -> None:
+    validate("wtctl/cli/error.json", WtctlError(code, "m", details={"cause": cause}).to_object())
+
+
+@pytest.mark.parametrize(
+    ("code", "cause"),
+    [("clone_failed", "prune_incomplete"), ("fetch_failed", "bogus"), ("clone_failed", "bogus")],
+)
+def test_other_causes_are_rejected_by_error_json(code: str, cause: str) -> None:
+    # WtctlError itself refuses these, so the object is built by hand
+    obj = {"error": {"code": code, "message": "m", "details": {"cause": cause}}}
+    with pytest.raises(ValidationError):
+        validate("wtctl/cli/error.json", obj)
+
+
+@pytest.mark.parametrize("cause", ["timeout", "prune_incomplete", *_NEW_CAUSES, None])
+def test_checks_fetch_validates_each_cause(cause: str | None) -> None:
+    registry = _registry()
+    schema = {"$ref": "wtctl/defs.json#/$defs/checks"}
+    detail = {"code": "fetch_failed", "cause": cause, "message": "git failed (x)"}
+    checks = {"fetch": {"status": "fail", "details": [detail]}}
+    Draft202012Validator(schema, registry=registry).validate(checks)
+    detail["cause"] = "bogus"
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema, registry=registry).validate(checks)

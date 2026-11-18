@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import http.server
 import shutil
+import socket
 import ssl
 import subprocess
 import threading
@@ -43,6 +44,7 @@ class Capture:
     redirect_to: str | None = None
     stall: bool = False
     always_401: bool = False
+    status: int | None = None  # answer every request with this status
     release: threading.Event = field(default_factory=threading.Event)
 
 
@@ -73,6 +75,11 @@ def server(tmp_path: Path) -> Iterator[Capture]:
             )
             if cap.stall:
                 cap.release.wait(15)
+                return
+            if cap.status is not None:
+                self.send_response(cap.status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
                 return
             if cap.redirect_to and self.path.startswith("/redir"):
                 self.send_response(302)
@@ -369,6 +376,53 @@ def test_a_stalled_server_times_out_end_to_end(
     result = ls_remote(git, mirror, cfg, auth, url)
     assert result.timed_out
     assert classify_fetch(result).cause == "timeout"
+
+
+@pytest.mark.parametrize(
+    "status,cause", [(404, "repository_not_found"), (429, "rate_limited"), (503, None)]
+)
+def test_real_http_failures_are_classified_end_to_end(
+    server: Capture, mirror: Path, private_home: Path, status: int, cause: str | None
+) -> None:
+    server.status = status
+    url = f"https://127.0.0.1:{server.port}/org/repo.git"
+    cfg, auth = auth_for(url)
+    git = Git(trusting_gateway(server.cert), GIT, str(private_home))
+    result = ls_remote(git, mirror, cfg, auth, url)
+    outcome = classify_fetch(result)
+    assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, cause)
+
+
+def test_a_refused_connection_is_network_unreachable_end_to_end(
+    mirror: Path, private_home: Path
+) -> None:
+    with socket.socket() as s:  # a port nothing listens on, freed right away
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"https://127.0.0.1:{port}/org/repo.git"
+    cfg, auth = auth_for(url)
+    git = Git(Gateway(), GIT, str(private_home))
+    result = ls_remote(git, mirror, cfg, auth, url)
+    outcome = classify_fetch(result)
+    assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, "network_unreachable")
+
+
+def test_a_refused_ssh_connection_is_network_unreachable_end_to_end(
+    mirror: Path, private_home: Path
+) -> None:
+    if shutil.which("ssh") is None:
+        pytest.skip("needs an ssh binary")
+    with socket.socket() as s:  # a port nothing listens on, freed right away
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    url = f"ssh://127.0.0.1:{port}/x"
+    cfg = Config()
+    auth = prepare_network_auth(cfg, url, environ={}, gateway=Gateway(), warn=lambda m: None)
+    git = Git(Gateway(), GIT, str(private_home))
+    result = ls_remote(git, mirror, cfg, auth, url)
+    assert "ssh: connect to host" in result.err, result.err
+    outcome = classify_fetch(result)
+    assert (outcome.kind, outcome.cause) == (FetchKind.FAILED, "network_unreachable")
 
 
 # -- #13: separator, owned config, the token-rejected message ---------------------------------
