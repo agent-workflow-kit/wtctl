@@ -217,7 +217,10 @@ def test_the_pack_is_indexed_in_a_throwaway_bare_repository(w: World) -> None:
     assert gd != str(w.clone / ".git") and gd != m.path
     assert "--fsck-objects" in argv and "--strict" not in argv and "--fix-thin" not in argv
     assert env["GIT_ALLOW_PROTOCOL"] == "none"
-    assert any("init" in c[0] and "--bare" in c[0] and gd in c[0] for c in rec.calls)
+    assert any(
+        "init" in c[0] and "--bare" in c[0] and "--template=" in c[0] and gd in c[0]
+        for c in rec.calls
+    )
     assert not os.path.exists(gd)  # gone with the private directory
 
 

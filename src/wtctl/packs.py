@@ -125,8 +125,9 @@ def index_pack(git: Git, pack: str, idx: str, *, p: str, timeout: float) -> str:
     The repository is ``p/idx.git``, made here with ``init --bare --template=`` (no hooks, no
     templates; its config is the one ``init`` writes, and the hardened environment reads no other),
     empty and never the clone. Not outside any repository: git 2.34.1 segfaults (exit 139) in
-    ``index-pack --fsck-objects`` there whenever a tree names ``.gitmodules`` and the pack does not
-    carry that blob, which every range that leaves ``.gitmodules`` alone looks like (D65, #90).
+    ``index-pack --fsck-objects`` there when a tree names ``.gitmodules`` (observed with the blob
+    absent or present; a range that leaves ``.gitmodules`` alone is the common absent case; D65,
+    #90).
     Inside any repository the same command is fine and gives the same index. ``--fsck-objects``
     rejects objects that fail fsck (a ``.gitmodules`` abuse, a malformed tree); ``--strict`` is not
     used (it also checks connectivity, which a range pack cannot satisfy) and ``--fix-thin``
