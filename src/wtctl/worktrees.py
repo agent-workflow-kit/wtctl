@@ -119,11 +119,11 @@ def scrub_urls(text: str) -> str:
     return _URL_TOKEN.sub(one, text)
 
 
-def admin_gitdirs(common_dir: str) -> list[str]:
-    """The ``gitdir`` file content (the worktree's ``.git`` path) of every admin entry that has
-    one; an admin directory without a regular ``gitdir`` file is not an entry."""
+def _admin_pairs(common_dir: str) -> list[tuple[str, str]]:
+    """``(admin directory, gitdir file content)`` of every admin entry that has a regular
+    ``gitdir`` file."""
     admin = os.path.join(common_dir, "worktrees")
-    found: list[str] = []
+    found: list[tuple[str, str]] = []
     try:
         it = os.scandir(admin)
     except FileNotFoundError:
@@ -139,8 +139,28 @@ def admin_gitdirs(common_dir: str) -> list[str]:
             with os.fdopen(fd, "rb") as fh:
                 if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
                     continue
-                found.append(fh.read(1 << 16).decode("utf-8", "surrogateescape").rstrip("\n"))
+                text = fh.read(1 << 16).decode("utf-8", "surrogateescape").rstrip("\n")
+                found.append((e.path, text))
     return found
+
+
+def admin_gitdirs(common_dir: str) -> list[str]:
+    """The ``gitdir`` file content (the worktree's ``.git`` path) of every admin entry that has
+    one; an admin directory without a regular ``gitdir`` file is not an entry."""
+    return [g for _, g in _admin_pairs(common_dir)]
+
+
+def admin_for_path(common_dir: str, path: str) -> str | None:
+    """The one admin entry whose ``gitdir`` names ``<path>/.git``, read from the common dir only
+    (never from the worktree directory, which a mount may cover). ``None`` for none or for more
+    than one (an ambiguity is never guessed at)."""
+    mine = os.path.join(path, ".git")
+    hits = [
+        a
+        for a, g in _admin_pairs(common_dir)
+        if g == mine and ADMIN_NAME.fullmatch(os.path.basename(a))
+    ]
+    return hits[0] if len(hits) == 1 else None
 
 
 def worktree_entries(git: Git, common_dir: str) -> list[WorktreeEntry]:
@@ -503,7 +523,14 @@ def inspect_added(git: Git, common_dir: str, path: str) -> Added:
     return Added(admin, head, _reflog_last(admin), _stash_ids(git, common_dir))
 
 
-def _reflog_last(admin: str) -> str | None:
+def reflog_first(admin: str) -> str | None:
+    """The commit the admin entry's HEAD reflog starts at: where HEAD stood when git created the
+    worktree. ``None`` when there is no usable entry or the first line is not the creation entry
+    (its old value is not all zeros: the reflog expired or was edited)."""
+    return _reflog_last(admin, first=True)
+
+
+def _reflog_last(admin: str, *, first: bool = False) -> str | None:
     try:
         fd = os.open(os.path.join(admin, "logs", "HEAD"), os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
@@ -512,8 +539,10 @@ def _reflog_last(admin: str) -> str | None:
         lines = fh.read(1 << 20).splitlines()
     if not lines:
         return None
-    fields = lines[-1].split(b" ", 2)
+    fields = lines[0 if first else -1].split(b" ", 2)
     new = fields[1].decode("ascii", "replace") if len(fields) > 1 else ""
+    if first and fields[0] != b"0" * 40:
+        return None
     return new if SHA.fullmatch(new) else None
 
 

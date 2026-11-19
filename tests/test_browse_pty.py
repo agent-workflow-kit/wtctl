@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -23,6 +24,15 @@ pytest.importorskip("curses")
 HOSTILE = "evil\x1b]0;pwn\x07\x9b2Jend"
 
 
+def _child_setup() -> None:
+    """Runs in the child before exec: the pty is its terminal, and SIGINT has its default action.
+    A child inherits an ignored SIGINT (the test process can have it ignored, e.g. when started
+    from a background job or after another test changed it); a Python child then never installs
+    its KeyboardInterrupt handler and the terminal's ^C does nothing."""
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 class Term:
     def __init__(self, env: dict[str, str], argv: list[str], rows: int = 30, cols: int = 110):
         self.master, slave = pty.openpty()
@@ -34,7 +44,7 @@ class Term:
             stderr=slave,
             env=env,
             start_new_session=True,
-            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0),  # the pty is its terminal
+            preexec_fn=_child_setup,
             close_fds=True,
         )
         os.close(slave)
@@ -42,8 +52,6 @@ class Term:
 
     def resize(self, rows: int, cols: int) -> None:
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, _winsize(rows, cols))
-        import signal
-
         os.kill(self.proc.pid, signal.SIGWINCH)  # our own child, by its exact pid
 
     def send(self, data: bytes) -> None:

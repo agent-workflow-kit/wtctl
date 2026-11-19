@@ -30,6 +30,7 @@ from . import (
     fsafe_child,
     hooks,
     linkcheck,
+    reconcile_probe,
     removal_content,
     removal_delete,
     removal_integrity,
@@ -139,13 +140,22 @@ class Remover:
             raise self._refuse("unlinked", f"{rec['id']} is {rec['state']}, not active")
         if not rec["owned"] or rec["state"] == "partial":
             self.ctx.require_human()
+        self.settings = self.config.repo(rec["repo"])
+        self._status(rec)
+        if rec["state"] == "partial" and rec["dir_id"] is None:
+            rebound = self._rebind(rec)
+            if rebound is None:
+                return self._finish_unplaced(rec)
+            rec = self.rec = rebound
+            self._status(rec)
+        return self._normal(rec)
+
+    def _status(self, rec: Record) -> None:
         self.st = Status(self.ctx, rec)
         self.st.git = self.git
         self.st.budget = self.budget
         self.st.warnings = self.warnings
         self.st.checks = self.checks
-        self.settings = self.config.repo(rec["repo"])
-        return self._normal(rec)
 
     # -- refusals -----------------------------------------------------------------------------
 
@@ -531,6 +541,123 @@ class Remover:
             branch_deleted, kept = self._branch(rec, plan, prepared)
         return self._finish(rec, branch_deleted, kept)
 
+    # -- the unplaced flow --------------------------------------------------------------------
+
+    def _rebind(self, rec: Record) -> Record | None:
+        """A ``partial`` record with no ``dir_id`` (create or reconcile could not verify the
+        directory because a mount covered it): when the directory is verifiably the worktree now
+        (no mount, the pointers match the admin entry, as reconcile's adoption checks them) its
+        identity is recorded and the removal goes on as for any ``partial`` record. ``None``
+        otherwise."""
+        try:
+            links = linkcheck.verify_links(rec, self.state)
+        except WtctlError:
+            return None
+        self.state.transition(rec["id"], "partial", "partial", dir_id=links.dir_id)
+        return self._fresh_record()
+
+    def _plan_unplaced(self, rec: Record) -> Plan:
+        """The branch is deleted only when this create made it, it is still at the sha it was
+        made at (``head_at_create``, compare-and-swap) and no other worktree has it."""
+        plan = Plan(branch=rec["branch"])
+        if not rec["created_branch"] or not rec["branch"]:
+            plan.kept_reason = "not_created"
+        elif not self.config.remove.delete_branch:
+            plan.kept_reason = "disabled"
+        elif self.o.keep_branch:
+            plan.kept_reason = "keep_branch"
+        else:
+            self._plan_unplaced_branch(rec, plan)
+        return plan
+
+    def _plan_unplaced_branch(self, rec: Record, plan: Plan) -> None:
+        common, branch = rec["common_dir"], str(rec["branch"])
+        ref = f"refs/heads/{branch}"
+        r = self.git.run(
+            ["rev-parse", "--verify", "-q", ref], git_dir=common, cwd=common, timeout=60
+        )
+        tip = r.out.strip()
+        if r.returncode != 0 or r.timed_out or len(tip) != SHA_LEN:
+            plan.kept_reason = "not_created"
+            self.warnings.append(f"the branch {_escape(branch)} no longer exists")
+            return
+        if tip != rec["head_at_create"]:
+            plan.kept_reason = "unpushed"
+            self.warnings.append(
+                f"the branch {_escape(branch)} moved since the worktree was created; it was kept"
+            )
+            return
+        try:
+            entries = worktrees.worktree_entries(self.git, common)
+        except WtctlError:
+            plan.kept_reason = "checked_out_elsewhere"
+            self.warnings.append("the worktrees of the clone could not be listed; branch kept")
+            return
+        mine = os.path.realpath(rec["path"])
+        if any(e.branch == ref and os.path.realpath(e.path) != mine for e in entries):
+            plan.kept_reason = "checked_out_elsewhere"
+            return
+        plan.tip, plan.delete = tip, True
+
+    def _finish_unplaced(self, rec: Record) -> Result:
+        """A ``partial`` record whose directory cannot be verified (a mount covers it, or it is
+        not the worktree): the directory is never opened for deletion. Only what wtctl can verify
+        elsewhere is cleared, the admin entry (through the recorded common dir) and the branch
+        (compare-and-swap). The record becomes ``removed`` only when the planned path is then
+        absent; otherwise it stays ``partial`` and the directory is left for a human."""
+        for name in ("integrity", "locked", "baseline", "fetch", "held"):
+            self.checks[name] = removal_content.skipped()
+        self.checks.update(removal_content.not_run())
+        self._in_use(self.st)
+        plan = self._plan_unplaced(rec)
+        shown = [_escape(rec["path"])]
+        self._confirm(
+            "\n".join(
+                [
+                    f"finish removing {rec['name']}: the admin entry and the branch only; "
+                    f"{shown[0]} is not verified and is left untouched",
+                    *self.warnings,
+                ]
+            )
+        )
+        self._pre_hooks()
+        with self.state.lease(clone_lease(rec["clone_path"]), wait=self.config.lease_wait_s):
+            rec = self._fresh_record()
+            admin = removal_delete.admin_check(self.state, rec, self.del_budget)
+            if isinstance(admin, fsafe.FsafeError):
+                raise self._unlinked(f"the admin entry of {rec['id']} cannot be opened")
+            if admin.locked:
+                self._locked_gate(rec, removal_integrity.lock_check(rec))
+                raise self._refuse("locked", f"{rec['id']} is locked", details={"lock_reason": ""})
+            self.checks["locked"] = {"status": "pass", "details": []}
+            prepared = self._prepare_audits(rec, plan)
+            self._check_lease()
+            self._finish_admin(rec, prepared)
+            self._check_lease()
+            branch_deleted, kept = self._branch(rec, plan, prepared)
+            self._check_lease()
+            kind, _ = reconcile_probe.planted(self.state, rec)
+            if kind != "absent":
+                self._left_unplaced(rec, prepared, shown, kind)
+            self._late_audit(rec, prepared.ok, "remove")
+        return self._finish(rec, branch_deleted, kept)
+
+    def _left_unplaced(self, rec: Record, prepared: Prepared, shown: list[str], kind: str) -> None:
+        why = "a mount point" if kind == "mount" else "not verifiable as the worktree"
+        error = (
+            f"{shown[0]} was left untouched ({why}); inspect or unmount it and run `wtctl remove` "
+            "again if it then is the worktree; an empty or foreign leftover directory needs "
+            "removing by hand, or `wtctl forget` the record"
+        )
+        self.state.transition(rec["id"], "partial", "partial", last_error=error[:500])
+        note = self._audit_failed(prepared)
+        raise WtctlError(
+            "partial",
+            f"removing {rec['id']}: the admin entry and the branch were cleared where they could "
+            f"be, but {shown[0]} was left ({why}){note}",
+            details={"remaining_path": shown[0], "remaining": shown},
+        )
+
     # -- the partial flow ---------------------------------------------------------------------
 
     def _finish_partial(self, rec: Record) -> Result:
@@ -754,7 +881,7 @@ class Remover:
         inputs = {
             "head": self.head,
             "merged_head": self.o.merged_head,
-            "baseline_digest": rec["baseline_digest"],
+            "baseline_digest": baselinesvc.recorded_digest(rec),
             "overridden": list(self.overridden),
         }
         self.journal.check_writable()

@@ -829,7 +829,12 @@ class Creator:
                 added = self._added_on_disk()
             if not added:
                 raise WtctlError("create_failed", "git worktree add did not create the worktree")
-            dir_id = self._verify_placement()
+            try:
+                dir_id = self._verify_placement()
+            except WtctlError as exc:
+                if (exc.fields.get("details") or {}).get("cause") == "anchor_changed":
+                    self._settle_unplaced(record, plan, created[0] if created else None, exc)
+                raise
             info = worktrees.inspect_added(self.git, common, self.path)
             self.state.transition(
                 record["id"],
@@ -951,6 +956,49 @@ class Creator:
                 return identity_str(os.fstat(fd))
             finally:
                 os.close(fd)
+
+    def _settle_unplaced(
+        self, record: Record, plan: Plan, created_sha: str | None, exc: WtctlError
+    ) -> None:
+        """The worktree directory cannot be verified after the add (a mount or a swapped parent
+        got in the way): no ``dir_id`` is recorded and nothing in it is touched. The record
+        becomes ``partial`` with the admin entry git made (found from the common dir only) and the
+        sha the branch was created at, so ``remove`` can clear the admin entry and the branch and
+        never the directory; ``details.remaining`` names what is left. Any failure here keeps the
+        record ``creating`` (reconcile settles it)."""
+        common = self.res.common_dir
+        try:
+            admin = worktrees.admin_for_path(common, self.path)
+            if admin is None:
+                return
+            info = worktrees.inspect_existing(self.git, common, admin)
+            made = created_sha if plan.created_branch else None
+            last = (
+                f"{self.path} could not be verified after the add: it is not the directory "
+                "created; nothing in it was touched. `wtctl remove` clears the admin entry and "
+                "the branch, `wtctl forget` the record"
+            )
+            self.state.transition(
+                record["id"], "creating", "partial",
+                admin_dir=admin, head_at_create=made or info.head,
+                reflog_start_ts=self.state.timestamp(), reflog_start_sha=info.reflog_start_sha,
+                stash_ids=info.stash_ids, last_error=last[:500],
+            )  # fmt: skip
+        except Exception as inner:  # noqa: BLE001 - the original error is what the caller needs
+            self._annotate(exc, [f"record {record['id']} could not be made `partial` ({inner})"])
+            return
+        left = [admin]
+        if plan.created_branch and plan.branch:
+            left.append(f"refs/heads/{plan.branch}")
+        left.append(self.path)
+        details = exc.fields["details"]
+        details["remaining"] = [fsafe.escape_for_details(x) for x in left]
+        exc.message += (
+            f" (record {record['id']} is `partial`; the directory was not touched; "
+            f"finish it with `wtctl remove {record['id']}`, which deletes only the admin entry "
+            "and the branch)"
+        )
+        exc.args = (exc.message,)
 
     @staticmethod
     def _on_another_mount(parent_fd: int, child_fd: int) -> bool:
