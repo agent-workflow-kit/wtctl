@@ -267,7 +267,7 @@ def test_r8_a_parent_swapped_after_the_add_is_anchor_changed(w: CW) -> None:
     assert err["code"] == "create_failed" and err["details"]["cause"] == "anchor_changed"
     assert err["details"]["anchors"]
     [rec] = w.records()
-    assert rec["state"] == "creating"  # after the add: the record stays for reconcile
+    assert rec["state"] == "partial" and rec["dir_id"] is None  # settled (#83), nothing deleted
 
 
 # -- R9: the admin entry count only counts real entries --------------------------------------------

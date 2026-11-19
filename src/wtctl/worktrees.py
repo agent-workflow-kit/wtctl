@@ -155,7 +155,11 @@ def admin_for_path(common_dir: str, path: str) -> str | None:
     (never from the worktree directory, which a mount may cover). ``None`` for none or for more
     than one (an ambiguity is never guessed at)."""
     mine = os.path.join(path, ".git")
-    hits = [a for a, g in _admin_pairs(common_dir) if g == mine and ADMIN_NAME.fullmatch(os.path.basename(a))]
+    hits = [
+        a
+        for a, g in _admin_pairs(common_dir)
+        if g == mine and ADMIN_NAME.fullmatch(os.path.basename(a))
+    ]
     return hits[0] if len(hits) == 1 else None
 
 

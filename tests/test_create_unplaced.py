@@ -1,5 +1,5 @@
-"""A mount placed between create's mount-point check and the ``dir_id`` open (issue #83; docs/design.md
-D62/D63, docs/interface.md Create order step 13, Reconcile, Remove order).
+"""A mount placed between create's mount-point check and the ``dir_id`` open (issue #83;
+docs/design.md D62, docs/interface.md Create order step 13, Reconcile, Remove order).
 
 The record never stays ``creating`` without a way out: create settles it ``partial`` with the admin
 entry and the creation sha, reconcile does the same for a record an older version left ``creating``,
@@ -240,7 +240,8 @@ def test_a_failing_admin_deletion_stops_before_the_branch(
     made(w, monkeypatch)
     [rec] = w.records()
     covered(monkeypatch)
-    monkeypatch.setattr(removal_delete, "delete_admin", lambda *a, **k: ("failed", [rec["admin_dir"]]))
+    failed = ("failed", [rec["admin_dir"]])
+    monkeypatch.setattr(removal_delete, "delete_admin", lambda *a, **k: failed)
     r = w.run("remove", rec["id"], "--yes", human=True)
     assert r.json()["error"]["code"] == "partial"
     assert branches(w) and w.records()[0]["state"] == "partial"

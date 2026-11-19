@@ -182,8 +182,8 @@ def repair_pointers(
 
 def planted(state: Any, rec: dict[str, Any]) -> tuple[str, str | None]:
     """What is at the planned path: ``absent``, ``unknown`` (cannot tell), ``mount`` (a mount
-    point: it is never opened), ``other`` or ``worktree`` with the admin directory its ``.git`` file names. Read with no-follow
-    descriptors from the recorded worktree root."""
+    point: it is never opened), ``other`` or ``worktree`` with the admin directory its
+    ``.git`` file names. Read with no-follow descriptors from the recorded worktree root."""
     base, path = rec["base_dir"], rec["path"]
     ident = state.anchor_identity(base) if base else None
     rel = os.path.relpath(path, base) if base else ".."
@@ -195,11 +195,7 @@ def planted(state: Any, rec: dict[str, Any]) -> tuple[str, str | None]:
             try:
                 pfd = fsafe.open_chain(anchor, anchor.fd, parts[:-1], start_path=anchor.path)
             except fsafe.FsafeError as exc:
-                return (
-                    ("absent", None)
-                    if exc.kind in ("missing", "not_dir")
-                    else ("unknown", None)
-                )
+                return ("absent", None) if exc.kind in ("missing", "not_dir") else ("unknown", None)
             try:
                 try:
                     anchor.fs.lstat_at(pfd, parts[-1])
