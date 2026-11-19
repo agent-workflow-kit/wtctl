@@ -595,7 +595,7 @@ def transfer_base(
             "git pack-objects in the mirror",
         )  # fmt: skip
 
-        # 5. index it outside any repository
+        # 5. index it in a throwaway bare repository (D65)
         idx = os.path.join(p, "x.idx")
         name = index_pack(git, pack, idx, p=p, timeout=timeout)
 

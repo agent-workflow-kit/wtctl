@@ -369,7 +369,7 @@ def test_a_mount_boundary_on_the_pack_directory_is_refused(w: World) -> None:
 
 @pytest.fixture
 def one_pack(w: World, tmp_path: Path) -> tuple[Path, Path, str]:
-    """A valid pack of a small repository, indexed outside any repository."""
+    """A valid pack of a small repository, indexed in a throwaway bare repository (D65)."""
     repo = w.tmp / "src"
     repo.mkdir()
     for args in (["init", "-q", "-b", "main"],):
@@ -562,6 +562,33 @@ def idx_of(w: World, pack: Path):  # noqa: ANN201
     return packs.index_pack(git, str(pack), str(p / "y.idx"), p=str(p), timeout=60)
 
 
+def index_with_stdout(w: World, pack: Path, stdout: str) -> str:
+    """Run ``index_pack`` on ``pack`` with the index-pack call's stdout replaced by ``stdout``."""
+
+    def after(argv: list[str], kw: dict[str, object], result: GitResult) -> GitResult:
+        if "index-pack" in argv:
+            return GitResult(result.returncode, stdout.encode(), result.stderr)
+        return result
+
+    git = Git(Recorder(after=after).gateway(), GIT, str(w.home))
+    p = w.tmp / "P3"
+    p.mkdir()
+    return packs.index_pack(git, str(pack), str(p / "z.idx"), p=str(p), timeout=60)
+
+
+def test_index_pack_takes_only_the_first_output_line_as_the_checksum(w: World, one_pack) -> None:  # noqa: ANN001
+    """Version-independent: git prints unchecked ``.gitmodules`` blob ids after the checksum."""
+    pack, _, name = one_pack
+    assert index_with_stdout(w, pack, f"{name}\n{'ab' * 20}\n") == name
+
+
+def test_index_pack_refuses_when_only_a_later_line_is_the_pack_checksum(w: World, one_pack) -> None:  # noqa: ANN001
+    pack, _, name = one_pack
+    with pytest.raises(WtctlError) as e:
+        index_with_stdout(w, pack, f"{'ab' * 20}\n{name}\n")
+    assert e.value.code == "create_failed"
+
+
 def test_a_corrupt_pack_is_refused(w: World, one_pack) -> None:  # noqa: ANN001
     pack, _, _ = one_pack
     data = bytearray(pack.read_bytes())
@@ -697,6 +724,8 @@ def gitmodules_tree_pack(w: World, dest: Path) -> None:
 def test_a_tree_naming_a_gitmodules_blob_that_is_not_in_the_pack_is_indexed(w: World) -> None:
     """Regression (#90): git 2.34.1 segfaulted (exit 139) in ``index-pack --fsck-objects`` outside
     a repository on any pack whose tree names ``.gitmodules`` without carrying the blob."""
+    # The crash coverage applies only on git versions that crash outside a repository (2.34.x);
+    # the version-independent guards are the argv/env test above and the first-line tests below.
     pack = w.tmp / "gm.pack"
     gitmodules_tree_pack(w, pack)
     name = idx_of(w, pack)
@@ -717,6 +746,8 @@ def test_a_bad_gitmodules_url_in_a_pack_with_its_tree_is_still_refused(w: World)
 def test_a_range_whose_trees_name_an_unchanged_gitmodules_transfers(w: World) -> None:
     """Regression (#90) through the whole transfer: the clone already has ``.gitmodules``; the
     range's new commits leave it alone, so their trees name a blob the pack does not carry."""
+    # The crash coverage applies only on git versions that crash outside a repository (2.34.x);
+    # the version-independent guards are the argv/env test and the first-line tests.
     w.build(1)
     (w.work / ".gitmodules").write_text('[submodule "x"]\n\tpath = x\n\turl = ../x.git\n')
     w.commit("gm")

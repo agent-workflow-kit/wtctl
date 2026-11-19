@@ -141,7 +141,7 @@ wtctl keeps one bare, treeless **mirror** per clone, which it alone configures. 
   - The only network transfers are into the mirror: a fetch of tree objects and, when the mirror lacks the start commit, a fetch of that commit by its id. Nothing is fetched into the clone.
   - Every git command that reads the clone runs with `GIT_ALLOW_PROTOCOL=none` ([Hardened git](#hardened-git)); no `fetch`, `clone` or `push` runs against the clone, and no git command at all runs in the clone while objects are written into it.
   - The pack is built in the mirror and is **not thin** (it resolves without any object of the clone): resolving a thin pack in the clone would make git lazily fetch the bases it lacks.
-  - It is indexed and checked (`--fsck-objects`) outside any repository, before anything is written to the clone.
+  - It is indexed and checked (`--fsck-objects`) in a throwaway bare repository inside `P`, before anything is written to the clone (D65).
   - It is installed by plain file writes that create only new files below `<common>/objects/pack/`, opened through a no-follow fd chain from the recorded common dir, whose opened fd must have the record's `common_id`, with every directory and every file it writes on the common dir's device and mount ([Mount points](#mount-points); otherwise `create_failed`); no ref, config, `FETCH_HEAD` or other file of the clone is written.
   - Before `worktree add`, wtctl verifies that the clone now holds every object reachable from the start commit; otherwise `create` fails. Planted refs, alternates or deleted objects in the clone can at most make the transfer fail (objects are content-addressed).
 
