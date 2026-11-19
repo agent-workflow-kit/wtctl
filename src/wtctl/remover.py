@@ -645,8 +645,9 @@ class Remover:
     def _left_unplaced(self, rec: Record, prepared: Prepared, shown: list[str], kind: str) -> None:
         why = "a mount point" if kind == "mount" else "not verifiable as the worktree"
         error = (
-            f"{shown[0]} was left untouched ({why}); inspect or unmount it, run `wtctl remove` "
-            "again if it is the worktree, or `wtctl forget` the record"
+            f"{shown[0]} was left untouched ({why}); inspect or unmount it and run `wtctl remove` "
+            "again if it then is the worktree; an empty or foreign leftover directory needs "
+            "removing by hand, or `wtctl forget` the record"
         )
         self.state.transition(rec["id"], "partial", "partial", last_error=error[:500])
         note = self._audit_failed(prepared)
@@ -880,7 +881,7 @@ class Remover:
         inputs = {
             "head": self.head,
             "merged_head": self.o.merged_head,
-            "baseline_digest": rec["baseline_digest"],
+            "baseline_digest": baselinesvc.recorded_digest(rec),
             "overridden": list(self.overridden),
         }
         self.journal.check_writable()

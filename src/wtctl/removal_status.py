@@ -227,6 +227,9 @@ class Status:
     def worktree(self, merged_head: str | None, holder: str | None) -> None:
         r, ctx = self.record, self.ctx
         self.git = open_git(self.config, ctx.gateway)
+        if r["state"] == "partial" and r["dir_id"] is None:
+            self.unplaced()
+            return
         if r["state"] in NOT_ACTIVE or r["dir_id"] is None:
             self.checks["integrity"] = {
                 "status": "fail",
@@ -339,6 +342,21 @@ class Status:
             self.in_use()
             return
         self.in_use()
+
+    def unplaced(self) -> None:
+        """A ``partial`` worktree with no ``dir_id`` (a mount covered its directory): ``remove``
+        finishes it without opening the directory, so only the in-use check runs here and the
+        content checks are excused (Unplaced records)."""
+        r = self.record
+        self.skip_git_checks()
+        self.checks["integrity"] = {"status": "skipped", "details": []}
+        self.checks["locked"] = removal_integrity.lock_check(r)
+        self.by_design_skipped = True
+        self.in_use()
+        self.warnings.append(
+            f"{_escape(r['path'])} is not verified (a mount covers it or it is not the worktree); "
+            "remove clears only the admin entry and the branch"
+        )
 
     def partial_worktree_unlinked(self) -> None:
         """A ``partial`` worktree whose pointers are gone: only the recorded path is verified,

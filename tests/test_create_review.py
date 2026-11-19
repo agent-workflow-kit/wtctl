@@ -254,7 +254,7 @@ def test_r7_a_worktree_inside_one_of_another_known_clone_is_refused(w: CW, capsy
 # -- R8: a parent swapped for a symlink after the checks -------------------------------------------
 
 
-def test_r8_a_parent_swapped_after_the_add_is_anchor_changed(w: CW) -> None:
+def test_r8_a_parent_swapped_after_the_add_is_anchor_changed_and_settles_partial(w: CW) -> None:
     host = w.root.resolve() / "worktrees" / "example.test"
 
     def swap(sub, argv, kw, result):  # noqa: ANN001, ANN202
@@ -263,6 +263,8 @@ def test_r8_a_parent_swapped_after_the_add_is_anchor_changed(w: CW) -> None:
             host.symlink_to(w.tmp / "moved-host")
         return None
 
+    # the swap happens after git wrote the admin entry, so it names the planned path and settles;
+    # a swap before the add leaves git recording the resolved path (record stays `creating`)
     err = refused(cli_spy(w, Spy(after=swap)), 12)
     assert err["code"] == "create_failed" and err["details"]["cause"] == "anchor_changed"
     assert err["details"]["anchors"]

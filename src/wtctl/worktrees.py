@@ -525,7 +525,8 @@ def inspect_added(git: Git, common_dir: str, path: str) -> Added:
 
 def reflog_first(admin: str) -> str | None:
     """The commit the admin entry's HEAD reflog starts at: where HEAD stood when git created the
-    worktree (``None`` when there is no usable entry)."""
+    worktree. ``None`` when there is no usable entry or the first line is not the creation entry
+    (its old value is not all zeros: the reflog expired or was edited)."""
     return _reflog_last(admin, first=True)
 
 
@@ -540,6 +541,8 @@ def _reflog_last(admin: str, *, first: bool = False) -> str | None:
         return None
     fields = lines[0 if first else -1].split(b" ", 2)
     new = fields[1].decode("ascii", "replace") if len(fields) > 1 else ""
+    if first and fields[0] != b"0" * 40:
+        return None
     return new if SHA.fullmatch(new) else None
 
 

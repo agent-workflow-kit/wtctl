@@ -172,6 +172,9 @@ def test_remove_after_the_mount_is_gone_goes_on_as_a_normal_remove(
     row = w.records()[0]
     assert row["state"] == "removed" and row["dir_id"] is not None
     assert not Path(rec["path"]).exists() and w.admin_entries() == []
+    validate("wtctl/cli/show.json", w.run("show", rec["id"]).json())  # null baseline_digest
+    for a in w.audit_records():
+        validate("wtctl/audit.json", a)
 
 
 def test_the_branch_is_kept_when_it_moved(w: TW, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -191,6 +194,84 @@ def test_a_branch_this_create_did_not_make_is_kept(w: TW, monkeypatch: pytest.Mo
     covered(monkeypatch)
     assert w.run("remove", rec["id"], "--yes", human=True).code != 0
     assert branches(w) and w.admin_entries() == []
+
+
+def finish_gone(w: TW, rec: sqlite3.Row, *argv: str) -> dict:
+    """The files lived in the mount and vanished with it: remove finishes the record."""
+    shutil.rmtree(rec["path"])
+    r = w.run("remove", rec["id"], "--yes", *argv, human=True)
+    assert r.code == 0, (r.out, r.err)
+    return r.json()
+
+
+def test_the_branch_is_kept_with_keep_branch(w: TW, monkeypatch: pytest.MonkeyPatch) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    out = finish_gone(w, rec, "--keep-branch")
+    assert out["branch_deleted"] is False and out["branch_kept_reason"] == "keep_branch"
+    assert branches(w)
+
+
+def test_the_branch_is_kept_when_deleting_branches_is_disabled(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    w.top["remove"] = {"delete_branch": False}
+    out = finish_gone(w, rec)
+    assert out["branch_deleted"] is False and out["branch_kept_reason"] == "disabled"
+    assert branches(w)
+
+
+def test_the_branch_is_kept_when_another_worktree_has_it(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    w.g(["worktree", "add", "--force", str(w.tmp / "other"), rec["branch"]])
+    shutil.rmtree(rec["path"])
+    r = w.run("remove", rec["id"], "--yes", human=True)
+    assert r.code == 0, (r.out, r.err)
+    assert r.json()["branch_kept_reason"] == "checked_out_elsewhere" and branches(w)
+
+
+def test_a_reflog_without_its_creation_entry_never_lets_remove_delete_the_branch(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rec = old_creating(w, monkeypatch)
+    log = Path(rec["common_dir"]) / "worktrees"
+    [entry] = [p for p in log.iterdir() if (p / "logs" / "HEAD").exists()]
+    f = entry / "logs" / "HEAD"
+    lines = f.read_text().splitlines(keepends=True)
+    f.write_text("".join(lines[1:]) or f"{'1' * 40} {w.shas['c3']} x <x> 0 +0000\tcommit: more\n")
+    covered(monkeypatch)
+    w.run("reconcile")
+    row = w.records()[0]
+    assert row["state"] == "partial" and not row["created_branch"]
+    w.run("remove", rec["id"], "--yes", human=True)
+    assert branches(w)
+
+
+def test_the_audit_line_of_an_unplaced_remove_is_valid(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    finish_gone(w, rec)
+    lines = w.audit_records()
+    assert lines
+    for a in lines:
+        validate("wtctl/audit.json", a)
+
+
+def test_status_says_an_unplaced_record_would_be_removed(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    covered(monkeypatch)
+    out = w.run("remove", rec["id"], "--dry-run", human=True).json()
+    assert out["would_remove"] is True, out
 
 
 def test_a_locked_admin_entry_is_never_cleared(w: TW, monkeypatch: pytest.MonkeyPatch) -> None:
