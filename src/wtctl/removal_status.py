@@ -228,8 +228,14 @@ class Status:
         r, ctx = self.record, self.ctx
         self.git = open_git(self.config, ctx.gateway)
         if r["state"] == "partial" and r["dir_id"] is None:
-            self.unplaced()
-            return
+            # remove rebinds first (the directory is verifiably the worktree again: the normal
+            # checks run), so the probe is the same, but read-only: nothing is recorded here
+            try:
+                links = linkcheck.verify_links(r, self.state)
+            except WtctlError:
+                self.unplaced()
+                return
+            r = self.record = {**r, "dir_id": links.dir_id}
         if r["state"] in NOT_ACTIVE or r["dir_id"] is None:
             self.checks["integrity"] = {
                 "status": "fail",

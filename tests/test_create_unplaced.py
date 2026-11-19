@@ -505,3 +505,95 @@ def test_a_real_mount_that_is_gone_before_remove_lets_it_finish_normally(tmp_pat
     assert out["create"] == 12 and out["state_before"] == "partial"
     assert out["remove"] == 0 and out["state"] == "removed"
     assert out["admin"] == [] and out["branches"] == [] and out["dir_exists"] is False
+
+
+# -- status agrees with remove once the mount is gone ---------------------------------------------
+
+
+def test_status_of_an_unplaced_record_whose_mount_is_gone_runs_the_normal_checks(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    (Path(rec["path"]) / "uncommitted").write_text("x")  # the directory is the worktree again
+    dry = w.run("remove", rec["id"], "--dry-run", human=True).json()
+    assert dry["would_remove"] is False and "dirty" in str(dry), dry
+    assert w.records()[0]["dir_id"] is None  # status never records the identity
+    r = w.run("remove", rec["id"], "--yes", human=True)
+    assert r.code != 0 and r.json()["error"]["reason"] == "dirty", r.out
+    assert w.admin_entries() and branches(w)
+
+
+# -- the unplaced plan and status guards ---------------------------------------------------------
+
+
+def test_a_branch_deleted_before_an_unplaced_remove_is_not_deleted_again(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import worktrees
+
+    made(w, monkeypatch)
+    [rec] = w.records()
+    w.g(["update-ref", "-d", branches(w)[0]])
+    calls: list[object] = []
+    monkeypatch.setattr(worktrees, "delete_created_branch", lambda *a, **k: calls.append(a))
+    out = finish_gone(w, rec)
+    assert calls == [] and w.admin_entries() == []
+    assert out["branch_deleted"] is False and out["branch_kept_reason"] == "not_created"
+    assert f"the branch {rec['branch']} no longer exists" in out["warnings"], out
+
+
+def test_a_clone_whose_worktrees_cannot_be_listed_keeps_the_branch(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import worktrees
+
+    made(w, monkeypatch)
+    [rec] = w.records()
+
+    def boom(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        raise WtctlError("create_failed", "cannot list")
+
+    monkeypatch.setattr(worktrees, "worktree_entries", boom)
+    out = finish_gone(w, rec)
+    assert out["branch_deleted"] is False and out["branch_kept_reason"] == "checked_out_elsewhere"
+    assert "the worktrees of the clone could not be listed; branch kept" in out["warnings"], out
+    assert branches(w)
+
+
+def test_status_of_an_unplaced_record_with_a_process_in_it_says_in_use(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wtctl import inuse
+
+    made(w, monkeypatch)
+    [rec] = w.records()
+    covered(monkeypatch)
+    busy = inuse.InUse("fail", [{"pid": 1, "cwd": rec["path"]}])
+    monkeypatch.setattr(inuse, "check_in_use", lambda *a, **k: busy)
+    out = w.run("remove", rec["id"], "--dry-run", human=True).json()
+    assert out["would_remove"] is False and out["reason"] == "in_use", out
+    assert w.admin_entries() and branches(w)
+
+
+def test_status_of_an_unplaced_record_skips_integrity_and_says_it_is_not_verified(
+    w: TW, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made(w, monkeypatch)
+    [rec] = w.records()
+    covered(monkeypatch)
+    out = w.run("status", rec["id"], human=True).json()
+    checks = out["checks"]
+    assert checks["integrity"] == {"status": "skipped", "details": []}
+    assert checks["locked"]["status"] == "pass"
+    assert any("is not verified" in x for x in out["warnings"]), out["warnings"]
+
+
+def test_a_real_mount_over_a_crashed_creating_record_is_settled_partial_by_reconcile(
+    tmp_path: Path,
+) -> None:
+    out = _userns(tmp_path, "unplaced_userns_reconcile_scenario.py")
+    assert out["create"] == 12
+    assert out["changes"] == [[out["rid"], "partial", "abandon_unplaced"]], out
+    assert out["state"] == "partial" and out["dir_id"] is None
+    assert out["admin_dir"] and len(out["admin"]) == 1
