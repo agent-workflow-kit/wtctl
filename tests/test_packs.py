@@ -201,7 +201,8 @@ def test_every_command_against_the_clone_runs_with_protocols_none(w: World) -> N
     assert not any("--thin" in c[0] or "--fix-thin" in c[0] for c in rec.calls)
 
 
-def test_the_pack_is_indexed_outside_any_repository(w: World) -> None:
+def test_the_pack_is_indexed_in_a_throwaway_bare_repository(w: World) -> None:
+    """D65: never outside a repository (git 2.34 segfaults there on some packs), never in the clone."""
     rec = Recorder()
     w = World(w.tmp, w.home, gateway=rec.gateway())
     _, new = lagging(w)
@@ -209,9 +210,15 @@ def test_the_pack_is_indexed_outside_any_repository(w: World) -> None:
     rec.calls.clear()
     run_transfer(w, m, new[-1])
     ((argv, env, cwd),) = [c for c in rec.calls if "index-pack" in c[0]]
-    assert "--fsck-objects" in argv and not any(a.startswith("--git-dir") for a in argv)
-    assert env["GIT_CEILING_DIRECTORIES"] == os.path.dirname(cwd)
-    assert "--strict" not in argv and "--fix-thin" not in argv
+    gds = [a for a in argv if a.startswith("--git-dir=")]
+    assert len(gds) == 1
+    gd = gds[0].split("=", 1)[1]
+    assert os.path.dirname(gd) == cwd  # a repository inside wtctl's private directory
+    assert gd != str(w.clone / ".git") and gd != m.path
+    assert "--fsck-objects" in argv and "--strict" not in argv and "--fix-thin" not in argv
+    assert env["GIT_ALLOW_PROTOCOL"] == "none"
+    assert any("init" in c[0] and "--bare" in c[0] and gd in c[0] for c in rec.calls)
+    assert not os.path.exists(gd)  # gone with the private directory
 
 
 # -- planted promisor remote (SAFE2-2) -----------------------------------------------------------
@@ -671,6 +678,57 @@ def test_a_pack_with_a_bad_gitmodules_url_is_refused_when_git_flags_it(w: World)
     except WtctlError:
         return
     pytest.skip("this git's --fsck-objects accepts it")
+
+
+def gitmodules_tree_pack(w: World, dest: Path) -> None:
+    """A pack of one tree naming ``.gitmodules`` whose blob is NOT in the pack (a range that does
+    not touch ``.gitmodules`` has exactly this shape)."""
+    repo = w.tmp / "gm"
+    repo.mkdir()
+    plain_git(["init", "-q", "-b", "main"], cwd=repo, home=w.home)
+    absent = "d0dba77f6852e55da49a014badab3970a79d66d3"
+    body = b"100644 .gitmodules\0" + bytes.fromhex(absent)
+    r = plain_git(["hash-object", "-w", "--literally", "-t", "tree", "--stdin"],
+                  cwd=repo, home=w.home, stdin=body)  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    pack_ids(w, repo, [r.stdout.decode().strip()], dest)
+
+
+def test_a_tree_naming_a_gitmodules_blob_that_is_not_in_the_pack_is_indexed(w: World) -> None:
+    """Regression (#90): git 2.34.1 segfaulted (exit 139) in ``index-pack --fsck-objects`` outside
+    a repository on any pack whose tree names ``.gitmodules`` without carrying the blob."""
+    pack = w.tmp / "gm.pack"
+    gitmodules_tree_pack(w, pack)
+    name = idx_of(w, pack)
+    assert len(name) == 40
+
+
+def test_a_gitmodules_blob_with_a_bad_url_in_a_pack_with_its_tree_is_still_refused(w: World) -> None:
+    """The invariant behind D65: moving into a repository must not skip the fsck of the blob."""
+    mod = b'[submodule "x"]\n\tpath = x\n\turl = -u./payload\n'
+    repo, _, ids = evil_repo(w, [(b"100644", b".gitmodules", mod)])
+    pack = w.tmp / "evil.pack"
+    pack_ids(w, repo, ids, pack)
+    with pytest.raises(WtctlError) as e:
+        idx_of(w, pack)
+    assert e.value.code == "create_failed"
+
+
+def test_a_range_whose_trees_name_an_unchanged_gitmodules_transfers(w: World) -> None:
+    """Regression (#90) through the whole transfer: the clone already has ``.gitmodules``; the
+    range's new commits leave it alone, so their trees name a blob the pack does not carry."""
+    w.build(1)
+    (w.work / ".gitmodules").write_text('[submodule "x"]\n\tpath = x\n\turl = ../x.git\n')
+    w.commit("gm")
+    w.g(["push", "-q", "origin", "HEAD:main"])
+    w.g(["pull", "-q", "origin", "main"], w.clone)
+    new = [w.commit(f"n{i}") for i in range(3)]
+    w.g(["push", "-q", "origin", "HEAD:main"])
+    m = refreshed(w)
+    got = run_transfer(w, m, new[-1])
+    assert got.commits == 3
+    assert cg(w, ["cat-file", "-t", new[-1]]) == "commit"
+    cg(w, ["fsck", "--strict", "--no-dangling"])
 
 
 def test_a_thin_pack_is_refused(w: World) -> None:
@@ -1262,6 +1320,8 @@ def test_an_index_that_names_another_pack_is_refused(w: World, one_pack) -> None
     pack, _, _ = one_pack
 
     def corrupt_idx(argv: list[str], kw: dict[str, object], r: GitResult) -> GitResult:
+        if "index-pack" not in argv:
+            return r
         idx = argv[argv.index("-o") + 1]
         os.chmod(idx, 0o644)
         with open(idx, "r+b") as f:
