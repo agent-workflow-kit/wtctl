@@ -120,20 +120,36 @@ def _sha_lines(path: str, *, what: str, limit: int = MAX_RANGE_COMMITS) -> int:
 
 
 def index_pack(git: Git, pack: str, idx: str, *, p: str, timeout: float) -> str:
-    """Index ``pack`` OUTSIDE any repository and return its checksum ``<h>`` (40 hex).
+    """Index ``pack`` in a throwaway bare repository and return its checksum ``<h>`` (40 hex).
 
-    Runs with cwd ``p`` (a fresh private directory) and ``GIT_CEILING_DIRECTORIES`` its parent, so
-    no repository and no config is read. ``--fsck-objects`` rejects objects that fail fsck (a
-    ``.gitmodules`` abuse, a malformed tree); ``--strict`` is not used here (it crashes outside a
-    repository on git 2.34) and ``--fix-thin`` never: a thin pack is refused, because resolving it
-    would need objects of the clone. The name is checked against the pack's own trailer, so a
-    forged name cannot reach the install.
+    The repository is ``p/idx.git``, made here with ``init --bare --template=`` (no hooks, no
+    templates; its config is the one ``init`` writes, and the hardened environment reads no other),
+    empty and never the clone. Not outside any repository: git 2.34.1 segfaults (exit 139) in
+    ``index-pack --fsck-objects`` there when a tree names ``.gitmodules`` (observed with the blob
+    absent or present; a range that leaves ``.gitmodules`` alone is the common absent case; D65,
+    #90).
+    Inside any repository the same command is fine and gives the same index. ``--fsck-objects``
+    rejects objects that fail fsck (a ``.gitmodules`` abuse, a malformed tree); ``--strict`` is not
+    used (it also checks connectivity, which a range pack cannot satisfy) and ``--fix-thin``
+    never: a thin pack is refused, because resolving it would need objects of the clone. The name
+    is checked against the pack's own trailer, so a forged name cannot reach the install.
     """
-    r = _checked(
-        git.run(["index-pack", "--fsck-objects", "-o", idx, pack], private_dir=p, timeout=timeout),
-        "git index-pack",
+    repo = os.path.join(p, "idx.git")
+    _checked(
+        git.run(["init", "-q", "--bare", "--template=", "--", repo], private_dir=p, timeout=60),
+        "git init of the indexing repository",
     )
-    name = r.out.strip()
+    r = _checked(
+        git.run(
+            ["index-pack", "--fsck-objects", "-o", idx, pack],
+            git_dir=repo, cwd=p, timeout=timeout,
+        ),
+        "git index-pack",
+    )  # fmt: skip
+    # Inside a repository git 2.34 also prints the id of each ``.gitmodules`` blob it could not
+    # check (the pack does not carry it) after the checksum; only the first line is the checksum,
+    # and it is compared with the pack's own trailer below.
+    name = r.out.split("\n", 1)[0].strip()
     if not _SHA.fullmatch(name):
         raise _fail("git index-pack printed no pack checksum")
     with open(pack, "rb") as f:
@@ -580,7 +596,7 @@ def transfer_base(
             "git pack-objects in the mirror",
         )  # fmt: skip
 
-        # 5. index it outside any repository
+        # 5. index it in a throwaway bare repository (D65)
         idx = os.path.join(p, "x.idx")
         name = index_pack(git, pack, idx, p=p, timeout=timeout)
 
