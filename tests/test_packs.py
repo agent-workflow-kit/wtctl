@@ -202,7 +202,7 @@ def test_every_command_against_the_clone_runs_with_protocols_none(w: World) -> N
 
 
 def test_the_pack_is_indexed_in_a_throwaway_bare_repository(w: World) -> None:
-    """D65: never outside a repository (git 2.34 segfaults there on some packs), never in the clone."""
+    """D65: never outside a repository (git 2.34 segfaults on some packs), never in the clone."""
     rec = Recorder()
     w = World(w.tmp, w.home, gateway=rec.gateway())
     _, new = lagging(w)
@@ -703,7 +703,7 @@ def test_a_tree_naming_a_gitmodules_blob_that_is_not_in_the_pack_is_indexed(w: W
     assert len(name) == 40
 
 
-def test_a_gitmodules_blob_with_a_bad_url_in_a_pack_with_its_tree_is_still_refused(w: World) -> None:
+def test_a_bad_gitmodules_url_in_a_pack_with_its_tree_is_still_refused(w: World) -> None:
     """The invariant behind D65: moving into a repository must not skip the fsck of the blob."""
     mod = b'[submodule "x"]\n\tpath = x\n\turl = -u./payload\n'
     repo, _, ids = evil_repo(w, [(b"100644", b".gitmodules", mod)])
