@@ -773,7 +773,7 @@ wheels = [
 
 [[package]]
 name = "wtctl"
-version = "0.32.2"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
