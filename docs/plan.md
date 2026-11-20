@@ -1,8 +1,8 @@
 # wtctl: implementation plan
 
-Status: stages 0-5 implemented and released (v0.27.1 as of 2026-11-17) except open #79 in stage 2; stage 6 is open and human-owned. Implements [interface.md](interface.md) (normative) using the decisions and internal architecture in [design.md](design.md). Work is tracked as GitHub issues in this repo; each issue names its stage below, and each stage's **Status** lists the issues that delivered it. The bite-sized, test-first steps for an issue are written when the issue is picked up.
+Status: stages 0-5 implemented and released; 1.0 declared on 2026-11-20 with the stage 6 items below waived by the maintainer for 1.0 and kept open as post-1.0 follow-ups. Implements [interface.md](interface.md) (normative) using the decisions and internal architecture in [design.md](design.md). Work is tracked as GitHub issues in this repo; each issue names its stage below, and each stage's **Status** lists the issues that delivered it. The bite-sized, test-first steps for an issue are written when the issue is picked up.
 
-The stage numbers and the 0.1-0.5 labels below are plan milestones, not release numbers: the release job cuts one release per merged change (PR), plus a few patch releases, so the shipped versions run v0.1.0 to v0.27.1 (see [CHANGELOG.md](../CHANGELOG.md)).
+The stage numbers and the 0.1-0.5 labels below are plan milestones, not release numbers: the release job cuts one release per merged change (PR), plus a few patch releases, so the shipped versions run v0.1.0 to v0.32.2, then v1.0.0 (see [CHANGELOG.md](../CHANGELOG.md)).
 
 ## Conventions for every stage
 
@@ -155,11 +155,11 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 - `live` suite re-run on the user's machines.
 - Large-repository timing: nested scan at the default limit and mirror refresh on a monorepo-sized remote. The synthetic local run is recorded in design.md (Large-repository timing); the same measurement on the maintainer's real monorepo and forge remains.
 
-**Status**: In progress, human-owned. Not started: #26 (macOS checklist), #27 (WSL checklist), #29 (1.0 readiness). Code merged, issue open for the maintainer's real-environment run: #25 (`live` suite) and #28 (large-repository timing: the harness in `tests/bench/` and the synthetic local timings in design.md are merged; the measurement on the maintainer's real monorepo and forge remains).
+**Status**: Closed for 1.0 by maintainer waiver (2026-11-20): "We will waive those for 1.0 since I'm not going to do them just yet." Not run or not done, and not part of the 1.0 claim; each issue stays open as a post-1.0 follow-up: #25 (the credentialed `live` run, including its git 2.45+ and Apple-git vectors and the `GIT_NO_LAZY_FETCH` behaviour on a git that honors it), #26 (macOS checklist), #27 (WSL checklist), #28 (large-repository timing on the maintainer's real monorepo and forge; the harness in `tests/bench/` and the synthetic timings in design.md are merged), and the consumers' integration (review-run and review-respond do not call wtctl yet; agent-spawn does). #29 (1.0 readiness) is closed by the declaration.
 
 ## Version roadmap
 
-Done (0.x, shipped as v0.1.0 to v0.27.1; one release per merged change (PR), plus a few patch releases):
+Done (0.x, shipped as v0.1.0 to v0.32.2; one release per merged change (PR), plus a few patch releases):
 
 - **0.1** (stage 1): hardened git, `locate`, `clone`, the mirror. Done.
 - **0.2** (stage 2): `create`, bootstrap, baseline, `adopt`/`forget`. Done. Labels and hooks shipped earlier, in stage 0.
@@ -167,8 +167,11 @@ Done (0.x, shipped as v0.1.0 to v0.27.1; one release per merged change (PR), plu
 - **0.4** (stage 4): throwaways, `extract`, `prune`; enough for review-run and review-respond. Done.
 - **0.5** (stage 5): `reconcile`, recovery. Done. `cron` shipped earlier, in stage 0.
 
-Open:
+Declared:
 
-- **1.0** (stage 6, human-owned): the macOS and WSL checklists (#26, #27), the `live` run (#25), the real-monorepo timing (#28), and the consumers' integration with a deliberate breaking-change commit (#29, architecture §18.3). agent-spawn and review-respond must have used the interface without changes first.
-- **1.x** (additive): recursive submodule checks (#30, done: removing worktrees with initialized submodules without `--force`), sparse-checkout support (#31, done: `create --sparse`, cone only), a `browse` TUI (#32, done: read-only `curses` view, no new dependency), more fetch-error classifications (#33).
+- **1.0** (stage 6, declared 2026-11-20 by a deliberate breaking-change commit, #29, architecture §18.3, with `major_on_zero = true` set in the same change): the interface is stable. The stage 6 items were waived for 1.0 and are post-1.0 follow-ups (stage 6 Status).
+
+Next:
+
+- **1.x** (additive; #30 to #33 shipped before 1.0): recursive submodule checks (#30, done: removing worktrees with initialized submodules without `--force`), sparse-checkout support (#31, done: `create --sparse`, cone only), a `browse` TUI (#32, done: read-only `curses` view, no new dependency), more fetch-error classifications (#33, done).
 - **2.0**: reserved for a breaking interface change.

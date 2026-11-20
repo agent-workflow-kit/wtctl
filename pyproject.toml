@@ -55,7 +55,7 @@ addopts = "-m 'not live and not bench'"
 version_toml = ["pyproject.toml:project.version"]
 commit_parser = "conventional"
 allow_zero_version = true
-major_on_zero = false
+major_on_zero = true
 tag_format = "v{version}"
 commit_message = "chore(release): v{version}"
 # Refresh the package's own entry in uv.lock, stage it with the release commit, build.

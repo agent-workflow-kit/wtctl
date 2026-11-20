@@ -4,7 +4,7 @@ Git worktrees, throwaway checkouts, and the mapping from repo ids to local clone
 
 ## Status
 
-Designed: interface 0.1.0-design ([docs/interface.md](docs/interface.md)); not yet implemented. Implementation plan: [docs/plan.md](docs/plan.md).
+Stable (1.0). The interface ([docs/interface.md](docs/interface.md)) is implemented and its CLI, `--json` output, hook payloads, config schema and exit codes are covered by semantic versioning: a breaking change is a major release. Implementation plan and post-1.0 follow-ups: [docs/plan.md](docs/plan.md).
 
 ## Layer
 
