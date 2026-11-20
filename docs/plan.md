@@ -91,7 +91,7 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 - adopt/forget: realpath, main worktree, `--holder` reference counting, `not_a_holder`, plain `forget` human-only, throwaways refused, lease and state rules.
 - `live`: git-lfs with `create.allow_filters: [lfs]` and the `unsafe_repo_config` refusal for planted LFS transfer keys.
 
-**Status**: Complete. Issues #15 (`create`), #16 (bootstrap), #17 (baseline), #18 (`adopt`, `forget`), plus the follow-ups #64 (baseline covers content behind symlinks), #65 (adopt nesting refusal only against live records), #68 (cross-device symlink targets are uncovered, not blocking), #70 (create re-checks path overlap inside the insert transaction), #71 (baseline skips verified linked worktrees beneath the main worktree), #77 (a baseline that cannot be recorded leaves no stuck `creating` record) #55 (`copy_env` walk under the child deadline) and #79 (`remove` finishes a partial worktree whose root is a mount point), found in review of #77.
+**Status**: Complete. Issues #15 (`create`), #16 (bootstrap), #17 (baseline), #18 (`adopt`, `forget`), plus the follow-ups #64 (baseline covers content behind symlinks), #65 (adopt nesting refusal only against live records), #68 (cross-device symlink targets are uncovered, not blocking), #70 (create re-checks path overlap inside the insert transaction), #71 (baseline skips verified linked worktrees beneath the main worktree), #77 (a baseline that cannot be recorded leaves no stuck `creating` record), #55 (`copy_env` walk under the child deadline) and #79 (`remove` finishes a partial worktree whose root is a mount point), found in review of #77.
 
 ## Stage 3: Removal (0.3)
 
