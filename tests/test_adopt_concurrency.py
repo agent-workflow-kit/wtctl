@@ -64,9 +64,16 @@ def patient(w: CW) -> None:
 
 def finish(procs: list[subprocess.Popen[str]]) -> list[tuple[int, str, str]]:
     out = []
-    for p in procs:
-        stdout, stderr = p.communicate(timeout=120)
-        out.append((p.returncode, stdout, stderr))
+    try:
+        for p in procs:
+            stdout, stderr = p.communicate(timeout=120)
+            out.append((p.returncode, stdout, stderr))
+    except subprocess.TimeoutExpired:
+        for p in procs:  # never leave the spawned processes running
+            p.kill()
+        for p in procs:
+            p.wait()
+        raise
     return out
 
 

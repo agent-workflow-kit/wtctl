@@ -371,9 +371,24 @@ def test_a_grandchild_left_behind_after_a_clean_exit_is_not_chased(r: Repo, tmp_
         assert not failed and alive(int(pid.read_text()))  # only a timeout kills the group
 
 
-def test_on_tick_runs_during_a_long_step(r: Repo) -> None:
+def test_on_tick_runs_during_a_long_step(r: Repo, tmp_path: Path) -> None:
+    # The step stays alive until the second tick has fired (bounded at 60s), so a stalled test
+    # process only delays the ticks instead of letting the step end before they happen.
     ticks: list[int] = []
-    run(r, [py("import time; time.sleep(2.3)")], on_tick=lambda: ticks.append(1))
+    gate = tmp_path / "two-ticks"
+
+    def tick() -> None:
+        ticks.append(1)
+        if len(ticks) >= 2:
+            gate.touch()
+
+    script = (
+        "import os, time\n"
+        "end = time.monotonic() + 60\n"
+        f"while not os.path.exists({str(gate)!r}) and time.monotonic() < end:\n"
+        "    time.sleep(0.05)\n"
+    )
+    run(r, [py(script)], on_tick=tick)
     assert len(ticks) >= 2
 
 
