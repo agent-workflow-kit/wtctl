@@ -34,6 +34,7 @@ MINIMAL: dict[str, list[str]] = {
     "locate": ["locate", "example.com/o/r"],
     "clone": ["clone", "example.com/o/r"],
     "export": ["export"],
+    "validate": ["validate"],
     "label_add": ["label", "add", SID, "k=v"],
     "label_remove": ["label", "remove", SID, "k=v"],
     "reconcile": ["reconcile"],
