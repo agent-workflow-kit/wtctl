@@ -20,9 +20,13 @@ from wtctl.gateway import Gateway, GitResult
 GOLDEN = Path(__file__).parent / "golden" / "validate_ok.json"
 
 
+GIT_CALLS: list[dict[str, Any]] = []
+
+
 def git_says(text: str, code: int = 0) -> Gateway:
     def runner(argv: list[str], **kwargs: Any) -> GitResult:
         assert argv[1:] == ["--version"]
+        GIT_CALLS.append(kwargs)
         return GitResult(code, text.encode(), b"")
 
     return Gateway(git_runner=runner)
@@ -282,6 +286,19 @@ def test_real_git(capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict
     assert r.json()["checks"]["git"]["version"][0].isdigit()
 
 
+def test_git_is_invoked_hardened(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]
+) -> None:
+    GIT_CALLS.clear()
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, **good))
+    assert r.code == 0
+    assert len(GIT_CALLS) == 1
+    call = GIT_CALLS[0]
+    assert call["cwd"] == "/"
+    assert call["timeout"] == 15
+    assert call["env"]["HOME"] == "/"
+
+
 def _tree(base: Path) -> list[tuple[str, int, int]]:
     out = []
     for dirpath, dirs, files in os.walk(base):
@@ -339,3 +356,152 @@ def test_read_only_state_dir_does_not_matter(
     monkeypatch.setenv("XDG_STATE_HOME", "/proc/nonexistent-wtctl-state")
     r = run_validate(capsys, "--json", "--config", config(tmp_path, **good))
     assert r.code == 0
+
+
+NOT_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+
+
+def test_dangling_symlink_root_below_writable_dir_is_fine(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "ro" / "new")
+    (tmp_path / "ro").mkdir()
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, root=str(link)))
+    assert r.code == 0
+    assert r.json()["checks"]["root"] == {"path": str(link), "exists": False}
+
+
+@NOT_ROOT
+def test_dangling_symlink_root_below_unwritable_dir_is_config_invalid(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(ro / "new")
+    ro.chmod(0o500)
+    try:
+        r = run_validate(capsys, "--json", "--config", config(tmp_path, root=str(link)))
+    finally:
+        ro.chmod(0o700)
+    assert r.code == 2
+    assert r.json()["error"]["message"].startswith("root:")
+
+
+def test_symlink_to_writable_dir_is_fine(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]
+) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(good["root"])
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, root=str(link)))
+    assert r.code == 0
+    assert r.json()["checks"]["root"] == {"path": str(link), "exists": True}
+
+
+def test_read_only_mount_root_is_config_invalid(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    good: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = os.statvfs
+
+    def fake(path: Any) -> Any:
+        st = real(path)
+
+        class V:
+            f_flag = st.f_flag | os.ST_RDONLY
+
+        return V()
+
+    monkeypatch.setattr(os, "statvfs", fake)
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, **good))
+    assert r.code == 2
+    assert r.json()["error"]["message"].startswith("root:")
+
+
+def test_statvfs_failure_is_ignored(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    good: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(path: Any) -> Any:
+        raise OSError("nope")
+
+    monkeypatch.setattr(os, "statvfs", boom)
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, **good))
+    assert r.code == 0
+
+
+@NOT_ROOT
+def test_root_without_search_bit_is_config_invalid(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    d = tmp_path / "noexec"
+    d.mkdir()
+    d.chmod(0o600)
+    try:
+        r = run_validate(capsys, "--json", "--config", config(tmp_path, root=str(d)))
+    finally:
+        d.chmod(0o700)
+    assert r.code == 2
+    assert r.json()["error"]["message"].startswith("root:")
+
+
+@NOT_ROOT
+def test_unreadable_search_root(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]
+) -> None:
+    d = tmp_path / "locked"
+    d.mkdir()
+    d.chmod(0)
+    try:
+        cfg = config(tmp_path, **good, search_roots=[str(d)])
+        r = run_validate(capsys, "--json", "--config", cfg)
+    finally:
+        d.chmod(0o700)
+    assert r.code == 0
+    data = r.json()
+    assert data["checks"]["search_roots"][0]["status"] == "unreadable"
+    assert data["warnings"][0]["code"] == "search_root_unusable"
+
+
+def test_too_long_search_root_is_missing(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]
+) -> None:
+    long = str(tmp_path / ("x" * 300))
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, **good, search_roots=[long]))
+    assert r.code == 0
+    data = r.json()
+    assert data["checks"]["search_roots"][0]["status"] == "missing"
+    assert data["warnings"][0]["code"] == "search_root_missing"
+
+
+def test_shown_cuts_at_exactly_max_shown() -> None:
+    from wtctl.commands.validate import MAX_SHOWN, shown
+
+    assert MAX_SHOWN == 200
+    assert shown("a" * 500) == "a" * 200 + "..."
+    assert shown("a" * 200) == "a" * 200
+
+
+def test_path_entry_with_newline_is_skipped(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    good: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = tmp_path / "bad\ndir"
+    bad.mkdir()
+    ok = tmp_path / "okbin"
+    ok.mkdir()
+    for d in (bad, ok):
+        g = d / "git"
+        g.write_text("#!/bin/sh\n")
+        g.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bad}{os.pathsep}{ok}")
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, **good))
+    assert r.code == 0
+    assert r.json()["checks"]["git"]["path"] == str(ok / "git")

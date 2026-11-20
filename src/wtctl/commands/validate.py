@@ -8,6 +8,7 @@ touches the network; the only process it starts is ``git --version``.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from typing import Any
@@ -42,9 +43,14 @@ def _check_root(root: str) -> dict[str, Any]:
     """``root`` must be a directory wtctl can write in, or be creatable below one.
 
     Looks only (``stat``, ``access``): the directory is never created. A symlink is followed
-    (``create`` resolves the root with ``realpath`` first).
+    (``create`` resolves the root with ``realpath`` first), also a dangling one: the walk and the
+    writability check run on the resolved path, while ``path`` stays the configured root.
     """
-    path = root
+    try:
+        resolved = os.path.realpath(root)
+    except (OSError, ValueError):
+        resolved = root
+    path = resolved
     while True:
         try:
             st = os.stat(path)
@@ -60,11 +66,19 @@ def _check_root(root: str) -> dict[str, Any]:
         break
     if not stat.S_ISDIR(st.st_mode):
         raise _invalid("root", f"{shown(path)} is not a directory")
-    if not os.access(path, os.W_OK | os.X_OK):
-        if path == root:
+    if not os.access(path, os.W_OK | os.X_OK) or _read_only_mount(path):
+        if path == resolved:
             raise _invalid("root", f"{shown(root)} is not writable")
         raise _invalid("root", f"{shown(root)} does not exist and {shown(path)} is not writable")
-    return {"path": root, "exists": path == root}
+    return {"path": root, "exists": path == resolved}
+
+
+def _read_only_mount(path: str) -> bool:
+    """True when ``path`` is on a read-only mount (``os.access`` can miss that); errors: no."""
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except (OSError, ValueError):
+        return False
 
 
 def _check_search_root(path: str) -> str:
@@ -72,7 +86,10 @@ def _check_search_root(path: str) -> str:
         st = os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
         return STATUS_MISSING
-    except (OSError, ValueError):
+    except OSError as exc:
+        # A path too long for the file system cannot exist.
+        return STATUS_MISSING if exc.errno == errno.ENAMETOOLONG else STATUS_UNREADABLE
+    except ValueError:
         return STATUS_UNREADABLE
     if not stat.S_ISDIR(st.st_mode):
         return STATUS_NOT_DIRECTORY
