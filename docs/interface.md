@@ -1,6 +1,6 @@
 # wtctl: interface
 
-Status: interface 0.1.0-design, 2026-10-30. Written before implementation (architecture §18.1). This document is the single normative source for wtctl's rules; `docs/design.md`, the README and the architecture link to its headings instead of restating them. Where another document differs, this one wins.
+Status: stable, interface 1.0.0 (declared 2026-11-20; first written as 0.1.0-design on 2026-10-30, before implementation, architecture §18.1). This document is the single normative source for wtctl's rules; `docs/design.md`, the README and the architecture link to its headings instead of restating them. Where another document differs, this one wins.
 
 wtctl is a Layer 1 primitive: it manages git worktrees, throwaway checkouts and the mapping from repo ids to local clones. It knows nothing about the tools that call it; behavior differs only by explicit arguments. It never runs repository-controlled executable config, never runs `git reset`, `checkout --`, `restore` or `clean` on user files, never runs `git worktree remove` or `git worktree repair` (it deletes worktrees and rewrites their pointers itself), never fetches from the network into a user's clone ([Mirror](#mirror)), never force-pushes (it never pushes at all), and never signals a process it did not start (it signals only the process groups it created for bootstrap steps, hooks, token commands and timed-out git calls).
 

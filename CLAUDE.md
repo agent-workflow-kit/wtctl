@@ -22,7 +22,7 @@ standalone: no harness, bus, shared library or shared contracts package is requi
 - No upward awareness: this tool never knows about, or behaves differently for, the tools that call
   it. Behavior may differ only by explicit arguments.
 - Interface first: write `docs/interface.md` and `schemas/` before implementation.
-- Semver. wtctl is 1.0 (declared 2026-11-20): a breaking interface change is a `!` commit (major bump); the title becomes the changelog line (details go in the PR body). Update `awkit-docs/interface-registry.md`. Never hand-edit CHANGELOG.md or the version.
+- Semver. wtctl is 1.0: a breaking interface change is a `!` commit (major bump); the title becomes the changelog line (details go in the PR body). Update `awkit-docs/interface-registry.md`. Never hand-edit CHANGELOG.md or the version.
 - Run `make verify` before every commit.
 - All subprocess and HTTP calls go through `src/wtctl/gateway.py` so tests can substitute fakes.
 - Never run destructive git commands (reset, checkout --, clean, restore, forced push) and never
@@ -38,7 +38,7 @@ standalone: no harness, bus, shared library or shared contracts package is requi
 ## Repository workflow
 
 - Work in a git worktree on a branch named `<type>/<short-slug>`, never in the main checkout (design guide section 17).
-- PR titles are Conventional Commit headers; they become the squash commit, the version bump and the changelog line (architecture section 18.3). A breaking interface change is a `!` title (wtctl is 1.0; the design guide's 0.x rule no longer applies).
+- PR titles are Conventional Commit headers; they become the squash commit, the version bump and the changelog line (architecture section 18.3). A breaking interface change is a `!` title (wtctl is 1.0; design guide section 13).
 - Never use `--no-verify`. Check PR titles, bodies and comments with `guard text` where the private-content guard is installed (architecture section 18.7).
 - Never merge a PR without the maintainer's explicit instruction for that PR; merges go through `awkit-ci`'s `scripts/pr-merge` (architecture section 18.6).
 - Never hand-edit `CHANGELOG.md` or the version in `pyproject.toml`; the release job owns them.

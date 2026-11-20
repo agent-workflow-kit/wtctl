@@ -2,7 +2,7 @@
 
 Status: stages 0-5 implemented and released; 1.0 declared on 2026-11-20 with the stage 6 items below waived by the maintainer for 1.0 and kept open as post-1.0 follow-ups. Implements [interface.md](interface.md) (normative) using the decisions and internal architecture in [design.md](design.md). Work is tracked as GitHub issues in this repo; each issue names its stage below, and each stage's **Status** lists the issues that delivered it. The bite-sized, test-first steps for an issue are written when the issue is picked up.
 
-The stage numbers and the 0.1-0.5 labels below are plan milestones, not release numbers: the release job cuts one release per merged change (PR), plus a few patch releases, so the shipped versions run v0.1.0 to v0.32.2, then v1.0.0 (see [CHANGELOG.md](../CHANGELOG.md)).
+The stage numbers and the 0.1-0.5 labels below are plan milestones, not release numbers: the release job cuts one release per merged change (PR), plus a few patch releases, so the shipped versions run v0.1.0 to v0.32.2, then v1.0.0 from this declaration (see [CHANGELOG.md](../CHANGELOG.md)).
 
 ## Conventions for every stage
 
@@ -91,7 +91,7 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 - adopt/forget: realpath, main worktree, `--holder` reference counting, `not_a_holder`, plain `forget` human-only, throwaways refused, lease and state rules.
 - `live`: git-lfs with `create.allow_filters: [lfs]` and the `unsafe_repo_config` refusal for planted LFS transfer keys.
 
-**Status**: Complete except #79. Issues #15 (`create`), #16 (bootstrap), #17 (baseline), #18 (`adopt`, `forget`), plus the follow-ups #64 (baseline covers content behind symlinks), #65 (adopt nesting refusal only against live records), #68 (cross-device symlink targets are uncovered, not blocking), #70 (create re-checks path overlap inside the insert transaction), #71 (baseline skips verified linked worktrees beneath the main worktree), #77 (a baseline that cannot be recorded leaves no stuck `creating` record) and #55 (`copy_env` walk under the child deadline). Open: #79 (`remove` cannot finish a partial worktree whose root is a mount point), found in review of #77.
+**Status**: Complete. Issues #15 (`create`), #16 (bootstrap), #17 (baseline), #18 (`adopt`, `forget`), plus the follow-ups #64 (baseline covers content behind symlinks), #65 (adopt nesting refusal only against live records), #68 (cross-device symlink targets are uncovered, not blocking), #70 (create re-checks path overlap inside the insert transaction), #71 (baseline skips verified linked worktrees beneath the main worktree), #77 (a baseline that cannot be recorded leaves no stuck `creating` record) #55 (`copy_env` walk under the child deadline) and #79 (`remove` finishes a partial worktree whose root is a mount point), found in review of #77.
 
 ## Stage 3: Removal (0.3)
 
@@ -145,9 +145,9 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 
 ## Stage 6: Platforms and 1.0 readiness
 
-**Goal**: Verified on macOS and WSL, consumers integrated, interface stable.
+**Goal** (original; waived for 1.0, see Status): Verified on macOS and WSL, consumers integrated, interface stable.
 
-**Success Criteria**: The macOS checklist (Apple git 2.39, `lsof` in-use detection including sandboxed processes, case-insensitive `.git` handling, `GIT_NO_LAZY_FETCH` availability, cron `PATH`) and the WSL checklist (`/proc` scanning, `/mnt/` warnings, drvfs `.git.`/`GIT~1` names) pass; agent-spawn and review-respond have integrated against the interface without changes to it.
+**Success Criteria** (original criteria, not met and waived for 1.0): The macOS checklist (Apple git 2.39, `lsof` in-use detection including sandboxed processes, case-insensitive `.git` handling, `GIT_NO_LAZY_FETCH` availability, cron `PATH`) and the WSL checklist (`/proc` scanning, `/mnt/` warnings, drvfs `.git.`/`GIT~1` names) pass; agent-spawn and review-respond have integrated against the interface without changes to it.
 
 **Tests**:
 
@@ -155,7 +155,7 @@ The stage numbers and the 0.1-0.5 labels below are plan milestones, not release 
 - `live` suite re-run on the user's machines.
 - Large-repository timing: nested scan at the default limit and mirror refresh on a monorepo-sized remote. The synthetic local run is recorded in design.md (Large-repository timing); the same measurement on the maintainer's real monorepo and forge remains.
 
-**Status**: Closed for 1.0 by maintainer waiver (2026-11-20): "We will waive those for 1.0 since I'm not going to do them just yet." Not run or not done, and not part of the 1.0 claim; each issue stays open as a post-1.0 follow-up: #25 (the credentialed `live` run, including its git 2.45+ and Apple-git vectors and the `GIT_NO_LAZY_FETCH` behaviour on a git that honors it), #26 (macOS checklist), #27 (WSL checklist), #28 (large-repository timing on the maintainer's real monorepo and forge; the harness in `tests/bench/` and the synthetic timings in design.md are merged), and the consumers' integration (review-run and review-respond do not call wtctl yet; agent-spawn does). #29 (1.0 readiness) is closed by the declaration.
+**Status**: Waived for 1.0 by the maintainer (2026-11-20), issues still open: "We will waive those for 1.0 since I'm not going to do them just yet." Not run or not done, and not part of the 1.0 claim; each issue stays open as a post-1.0 follow-up: #25 (the credentialed `live` run, including its git 2.45+ and Apple-git vectors and the `GIT_NO_LAZY_FETCH` behaviour on a git that honors it), #26 (macOS checklist), #27 (WSL checklist), #28 (large-repository timing on the maintainer's real monorepo and forge; the harness in `tests/bench/` and the synthetic timings in design.md are merged), and the consumers' integration (review-run and review-respond do not call wtctl yet; agent-spawn does). #29 (1.0 readiness) is closed by the declaration.
 
 ## Version roadmap
 
