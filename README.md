@@ -4,7 +4,7 @@ Git worktrees, throwaway checkouts, and the mapping from repo ids to local clone
 
 ## Status
 
-Designed: interface 0.1.0-design ([docs/interface.md](docs/interface.md)); not yet implemented. Implementation plan: [docs/plan.md](docs/plan.md).
+Stable (1.0). The interface ([docs/interface.md](docs/interface.md)) is implemented and its CLI, `--json` output, hook payloads, config schema and exit codes are covered by semantic versioning (awkit design guide, section 13): a breaking change is a major release. Implementation plan and post-1.0 follow-ups: [docs/plan.md](docs/plan.md). 1.0 was declared with these not yet verified: the credentialed `live` suite, macOS, WSL and real-monorepo timing (post-1.0 follow-ups, see docs/plan.md Stage 6).
 
 ## Layer
 
@@ -94,7 +94,7 @@ The reserved awkit codes only (0, 1, 2, 10, 11, 12, 13, 20, 21; no tool-specific
 
 ## Platforms
 
-Linux, WSL (Ubuntu 22.04 or newer) and macOS. SHA-1 repositories only in v1 (SHA-256 repositories are refused). See [Platform notes](docs/interface.md#platform-notes).
+Linux (tested), WSL and macOS (supported by design, not yet verified; see docs/plan.md Stage 6). SHA-1 repositories only in v1 (SHA-256 repositories are refused). See [Platform notes](docs/interface.md#platform-notes).
 
 ## Install
 

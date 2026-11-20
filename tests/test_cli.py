@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -43,6 +45,15 @@ MINIMAL: dict[str, list[str]] = {
 
 def test_minimal_table_covers_every_registered_command() -> None:
     assert set(MINIMAL) == {c.key for c in COMMANDS}
+
+
+# Assumes a uv-synced environment (`uv run` re-syncs the editable install when
+# pyproject.toml changes).
+def test_version_matches_pyproject() -> None:
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    expected = tomllib.loads(pyproject.read_text())["project"]["version"]
+
+    assert __version__ == expected
 
 
 def test_version(capsys: pytest.CaptureFixture[str]) -> None:

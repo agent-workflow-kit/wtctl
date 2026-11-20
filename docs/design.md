@@ -1,6 +1,6 @@
 # wtctl: design
 
-Status: designed (interface 0.1.0-design), 2026-10-30. The interface, including every normative rule, is in [interface.md](interface.md); this document records the decisions, the internal architecture and the live verification behind them, and links to the interface instead of restating its rules.
+Status: implemented and stable at 1.0 (first designed 2026-10-30 as interface 0.1.0-design). The interface, including every normative rule, is in [interface.md](interface.md); this document records the decisions, the internal architecture and the live verification behind them, and links to the interface instead of restating its rules.
 
 ## Role and layer
 
