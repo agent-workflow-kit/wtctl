@@ -31,7 +31,9 @@ def git_says(text: str, code: int = 0) -> Gateway:
 def run_validate(
     capsys: pytest.CaptureFixture[str], *argv: str, gateway: Gateway | None = None
 ) -> Run:
-    rt = Runtime(stdin_isatty=False, me_name="alice", gateway=gateway or git_says("git version 2.43.0"))
+    rt = Runtime(
+        stdin_isatty=False, me_name="alice", gateway=gateway or git_says("git version 2.43.0")
+    )
     code = main(["validate", *argv], runtime=rt)
     c = capsys.readouterr()
     return Run(code, c.out, c.err)
@@ -82,7 +84,9 @@ def test_golden_output(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> No
     assert text == GOLDEN.read_text()
 
 
-def test_human_output(capsys: pytest.CaptureFixture[str], good: dict[str, str], tmp_path: Path) -> None:
+def test_human_output(
+    capsys: pytest.CaptureFixture[str], good: dict[str, str], tmp_path: Path
+) -> None:
     r = run_validate(capsys, "--config", config(tmp_path, **good))
     assert r.code == 0
     assert "usable" in r.out
@@ -165,9 +169,7 @@ def test_search_root_warnings(
     ok.mkdir()
     afile = tmp_path / "afile"
     afile.write_text("x")
-    cfg = config(
-        tmp_path, **good, search_roots=[str(ok), str(tmp_path / "missing"), str(afile)]
-    )
+    cfg = config(tmp_path, **good, search_roots=[str(ok), str(tmp_path / "missing"), str(afile)])
     r = run_validate(capsys, "--json", "--config", cfg)
     assert r.code == 0
     data = r.json()
@@ -188,9 +190,7 @@ def test_hostile_search_root_text_is_escaped_and_bounded(
     capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]
 ) -> None:
     evil = str(tmp_path / ("\x1b[31m‮" + "x" * 5000))
-    r = run_validate(
-        capsys, "--config", config(tmp_path, **good, search_roots=[evil])
-    )
+    r = run_validate(capsys, "--config", config(tmp_path, **good, search_roots=[evil]))
     assert r.code == 0
     assert "\x1b" not in r.err and "‮" not in r.err
     assert "\\x1b" in r.err
@@ -216,7 +216,10 @@ def test_git_too_old_is_exit_12_like_every_git_command(
     capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]
 ) -> None:
     r = run_validate(
-        capsys, "--json", "--config", config(tmp_path, **good),
+        capsys,
+        "--json",
+        "--config",
+        config(tmp_path, **good),
         gateway=git_says("git version 2.33.9"),
     )
     assert r.code == 12
@@ -228,7 +231,10 @@ def test_git_minimum_is_accepted(
     capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]
 ) -> None:
     r = run_validate(
-        capsys, "--json", "--config", config(tmp_path, **good),
+        capsys,
+        "--json",
+        "--config",
+        config(tmp_path, **good),
         gateway=git_says("git version 2.34.0"),
     )
     assert r.code == 0
@@ -254,11 +260,12 @@ def test_configured_git_bin_that_is_not_executable_names_the_key(
     assert r.json()["error"]["message"].startswith("git_bin:")
 
 
-def test_config_is_checked_before_git(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
+def test_config_is_checked_before_git(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     r = run_validate(
-        capsys, "--json", "--config", config(tmp_path, bogus=1),
+        capsys,
+        "--json",
+        "--config",
+        config(tmp_path, bogus=1),
         gateway=git_says("git version 1.0"),
     )
     assert r.code == 2
@@ -270,9 +277,7 @@ def test_dry_run_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_real_git(capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str]) -> None:
-    r = run_validate(
-        capsys, "--json", "--config", config(tmp_path, **good), gateway=Gateway()
-    )
+    r = run_validate(capsys, "--json", "--config", config(tmp_path, **good), gateway=Gateway())
     assert r.code == 0
     assert r.json()["checks"]["git"]["version"][0].isdigit()
 
@@ -325,7 +330,9 @@ def test_no_network_no_other_process_no_writes(
 
 
 def test_read_only_state_dir_does_not_matter(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path, good: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    good: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A state directory that cannot be opened must not fail validate: it never looks there.
