@@ -168,14 +168,15 @@ class PorcelainError(ValueError):
 def resolve_binary(name: str, path_env: str, explicit: str | None = None) -> str | None:
     """``explicit`` (must be absolute) else the first absolute ``PATH`` entry with an executable.
 
-    Relative and empty ``PATH`` entries are ignored (they would depend on the cwd; D49).
+    Relative and empty ``PATH`` entries are ignored (they would depend on the cwd; D49), as are
+    entries with a newline or NUL (``build_env`` rejects such a path).
     """
     if explicit is not None:
         if not os.path.isabs(explicit) or "\n" in explicit:
             return None
         return explicit if _is_executable(explicit) else None
     for entry in path_env.split(os.pathsep):
-        if not entry or not os.path.isabs(entry):
+        if not entry or not os.path.isabs(entry) or "\n" in entry or "\0" in entry:
             continue
         candidate = os.path.join(entry, name)
         if _is_executable(candidate):

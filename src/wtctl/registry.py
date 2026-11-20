@@ -226,6 +226,13 @@ COMMANDS: tuple[Command, ...] = (
     Command("label_remove", ("label", "remove"), "remove labels", "#7", _label_edit, dry_run=True),
     Command("reconcile", ("reconcile",), "reconcile state with disk", "#23", _none, dry_run=True),
     Command("prune", ("prune",), "remove old throwaways", "#21", _prune, dry_run=True),
+    Command(
+        "validate",
+        ("validate",),
+        "check the config and environment (offline, read-only)",
+        "#93",
+        _none,
+    ),
     Command("export", ("export",), "print audit or log records", "#5", _export),
     Command(
         "cron_install",

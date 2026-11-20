@@ -1,0 +1,1 @@
+{"checks":{"root":{"path":"<tmp>/wt","exists":true},"search_roots":[{"path":"<tmp>/gone","status":"missing"}],"git":{"path":"<git>","version":"2.43.0","minimum":"2.34"}},"warnings":[{"code":"search_root_missing","key":"search_roots[0]","message":"<tmp>/gone does not exist"}]}

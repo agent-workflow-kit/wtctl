@@ -975,3 +975,17 @@ def test_a_transport_failure_message_is_the_matching_line(stderr: str, matching:
     assert outcome.cause in TRANSPORT_CAUSES
     e = outcome_error(outcome, r)
     assert e is not None and e.message == f"git failed ({matching})"
+
+
+def test_resolve_binary_skips_path_entries_with_newline_or_nul(tmp_path: Path) -> None:
+    bad = tmp_path / "bad\ndir"
+    bad.mkdir()
+    good = tmp_path / "good"
+    good.mkdir()
+    for d in (bad, good):
+        t = d / "git"
+        t.write_text("#!/bin/sh\n")
+        t.chmod(0o755)
+    path = os.pathsep.join([str(bad), "/nul\0dir", str(good)])
+    assert hardgit.resolve_binary("git", path) == str(good / "git")
+    assert hardgit.resolve_binary("git", str(bad)) is None

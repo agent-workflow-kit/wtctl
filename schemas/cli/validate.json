@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wtctl/cli/validate.json",
+  "title": "wtctl validate --json",
+  "type": "object",
+  "properties": {
+    "checks": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "$ref": "../defs.json#/$defs/abs_path",
+              "description": "The configured root, expanded and normalized."
+            },
+            "exists": {
+              "type": "boolean",
+              "description": "false: the directory does not exist yet but can be created (a nearest existing ancestor is a writable directory)."
+            }
+          },
+          "additionalProperties": false,
+          "required": ["path", "exists"]
+        },
+        "search_roots": {
+          "type": "array",
+          "maxItems": 50,
+          "description": "One entry per search_roots entry, in config order; at most the first 50 are checked (search_roots_truncated).",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "$ref": "../defs.json#/$defs/abs_path"
+              },
+              "status": {
+                "enum": ["ok", "missing", "not_directory", "unreadable"]
+              }
+            },
+            "additionalProperties": false,
+            "required": ["path", "status"]
+          }
+        },
+        "git": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "$ref": "../defs.json#/$defs/abs_path",
+              "description": "The git binary used (git_bin, else the first absolute PATH entry with git)."
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)*$"
+            },
+            "minimum": {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)*$"
+            }
+          },
+          "additionalProperties": false,
+          "required": ["path", "version", "minimum"]
+        }
+      },
+      "additionalProperties": false,
+      "required": ["root", "search_roots", "git"]
+    },
+    "warnings": {
+      "type": "array",
+      "description": "Empty when there is nothing to say. Each entry is an object, unlike the string warnings of other commands.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "enum": ["search_root_missing", "search_root_unusable", "search_roots_truncated"]
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 400,
+            "x-untrusted": true,
+            "description": "Human-readable; embeds config values (escaped and cut to 200 characters)."
+          },
+          "key": {
+            "type": "string",
+            "description": "The config key the warning is about, e.g. search_roots[2]."
+          }
+        },
+        "additionalProperties": false,
+        "required": ["code", "message"]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": ["checks", "warnings"]
+}
