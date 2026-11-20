@@ -201,6 +201,13 @@ def test_lease_name_helpers() -> None:
 
 
 def test_heartbeat_keeps_a_held_lease_alive(tmp_path: Path) -> None:
+    """The heartbeat extends the expiry on its own.
+
+    Asserts on observed renewals (the stored expiry advancing), not on ``expiry > now`` after a
+    fixed sleep: a process-wide stall longer than the ttl (a paused CI VM) makes the lease
+    genuinely expire for a moment, and a wall-clock check right after the stall races the
+    heartbeat thread's catch-up. The deadline is a generous upper bound, not a tuned wait.
+    """
     st = State(tmp_path / "st" / "state.db", Gateway(), heartbeat=True)
     other_pid = os.getpid() + 1
     other = State(
@@ -208,8 +215,17 @@ def test_heartbeat_keeps_a_held_lease_alive(tmp_path: Path) -> None:
     )
     lease = st.lease("global", wait=0, ttl=0.6)
     try:
-        time.sleep(1.5)  # > 2 ttls
-        assert st.lease_expires("global") > st.gateway.clock.now().timestamp()
+        seen = st.lease_expires("global")
+        renewals = 0
+        deadline = time.monotonic() + 60
+        while renewals < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+            now_expires = st.lease_expires("global")
+            if now_expires > seen:
+                renewals += 1
+                seen = now_expires
+        assert renewals == 3, "the heartbeat did not renew the lease"
+        assert not lease.lost
     finally:
         lease.release()
     assert other.try_lease("global") is not None
