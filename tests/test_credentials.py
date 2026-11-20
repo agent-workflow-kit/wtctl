@@ -731,13 +731,21 @@ def test_run_network_git_with_a_huge_timeout_does_not_overflow(
     assert result.returncode == 0
 
 
-def test_valid_token_is_returned_although_a_descendant_holds_the_pipe() -> None:
-    start = time.monotonic()
-    result = run_token_command(
-        sh(f"echo {TOKEN}; sleep 3 &"), env=ENV, timeout=10.0, max_bytes=1024
+def test_valid_token_is_returned_although_a_descendant_holds_the_pipe(tmp_path: Path) -> None:
+    # The background descendant keeps the pipe open until the test releases it (bounded at ~20s
+    # so it can never leak). Had run_token_command waited for it, the call could only end by its
+    # 10s timeout and report a failure; a stalled test process cannot change that outcome.
+    release = tmp_path / "release"
+    script = (
+        f"echo {TOKEN}; "
+        f"(i=0; while [ ! -e {release} ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done) &"
     )
-    assert result.failure is None and result.stdout.strip() == TOKEN.encode()
-    assert time.monotonic() - start < 2.5
+    try:
+        result = run_token_command(sh(script), env=ENV, timeout=10.0, max_bytes=1024)
+        assert not release.exists()  # the descendant was still holding the pipe on return
+        assert result.failure is None and result.stdout.strip() == TOKEN.encode()
+    finally:
+        release.touch()
 
 
 def test_token_command_result_stdout_is_not_compared() -> None:

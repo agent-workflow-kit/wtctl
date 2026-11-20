@@ -55,15 +55,30 @@ def spawn(w: CW, *argv: str) -> subprocess.Popen[str]:
     )
 
 
+def patient(w: CW) -> None:
+    """The world's 1s ``lease_wait`` is for tests that expect ``busy``. Racing processes queue on
+    the clone lease, and on a loaded host each one's start-up alone can outlast a second, so a
+    queued loser would exit 12; a long wait makes the outcome independent of host speed."""
+    w.top["lease_wait"] = "300s"
+
+
 def finish(procs: list[subprocess.Popen[str]]) -> list[tuple[int, str, str]]:
     out = []
-    for p in procs:
-        stdout, stderr = p.communicate(timeout=120)
-        out.append((p.returncode, stdout, stderr))
+    try:
+        for p in procs:
+            stdout, stderr = p.communicate(timeout=120)
+            out.append((p.returncode, stdout, stderr))
+    except subprocess.TimeoutExpired:
+        for p in procs:  # never leave the spawned processes running
+            p.kill()
+        for p in procs:
+            p.wait()
+        raise
     return out
 
 
 def test_parallel_adopts_of_one_path_make_one_record_and_keep_every_holder(w: CW) -> None:
+    patient(w)
     path = foreign(w)
     procs = [spawn(w, "adopt", str(path), "--repo", REPO, "--holder", f"h{i}") for i in range(4)]
     results = finish(procs)
@@ -75,6 +90,7 @@ def test_parallel_adopts_of_one_path_make_one_record_and_keep_every_holder(w: CW
 
 
 def test_parallel_forgets_of_the_holders_forget_the_record_exactly_once(w: CW, capsys) -> None:  # noqa: ANN001
+    patient(w)
     path = foreign(w)
     rid = None
     for i in range(4):
@@ -91,6 +107,7 @@ def test_parallel_forgets_of_the_holders_forget_the_record_exactly_once(w: CW, c
 
 
 def test_forget_and_adopt_holder_race_never_loses_a_live_holder(w: CW, capsys) -> None:  # noqa: ANN001
+    patient(w)
     path = foreign(w)
     rid = ok_adopt(adopt(w, capsys, path, "--holder", "old"))["record"]["id"]
     procs = [
