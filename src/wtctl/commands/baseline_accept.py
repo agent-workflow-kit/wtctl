@@ -11,9 +11,11 @@ clone, ``_reattach``): the record and the clone's row follow the clone and the t
 rewritten as Reconcile does it.
 
 Every accept that records something is audited (``baseline_accept``: old and new digest, the
-changed items, the anchors). The record is validated and the audit file checked before anything
-is written, and appended after the transaction commits; a failed append is exit 1 (an unaudited
-accept is never reported as a success). A dry run and an accept that changes nothing write none.
+changed items, the anchors; when the items do not fit one audit line the record lists the longest
+prefix that fits, the digests and anchors always whole). The record is validated and the audit
+file checked before anything is written, and appended after the transaction commits; a failed
+append is exit 1 (an unaudited accept is never reported as a success). A dry run and an accept that
+changes nothing write none.
 """
 
 from __future__ import annotations
@@ -181,18 +183,37 @@ def _prepare_audit(
     rows: list[dict[str, Any]],
     anchors: list[dict[str, Any]],
 ) -> tuple[audit.Journal, audit.PreparedAudit]:
-    """Validate and encode the ``baseline_accept`` audit record before the state changes."""
+    """Validate and encode the ``baseline_accept`` audit record before the state changes.
+
+    A record too large for one audit line degrades to the longest prefix of ``rows`` that fits;
+    any other refusal (and a record too large even without items) propagates."""
     journal = audit.journal_for(ctx)
     journal.check_writable()
-    prepared = journal.prepare_audit(
-        "baseline_accept",
-        actor=ctx.actor.value,
-        decision_ids=ctx.decision_ids,
-        target_id=record["id"],
-        target_path=record["path"],
-        inputs={"old_digest": old, "new_digest": new, "items": rows, "anchors": anchors},
-    )
-    return journal, prepared
+
+    def prepare(items: list[dict[str, Any]]) -> audit.PreparedAudit:
+        return journal.prepare_audit(
+            "baseline_accept",
+            actor=ctx.actor.value,
+            decision_ids=ctx.decision_ids,
+            target_id=record["id"],
+            target_path=record["path"],
+            inputs={"old_digest": old, "new_digest": new, "items": items, "anchors": anchors},
+        )
+
+    try:
+        return journal, prepare(rows)
+    except audit.AuditTooLarge:
+        best = prepare([])  # even zero items too large: propagates
+    lo, hi = 0, len(rows) - 1  # the largest n in [0, len) that fits; 0 is known to
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        try:
+            best_mid = prepare(rows[:mid])
+        except audit.AuditTooLarge:
+            hi = mid - 1
+        else:
+            lo, best = mid, best_mid
+    return journal, best
 
 
 def _refused(message: str) -> WtctlError:
@@ -255,6 +276,11 @@ def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
             "confirmation_required", "re-attaching a moved clone needs confirmation (--yes)"
         )
     audit.journal_for(ctx).check_writable()  # before the pointers are rewritten
+    # validate the record from the preview too: a refusal leaves the pointers untouched
+    _prepare_audit(
+        ctx, record, baselinesvc.recorded_digest(record), preview.digest,
+        repobaseline.compare(recorded, preview.items), [anchor] if anchor else [],
+    )  # fmt: skip
     with state.lease(clone_lease(moved.clone_path), wait=config.lease_wait_s):
         if old_admin is not None:
             why = reconcile_probe.repair_pointers(
