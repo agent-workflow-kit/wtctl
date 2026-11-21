@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import sqlite3
 import subprocess
@@ -478,6 +479,7 @@ class _Ticks:
     def wait(self, timeout: float) -> bool:
         self.waits.append(timeout)
         if self.n <= 0:
+            self.flag = True  # like Event.wait: True only once the event is set
             return True
         self.n -= 1
         if self.on_tick:
@@ -500,9 +502,12 @@ def _beating_lease(tmp: Path, monkeypatch: pytest.MonkeyPatch, flaky: dict, ttl:
     conns: list[_FlakyConn] = flaky.setdefault("conns", [])
 
     def connect(path):  # noqa: ANN001, ANN202
-        c = _FlakyConn(
-            real_connect(path), flaky.get("commits", 0), flaky.get("fail_rollback", False)
-        )
+        plan = flaky.get("plan")  # per-connection (fail_commits, fail_rollback), then clean
+        if plan is not None:
+            commits, rollback = plan[len(conns)] if len(conns) < len(plan) else (0, False)
+        else:
+            commits, rollback = flaky.get("commits", 0), flaky.get("fail_rollback", False)
+        c = _FlakyConn(real_connect(path), commits, rollback)
         conns.append(c)
         return c
 
@@ -563,17 +568,15 @@ def test_a_failed_commit_records_last_error_not_silence(
 def test_failed_rollback_does_not_stop_the_heartbeat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A connection that cannot even roll back is replaced; the next beat renews."""
-    flaky: dict = {"commits": 1, "fail_rollback": True}
+    """A connection that cannot even roll back is closed and replaced; the next beat renews."""
+    flaky: dict = {"plan": [(1, True)]}  # first connection: COMMIT and ROLLBACK fail
     st, lease = _beating_lease(tmp_path, monkeypatch, flaky)
     before = st.lease_expires("global")
     st.gateway.clock.advance(5)  # type: ignore[attr-defined]
-    flaky["fail_rollback"] = False
-    flaky["commits"] = 0
     lease._stop = _Ticks(2)  # type: ignore[assignment]
-    # The first connection is already built with fail_rollback; the replacement is clean.
-    flaky["conns"].clear()
     lease._beat()
+    first, second = flaky["conns"]
+    assert first.closed
     assert st.lease_expires("global") > before
     assert not lease.lost
     lease.release()
@@ -632,4 +635,182 @@ def test_a_failed_connect_is_retried_not_fatal(
     lease._beat()
     assert st.lease_expires("global") > before
     assert not lease.lost
+    lease.release()
+
+
+def _failing(tmp: Path, monkeypatch: pytest.MonkeyPatch, ttl: float = 30.0):  # noqa: ANN202
+    flaky: dict = {"commits": 10**6}
+    st, lease = _beating_lease(tmp, monkeypatch, flaky, ttl=ttl)
+    clock = st.gateway.clock
+    assert isinstance(clock, FakeClock)
+    return st, lease, clock, flaky
+
+
+@pytest.mark.parametrize("exc", [OSError("disk gone"), RuntimeError("boom"), OverflowError("x")])
+def test_non_sqlite_exceptions_are_failed_beats_then_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+
+    def boom(conn):  # noqa: ANN001, ANN202
+        raise exc
+
+    monkeypatch.setattr(lease, "_beat_once", boom)
+    ticks = _Ticks(3, on_tick=lambda: clock.advance(10))  # type: ignore[attr-defined]
+    lease._stop = ticks  # type: ignore[assignment]
+    lease._beat()  # retried while within ttl, then lost on the third (30 s) failure
+    assert lease.last_error is exc
+    assert lease.lost
+    lease.release()
+
+
+def test_a_failed_connect_with_os_error_is_retried_then_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+
+    def connect(path):  # noqa: ANN001, ANN202
+        raise OSError("no such device")
+
+    monkeypatch.setattr(state_mod, "_connect", connect)
+    lease._stop = _Ticks(1, on_tick=lambda: clock.advance(10))  # type: ignore[assignment]
+    lease._beat()
+    assert not lease.lost  # one failure within ttl: retried, not lost
+    lease._stop = _Ticks(2, on_tick=lambda: clock.advance(10))  # type: ignore[assignment]
+    lease._beat()
+    assert lease.lost
+    assert isinstance(lease.last_error, OSError)
+    lease.release()
+
+
+def test_an_unexpected_thread_exit_marks_the_lease_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, lease, _, _ = _failing(tmp_path, monkeypatch)
+
+    def boom(conn):  # noqa: ANN001, ANN202
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(lease, "_beat_once", boom)
+    lease._stop = _Ticks(1)  # type: ignore[assignment]
+    with pytest.raises(KeyboardInterrupt):
+        lease._beat()
+    assert lease.lost
+    lease.release()
+
+
+def test_a_requested_stop_does_not_mark_the_lease_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    flaky: dict = {}
+    _, lease = _beating_lease(tmp_path, monkeypatch, flaky)
+    lease._stop = _Ticks(1)  # type: ignore[assignment]
+    lease._beat()
+    assert not lease.lost
+    assert flaky["conns"][0].closed  # connection closed on a normal stop
+    lease.release()
+
+
+def test_the_wait_is_clamped_to_the_ttl_deadline_and_lost_is_set_at_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, lease, clock, flaky = _failing(tmp_path, monkeypatch, ttl=30.0)
+    ticks = _Ticks(10**6)
+    ticks.on_tick = lambda: clock.advance(ticks.waits[-1])  # each wait passes exactly
+    lease._stop = ticks  # type: ignore[assignment]
+    lease._beat()
+    assert ticks.waits == [10.0, 2.5, 5.0, 10.0, 2.5]  # last one clamped from 10 to the deadline
+    assert clock.mono == 30.0  # type: ignore[attr-defined]
+    assert lease.lost
+    assert flaky["conns"][-1].closed  # connection closed on the lost path
+    lease.release()
+
+
+def test_renew_counts_as_a_renewal_for_the_heartbeat_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+
+    def tick() -> None:
+        clock.advance(9)  # type: ignore[attr-defined]
+        lease.renew()  # the holder's own connection refreshes the row
+
+    lease._stop = _Ticks(6, on_tick=tick)  # type: ignore[assignment]
+    lease._beat()  # 54 s of failing beats, but never ttl since a renewal
+    assert not lease.lost
+    lease.release()
+
+
+def test_wall_clock_jumps_do_not_mark_the_lease_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+    lease._stop = _Ticks(5, on_tick=lambda: setattr(clock, "t", clock.t + dt.timedelta(hours=1)))  # type: ignore[assignment]
+    lease._beat()
+    assert not lease.lost  # monotonic time did not move
+
+
+def test_monotonic_time_alone_marks_the_lease_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+    wall = clock.t
+    lease._stop = _Ticks(10, on_tick=lambda: setattr(clock, "mono", clock.mono + 10))  # type: ignore[assignment]
+    lease._beat()
+    assert clock.t == wall
+    assert lease.lost
+    lease.release()
+
+
+def test_lost_boundary_is_inclusive_of_ttl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+    lease._stop = _Ticks(1, on_tick=lambda: setattr(clock, "mono", clock.mono + 30.0))  # type: ignore[assignment]
+    lease._beat()
+    assert lease.lost  # exactly ttl since the last renewal
+    lease.release()
+
+
+def test_just_under_ttl_is_not_lost(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+    lease._stop = _Ticks(1, on_tick=lambda: setattr(clock, "mono", clock.mono + 29.999))  # type: ignore[assignment]
+    lease._beat()
+    assert not lease.lost
+    lease.release()
+
+
+def test_failures_shorter_than_ttl_are_not_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, lease, clock, _ = _failing(tmp_path, monkeypatch)
+    lease._stop = _Ticks(3, on_tick=lambda: clock.advance(9))  # type: ignore[assignment]
+    lease._beat()  # 27 s of failures
+    assert not lease.lost
+    lease.release()
+
+
+def test_success_after_more_than_ttl_without_renewal_is_not_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    flaky: dict = {}
+    st, lease = _beating_lease(tmp_path, monkeypatch, flaky)
+    clock = st.gateway.clock
+    lease._stop = _Ticks(1, on_tick=lambda: clock.advance(100))  # type: ignore[assignment]
+    lease._beat()  # the check runs only after a failed beat
+    assert not lease.lost
+    lease.release()
+
+
+def test_a_row_taken_over_marks_the_lease_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    flaky: dict = {}
+    st, lease = _beating_lease(tmp_path, monkeypatch, flaky)
+    c = sqlite3.connect(st.path)
+    c.execute("DELETE FROM leases WHERE name = 'global'")
+    c.commit()
+    c.close()
+    lease._stop = _Ticks(5)  # type: ignore[assignment]
+    lease._beat()  # the beat succeeds (ok=False) and ends the thread
+    assert lease.lost
+    assert flaky["conns"][0].closed
     lease.release()

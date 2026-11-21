@@ -1473,7 +1473,9 @@ class Lease:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.lost = False
-        self.last_error: sqlite3.Error | None = None  # newest failed heartbeat, else None
+        self.last_error: Exception | None = None  # newest failed heartbeat, else None
+        # Monotonic time of the last successful renewal (by the heartbeat or by renew()).
+        self._last_renewed = state.gateway.clock.monotonic()
 
     def _renew(self, conn: sqlite3.Connection) -> bool:
         expires = self.state.gateway.clock.now().timestamp() + self.ttl
@@ -1490,6 +1492,7 @@ class Lease:
         if not ok:
             self.lost = True
             raise WtctlError("busy", f"lease {self.name} was lost to another process")
+        self._last_renewed = self.state.gateway.clock.monotonic()
 
     def _start_heartbeat(self) -> None:
         if not self.state._heartbeat:
@@ -1500,14 +1503,14 @@ class Lease:
 
     def _beat_once(self, conn: sqlite3.Connection) -> bool:
         """One renewal in its own transaction; True when the row was renewed, False when it is
-        no longer ours. A ``sqlite3.Error`` (locked, I/O, disk full) propagates, but never with
-        the transaction left open: a failed ``COMMIT`` keeps it open in SQLite, and the next
-        ``BEGIN`` would then fail for ever."""
+        no longer ours. An exception (SQLite locked, I/O, disk full, a clock error) propagates,
+        but never with the transaction left open: a failed ``COMMIT`` keeps it open in SQLite,
+        and the next ``BEGIN`` would then fail for ever."""
         try:
             conn.execute("BEGIN IMMEDIATE")
             ok = self._renew(conn)
             conn.execute("COMMIT")
-        except sqlite3.Error:
+        except Exception:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
@@ -1522,37 +1525,44 @@ class Lease:
         return min(normal, self.ttl / 12 * 2 ** (failures - 1))
 
     def _beat(self) -> None:
-        """Renew until released. Failed beats are retried with a short backoff and kept in
-        ``last_error``; once ``ttl`` has passed since the last renewal the lease may have
-        expired and been taken over, so it is marked ``lost`` (the holder then stops with
-        ``busy``) and the thread ends."""
+        """Renew until released. Any exception from a beat (SQLite, OS or clock errors) is a
+        failed beat: it is kept in ``last_error`` and retried with a short backoff. The wait
+        never runs past the ``ttl`` deadline since the last renewal (by this thread or by
+        ``renew()``), so the lease is marked ``lost`` (the holder then stops with ``busy``) by
+        the first failed beat at or after ``ttl`` since the last renewal (a beat can block up
+        to the busy timeout), and the thread ends. Any other exit of the thread without a
+        stop request also marks the lease ``lost``."""
         clock = self.state.gateway.clock
         conn: sqlite3.Connection | None = None
-        last_renewed = clock.monotonic()
         failures = 0
         try:
-            while not self._stop.wait(self._retry_delay(failures)):
+            while True:
+                deadline = self._last_renewed + self.ttl - clock.monotonic()
+                if self._stop.wait(max(0.0, min(self._retry_delay(failures), deadline))):
+                    break
                 try:
                     if conn is None:
                         conn = _connect(self.state.path)
                     ok = self._beat_once(conn)
-                except sqlite3.Error as exc:
+                except Exception as exc:
                     self.last_error = exc
                     failures += 1
                     if conn is not None and conn.in_transaction:
                         conn.close()  # the rollback itself failed: reconnect on the next beat
                         conn = None
-                    if clock.monotonic() - last_renewed >= self.ttl:
+                    if clock.monotonic() - self._last_renewed >= self.ttl:
                         self.lost = True
                         return
                     continue
                 failures = 0
                 self.last_error = None
-                last_renewed = clock.monotonic()
+                self._last_renewed = clock.monotonic()
                 if not ok:
                     self.lost = True
                     return
         finally:
+            if not self._stop.is_set():
+                self.lost = True  # the thread is gone without a stop request: never renewed again
             if conn is not None:
                 conn.close()
 
