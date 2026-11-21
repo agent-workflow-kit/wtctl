@@ -9,7 +9,11 @@ decided, then write the rows, the digest and any re-recorded identities.
 A ``clone_missing`` record whose re-resolved clone names its worktree is re-attached here (a moved
 clone, ``_reattach``): the record and the clone's row follow the clone and the two pointers are
 rewritten as Reconcile does it.
-TODO(#5): audit the ``baseline_accept`` event (items and anchors).
+
+Every accept that records something is audited (``baseline_accept``: old and new digest, the
+changed items, the anchors). The record is validated and the audit file checked before anything
+is written, and appended after the transaction commits; a failed append is exit 1 (an unaudited
+accept is never reported as a success). A dry run and an accept that changes nothing write none.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import (
+    audit,
     baselinesvc,
     fsafe_child,
     hooks,
@@ -168,6 +173,28 @@ def _check_state(record: dict[str, Any]) -> None:
     baselinesvc.require_worktree(record, "baseline accept")
 
 
+def _prepare_audit(
+    ctx: Context,
+    record: dict[str, Any],
+    old: str,
+    new: str,
+    rows: list[dict[str, Any]],
+    anchors: list[dict[str, Any]],
+) -> tuple[audit.Journal, audit.PreparedAudit]:
+    """Validate and encode the ``baseline_accept`` audit record before the state changes."""
+    journal = audit.journal_for(ctx)
+    journal.check_writable()
+    prepared = journal.prepare_audit(
+        "baseline_accept",
+        actor=ctx.actor.value,
+        decision_ids=ctx.decision_ids,
+        target_id=record["id"],
+        target_path=record["path"],
+        inputs={"old_digest": old, "new_digest": new, "items": rows, "anchors": anchors},
+    )
+    return journal, prepared
+
+
 def _refused(message: str) -> WtctlError:
     return WtctlError("refused", message, reason="unlinked")
 
@@ -227,6 +254,7 @@ def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
         raise WtctlError(
             "confirmation_required", "re-attaching a moved clone needs confirmation (--yes)"
         )
+    audit.journal_for(ctx).check_writable()  # before the pointers are rewritten
     with state.lease(clone_lease(moved.clone_path), wait=config.lease_wait_s):
         if old_admin is not None:
             why = reconcile_probe.repair_pointers(
@@ -240,6 +268,9 @@ def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
             raise _refused(f"{record['path']} does not match the moved clone after the rewrite")
         if snap.current.has_detail():
             raise baselinesvc.refusal(record, snap.current, snap.rows)
+        old = baselinesvc.recorded_digest(record)
+        journal, prepared = _prepare_audit(ctx, record, old, snap.current.digest, snap.rows,
+                                           snap.anchors)  # fmt: skip
         updates: dict[str, Any] = {
             "clone_path": moved.clone_path,
             "common_dir": moved.common_dir,
@@ -259,6 +290,7 @@ def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
             baseline_digest=snap.current.digest,
             baseline_items=baselinesvc.item_rows(snap.current), **updates,
         )  # fmt: skip
+    journal.commit_audit(prepared)
     result = _result(
         ctx, done, baselinesvc.recorded_digest(record), snap.current.digest, snap.rows,
         snap.anchors, dry=False, note=note,
@@ -330,6 +362,8 @@ def _decide(ctx: Context, record: dict[str, Any], write_state: Any) -> Result:
     if "common_id" in updates or again.clone_stale:
         # only a clones row of this very clone (same common dir) is touched
         updates["rebind_clone"] = (record["repo"], record["common_dir"], again.links.common_id)
+    journal, prepared = _prepare_audit(ctx, record, old, again.current.digest, snap.rows,
+                                       again.anchors)  # fmt: skip
     # one transaction: the record with its baseline rows, the anchor and the clone's identity
     new = state.transition(
         record["id"],
@@ -339,7 +373,7 @@ def _decide(ctx: Context, record: dict[str, Any], write_state: Any) -> Result:
         baseline_items=baselinesvc.item_rows(again.current),
         **updates,
     )
-    # TODO(#5): audit `baseline_accept` (the changed items and the anchors).
+    journal.commit_audit(prepared)
     result = _result(ctx, new, old, again.current.digest, snap.rows, again.anchors, dry=False)
     _post_hook(ctx, config, new, snap.rows, result)
     return result
