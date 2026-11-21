@@ -276,7 +276,11 @@ def _reattach(ctx: Context, record: dict[str, Any], *, dry: bool) -> Result:
             "confirmation_required", "re-attaching a moved clone needs confirmation (--yes)"
         )
     audit.journal_for(ctx).check_writable()  # before the pointers are rewritten
-    # validate the record from the preview too: a refusal leaves the pointers untouched
+    # validate the record from the preview too: a refusal leaves the pointers untouched.
+    # Accepted residual gap: the post-rewrite prepare carries every anchor of `_snapshot` (the
+    # worktree and hooks anchors need the rewritten pointers), this preview only the common_dir
+    # one. Only anchor strings alone exceeding the 32 KiB audit line can still fail after the
+    # rewrite; rows and digests are identical, so nothing else can differ.
     _prepare_audit(
         ctx, record, baselinesvc.recorded_digest(record), preview.digest,
         repobaseline.compare(recorded, preview.items), [anchor] if anchor else [],
