@@ -1473,6 +1473,7 @@ class Lease:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.lost = False
+        self.last_error: sqlite3.Error | None = None  # newest failed heartbeat, else None
 
     def _renew(self, conn: sqlite3.Connection) -> bool:
         expires = self.state.gateway.clock.now().timestamp() + self.ttl
@@ -1497,23 +1498,63 @@ class Lease:
         self._thread = t
         t.start()
 
-    def _beat(self) -> None:
-        conn = _connect(self.state.path)
+    def _beat_once(self, conn: sqlite3.Connection) -> bool:
+        """One renewal in its own transaction; True when the row was renewed, False when it is
+        no longer ours. A ``sqlite3.Error`` (locked, I/O, disk full) propagates, but never with
+        the transaction left open: a failed ``COMMIT`` keeps it open in SQLite, and the next
+        ``BEGIN`` would then fail for ever."""
         try:
-            while not self._stop.wait(self.ttl / 3):
+            conn.execute("BEGIN IMMEDIATE")
+            ok = self._renew(conn)
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return ok
+
+    def _retry_delay(self, failures: int) -> float:
+        """Wait before the next beat: ``ttl / 3`` normally; after failed beats it starts at
+        ``ttl / 12`` and doubles, never above ``ttl / 3``."""
+        normal = self.ttl / 3
+        if failures == 0:
+            return normal
+        return min(normal, self.ttl / 12 * 2 ** (failures - 1))
+
+    def _beat(self) -> None:
+        """Renew until released. Failed beats are retried with a short backoff and kept in
+        ``last_error``; once ``ttl`` has passed since the last renewal the lease may have
+        expired and been taken over, so it is marked ``lost`` (the holder then stops with
+        ``busy``) and the thread ends."""
+        clock = self.state.gateway.clock
+        conn: sqlite3.Connection | None = None
+        last_renewed = clock.monotonic()
+        failures = 0
+        try:
+            while not self._stop.wait(self._retry_delay(failures)):
                 try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        ok = self._renew(conn)
-                    finally:
-                        conn.execute("COMMIT")
-                except sqlite3.Error:
-                    continue  # transient (locked); the next beat retries
+                    if conn is None:
+                        conn = _connect(self.state.path)
+                    ok = self._beat_once(conn)
+                except sqlite3.Error as exc:
+                    self.last_error = exc
+                    failures += 1
+                    if conn is not None and conn.in_transaction:
+                        conn.close()  # the rollback itself failed: reconnect on the next beat
+                        conn = None
+                    if clock.monotonic() - last_renewed >= self.ttl:
+                        self.lost = True
+                        return
+                    continue
+                failures = 0
+                self.last_error = None
+                last_renewed = clock.monotonic()
                 if not ok:
                     self.lost = True
                     return
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def release(self) -> None:
         """Drop the lease if it is still ours (a stale release never touches a successor's)."""
