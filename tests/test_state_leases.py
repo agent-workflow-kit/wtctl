@@ -656,6 +656,10 @@ def test_non_sqlite_exceptions_are_failed_beats_then_lost(
         raise exc
 
     monkeypatch.setattr(lease, "_beat_once", boom)
+    lease._stop = _Ticks(1, on_tick=lambda: clock.advance(10))  # type: ignore[assignment]
+    lease._beat()
+    assert lease.last_error is exc  # a single failed beat is recorded ...
+    assert not lease.lost  # ... but retried within ttl, not lost
     ticks = _Ticks(3, on_tick=lambda: clock.advance(10))  # type: ignore[attr-defined]
     lease._stop = ticks  # type: ignore[assignment]
     lease._beat()  # retried while within ttl, then lost on the third (30 s) failure
