@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 from tests.statehelpers import FakeClock, FakeProcs, fake_gateway, make_state, rec
-from wtctl.errors import WtctlError
 from wtctl import state as state_mod
+from wtctl.errors import WtctlError
 from wtctl.gateway import Gateway
 from wtctl.state import MIGRATIONS, State, state_path
 
@@ -610,7 +610,6 @@ def test_retry_delay_is_shorter_after_a_failure_and_bounded(
     assert w[1] < w[0] and w[1] < w[2] <= 10.0  # backing off after failures, never above ttl/3
     assert w[-2] == 10.0  # back to normal after a success
     lease.release()
-
 
 
 def test_a_failed_connect_is_retried_not_fatal(
