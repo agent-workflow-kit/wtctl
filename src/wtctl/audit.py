@@ -180,6 +180,13 @@ class JournalIOError(WtctlError):
         super().__init__("internal", message)
 
 
+class AuditTooLarge(WtctlError):
+    """A record does not fit one audit line (exit 1, ``internal``); nothing is cut."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("internal", message)
+
+
 def _io(message: str) -> JournalIOError:
     return JournalIOError(message)
 
@@ -536,7 +543,7 @@ class Journal:
         }
         line = _dump(record)
         if s.truncated or len(line) >= MAX_LINE_BYTES:
-            raise _internal(
+            raise AuditTooLarge(
                 f"audit record for {action} is too large to record whole "
                 f"(limit {MAX_LINE_BYTES} bytes)"
             )
