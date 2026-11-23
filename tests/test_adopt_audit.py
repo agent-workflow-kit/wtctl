@@ -1,6 +1,6 @@
 """``adopt`` writes one ``adopt`` audit record per recorded state change (docs/interface.md, Audit
 and log; schemas/audit.json): a new adoption, and an already recorded path that gains a holder.
-Never for a dry run, a no-op or a refusal; an unusable audit file refuses before the state changes."""
+Never for a dry run, a no-op or a refusal; an unusable audit file refuses before any change."""
 
 from __future__ import annotations
 
