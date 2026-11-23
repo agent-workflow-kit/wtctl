@@ -13,7 +13,7 @@ Network git (the clone) takes its credentials from ``credentials.prepare_network
 ``default_branch`` is the value stored in the repo's ``clones`` row, which a mirror refresh
 (``mirror.Mirror.refresh``) writes from the remote's HEAD; it is null until the first refresh. The
 mirror's config follows a changed fetch URL at its next use (``Mirror.ensure``), not here.
-TODO(#5): the human ``clone`` re-accept is audited as ``clone_accept``.
+The human ``clone`` re-accept (and its ``clone_accept`` audit record) is in ``commands/clone.py``.
 """
 
 from __future__ import annotations

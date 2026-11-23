@@ -6,7 +6,13 @@ must agree with the clone that clone resolution found for the repo (a directory 
 like a worktree, or one of another clone, is refused). The baseline is recorded with the record,
 in one transaction; git runs only through the hardened runner.
 
-TODO(#5): audit ``adopt`` (path, digest, holder) and log it.
+Every adoption that changes state is audited (``adopt``: path, baseline digest, holder): a new
+record, and an already recorded path that gains a holder (``existing: true``). The record is
+validated and the audit file checked before anything is written, and appended after the change
+commits; a failed append is exit 1. A dry run and an ``existing`` call that changes nothing (no
+``--holder``, or one already held) write none. A record too large for one audit line (an extreme
+path) is refused before the change: it has no part that can be left out.
+TODO(#5): log the ``adopt`` event.
 ``reconcile`` settles ``missing`` and ``unlinked`` adopted records (``adopted_gone``).
 """
 
@@ -19,7 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .. import baselinesvc, fsafe, linkcheck, naming, unwind, urls, worktrees
+from .. import audit, baselinesvc, fsafe, linkcheck, naming, unwind, urls, worktrees
 from .. import labels as labelmod
 from ..context import Context, Result
 from ..errors import UsageError, WtctlError
@@ -186,13 +192,28 @@ class Adopter:
             raise WtctlError("not_found", f"{_shown(self.path)} is not a git worktree")
         if state != "active":
             raise _unlinked(f"{rec['id']} is {state}, not active")
-        if self.holder is not None:
+        if self.holder is not None and self.holder not in rec["holders"]:
             if self.dry:
-                if self.holder not in rec["holders"]:
-                    rec = {**rec, "holders": sorted([*rec["holders"], self.holder])}
+                rec = {**rec, "holders": sorted([*rec["holders"], self.holder])}
             else:
+                journal, prepared = self._prepare_audit(rec["id"], baselinesvc.recorded_digest(rec))
                 rec = self.state.add_holder(rec["id"], self.holder, expected="active")
+                journal.commit_audit(prepared)
         return self._result(rec, existing=True, human=f"{rec['id']} is already recorded")
+
+    def _prepare_audit(self, rid: str, digest: str) -> tuple[audit.Journal, audit.PreparedAudit]:
+        """Check the audit file and encode the ``adopt`` record before the state changes."""
+        journal = audit.journal_for(self.ctx)
+        journal.check_writable()
+        prepared = journal.prepare_audit(
+            "adopt",
+            actor=self.ctx.actor.value,
+            decision_ids=self.ctx.decision_ids,
+            target_id=rid,
+            target_path=self.path,
+            inputs={"path": self.path, "baseline_digest": digest, "holder": self.holder},
+        )
+        return journal, prepared
 
     # -- reading the directory -----------------------------------------------------------------
 
@@ -376,6 +397,7 @@ class Adopter:
             return self._result(
                 self._projected(fields), existing=False, human=f"would adopt {name}"
             )
+        journal, prepared = self._prepare_audit(rid, baseline.digest)
         if lease is not None:
             lease.renew()  # busy: the clone lease was taken over while the baseline ran
         try:
@@ -392,6 +414,7 @@ class Adopter:
                 "refused", f"{_shown(self.path)} was taken meanwhile ({exc.column})",
                 reason="path_exists",
             ) from None  # fmt: skip
+        journal.commit_audit(prepared)
         return self._result(record, existing=False, human=f"adopted {name}")
 
     def _check_nesting(self, res: Resolution) -> None:
