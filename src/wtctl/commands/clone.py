@@ -2,6 +2,9 @@
 
 An already resolving repo is returned as is. When its clone's common dir has a different identity
 than the recorded one, a human re-accepts it here (the only way besides ``baseline accept``).
+The re-accept is audited (``clone_accept``: repo, clone path, anchors): the record is validated and
+the audit file checked before the row is rewritten and appended after it; a failed append is
+exit 1. A dry run, a refusal and an actor that is not human write none.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from .. import audit
 from ..context import Context, Result
 from ..errors import WtctlError
 from ..locate import Resolution, Resolver, is_fuse, resolver_for
@@ -57,10 +61,20 @@ def _reaccept(ctx: Context, resolver: Resolver, res: Resolution) -> list[dict[st
                 "confirmation_required", "re-accepting a changed clone needs confirmation (--yes)"
             )
     with resolver.state.lease(repo_lease(res.repo), wait=resolver.config.lease_wait_s):
+        journal = audit.journal_for(ctx)
+        journal.check_writable()
+        prepared = journal.prepare_audit(
+            "clone_accept",
+            actor=ctx.actor.value,
+            decision_ids=ctx.decision_ids,
+            target_id=None,
+            target_path=res.clone_path,
+            inputs={"repo": res.repo, "clone_path": res.clone_path, "anchors": anchors},
+        )
         resolver.state.put_clone(
             res.repo, path=res.clone_path, common_dir=res.common_dir, common_id=res.common_id
         )
-        # TODO(#5): audit this as `clone_accept`.
+        journal.commit_audit(prepared)
     res.recorded_id = res.common_id
     return anchors
 
