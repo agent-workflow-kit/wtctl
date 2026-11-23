@@ -239,6 +239,10 @@
                   },
                   {
                     "type": "null"
+                  },
+                  {
+                    "const": "[redacted]",
+                    "description": "A holder shaped like a secret token is recorded redacted."
                   }
                 ]
               }

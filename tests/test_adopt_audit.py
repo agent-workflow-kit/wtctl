@@ -15,6 +15,8 @@ from tests.adoptlib import adopt, err_of, foreign, inproc_baseline, ok_adopt, wo
 from tests.createlib import CW
 from tests.schemacheck import validate
 from wtctl import audit
+from wtctl.errors import WtctlError
+from wtctl.state import State
 
 
 @pytest.fixture(autouse=True)
@@ -157,3 +159,47 @@ def test_hostile_strings_cannot_inject_audit_lines(w: CW, capsys) -> None:  # no
     (a,) = audits(w)
     validate("wtctl/audit.json", a)
     assert a["inputs"]["path"].endswith(name) and a["inputs"]["holder"] == "h#x"
+
+
+def test_a_failed_insert_leaves_no_audit_record(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = foreign(w)
+
+    def boom(self, *a, **k):  # noqa: ANN001, ANN002, ANN003, ANN202, ARG001
+        raise WtctlError("internal", "forced insert failure")
+
+    monkeypatch.setattr(State, "insert_record", boom)
+    r = adopt(w, capsys, path)
+    assert r.code == 1, (r.out, r.err)
+    assert w.count("records") == 0 and audits(w) == []
+
+
+def test_a_failed_holder_addition_leaves_no_second_audit_record(
+    w: CW,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = foreign(w)
+    ok_adopt(adopt(w, capsys, path, "--holder", "a#1"))
+
+    def boom(self, *a, **k):  # noqa: ANN001, ANN002, ANN003, ANN202, ARG001
+        raise WtctlError("internal", "forced add_holder failure")
+
+    monkeypatch.setattr(State, "add_holder", boom)
+    r = adopt(w, capsys, path, "--holder", "a#2")
+    assert r.code == 1, (r.out, r.err)
+    assert len(audits(w)) == 1
+
+
+def test_a_token_shaped_holder_is_recorded_redacted_and_schema_valid(
+    w: CW,
+    capsys,  # noqa: ANN001
+) -> None:
+    holder = "ghp_" + "a1B2c3D4e5" * 3
+    ok_adopt(adopt(w, capsys, foreign(w), "--holder", holder, human=True))
+    (a,) = audits(w)
+    validate("wtctl/audit.json", a)
+    assert a["inputs"]["holder"] == "[redacted]"

@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from .. import audit
+from .. import audit, fsafe
 from ..context import Context, Result
 from ..errors import WtctlError
 from ..locate import Resolution, Resolver, is_fuse, resolver_for
@@ -63,13 +63,25 @@ def _reaccept(ctx: Context, resolver: Resolver, res: Resolution) -> list[dict[st
     with resolver.state.lease(repo_lease(res.repo), wait=resolver.config.lease_wait_s):
         journal = audit.journal_for(ctx)
         journal.check_writable()
+        # the audit schema forbids a newline in these; the command's own output stays raw
+        audited = [
+            {
+                **a,
+                **{
+                    k: fsafe.escape_for_details(a[k])
+                    for k in ("path", "mount_point", "mount_source")
+                    if isinstance(a.get(k), str)
+                },
+            }
+            for a in anchors
+        ]
         prepared = journal.prepare_audit(
             "clone_accept",
             actor=ctx.actor.value,
             decision_ids=ctx.decision_ids,
             target_id=None,
             target_path=res.clone_path,
-            inputs={"repo": res.repo, "clone_path": res.clone_path, "anchors": anchors},
+            inputs={"repo": res.repo, "clone_path": res.clone_path, "anchors": audited},
         )
         resolver.state.put_clone(
             res.repo, path=res.clone_path, common_dir=res.common_dir, common_id=res.common_id

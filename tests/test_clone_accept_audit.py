@@ -15,6 +15,8 @@ from tests.schemacheck import validate
 from tests.test_locate import REPO, World, replace_clone, row
 from wtctl import audit
 from wtctl import locate as locate_mod
+from wtctl.errors import WtctlError
+from wtctl.state import State
 
 
 @pytest.fixture
@@ -127,3 +129,41 @@ def test_hostile_mount_text_cannot_inject_audit_lines(
     (a,) = audits(w)
     validate("wtctl/audit.json", a)
     assert set(a) == {"ts", "actor", "decision_id", "target", "action", "inputs", "result"}
+
+
+def test_mount_text_with_newlines_keeps_the_audit_record_schema_valid(
+    w: World,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changed(w, capsys)
+    monkeypatch.setattr(
+        locate_mod,
+        "describe_mount",
+        lambda path, st: {
+            "fs_type": "ext4",
+            "mount_source": "s\nx",
+            "mount_point": "/mnt/a\nb",
+        },
+    )
+    r = w.cli(capsys, "--yes", "clone", REPO, human=True)
+    assert r.code == 0, (r.out, r.err)
+    assert audit_path(w).read_bytes().count(b"\n") == 1
+    (a,) = audits(w)
+    validate("wtctl/audit.json", a)
+
+
+def test_a_failed_row_write_leaves_no_audit_record(
+    w: World,
+    capsys,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changed(w, capsys)
+
+    def boom(self, repo, **fields):  # noqa: ANN001, ANN202, ARG001
+        raise WtctlError("internal", "forced put_clone failure")
+
+    monkeypatch.setattr(State, "put_clone", boom)
+    r = w.cli(capsys, "--yes", "clone", REPO, human=True)
+    assert r.code == 1, (r.out, r.err)
+    assert audits(w) == []
