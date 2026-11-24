@@ -149,7 +149,6 @@
               },
               "repo": {
                 "type": "string",
-                "maxLength": 300,
                 "description": "From the validated config."
               }
             },
@@ -186,7 +185,6 @@
               },
               "host": {
                 "type": "string",
-                "maxLength": 300,
                 "description": "From the validated config."
               }
             },
@@ -231,12 +229,10 @@
               },
               "repo": {
                 "type": "string",
-                "maxLength": 300,
                 "description": "From the validated config."
               },
               "host": {
                 "type": "string",
-                "maxLength": 300,
                 "description": "The host (with a non-default port) the URL names; absent on an entry skipped before its URL was read."
               }
             },

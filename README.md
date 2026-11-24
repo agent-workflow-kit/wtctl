@@ -65,7 +65,7 @@ wtctl clone <repo-id>
 wtctl label add|remove <id|path> k=v...
 wtctl reconcile [--dry-run]
 wtctl prune --throwaways [--older-than D] [--if-configured] [--label k=v]... [--dry-run]
-wtctl validate
+wtctl validate [--probe]
 wtctl export [--since TIME] [--audit | --log]
 wtctl cron install [--env-file FILE]
 wtctl cron uninstall

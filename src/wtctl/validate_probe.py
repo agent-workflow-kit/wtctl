@@ -20,10 +20,13 @@ classified, never shown.
 from __future__ import annotations
 
 import os
+import re
+import signal
 import stat
-from collections.abc import Callable
-from contextlib import ExitStack
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import urls
@@ -31,6 +34,7 @@ from .context import Context
 from .credentials import (
     TOKEN_COMMAND_TIMEOUT,
     NetworkKind,
+    Secret,
     fetch_target,
     prepare_network_auth,
     resolve_token,
@@ -75,6 +79,20 @@ class _Probe:
     work: str  # a fresh private directory: cwd of the calls outside any repository
     started: float
     warnings: list[Warning_]
+    tokens: dict[str, Secret | None] = field(default_factory=dict)  # host -> token, once per host
+
+    def token(self, host: str) -> Secret | None:
+        """The token of ``hosts.<host>``: resolved (``token_command`` run) once per probe."""
+        if host not in self.tokens:
+            self.tokens[host] = resolve_token(
+                self.ctx.config,
+                host,
+                environ=os.environ,
+                gateway=self.ctx.gateway,
+                warn=lambda _note: None,  # the entry says it; a note could echo config text
+                command_timeout=max(MIN_CALL_S, min(TOKEN_COMMAND_TIMEOUT, self.remaining())),
+            )
+        return self.tokens[host]
 
     def remaining(self) -> float:
         return MAX_TOTAL_S - (self.ctx.gateway.clock.monotonic() - self.started)
@@ -130,15 +148,7 @@ def _check_token(probe: _Probe, host: str) -> Item:
     hc = cfg.host(host)
     if hc.token_env is None and hc.token_command is None:
         return _item(fields, SKIPPED, "no_token_source")
-    notes: list[str] = []
-    token = resolve_token(
-        cfg,
-        host,
-        environ=os.environ,
-        gateway=probe.ctx.gateway,
-        warn=notes.append,
-        command_timeout=max(MIN_CALL_S, min(TOKEN_COMMAND_TIMEOUT, probe.remaining())),
-    )
+    token = probe.token(host)
     if token is None:
         return _item(fields, FAILED, "token_unavailable")
     try:
@@ -157,6 +167,16 @@ class _EmbeddedCredentials(Exception):
     pass
 
 
+_AUTHORITY = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://([^/?#]*)", re.DOTALL)
+
+
+def _has_userinfo(raw: str) -> bool:
+    """Whether the URL's authority carries userinfo (any ``@``): structural, so neither the
+    case of the scheme nor a user name without a password hides it."""
+    m = _AUTHORITY.match(raw)
+    return m is not None and "@" in m.group(1)
+
+
 def _remote_url(probe: _Probe, repo_id: str) -> str:
     """The repo's fetch URL as ``clone`` would use it (``WtctlError`` for an unusable config)."""
     cfg = probe.ctx.config
@@ -168,7 +188,7 @@ def _remote_url(probe: _Probe, repo_id: str) -> str:
         raw = urls.render_clone_url(repo_id, template=cfg.host(host).clone_url)
         what = f"hosts.{host}.clone_url"
     if urls.local_path(raw) is None and urls.url_scheme(raw) == "https":
-        if urls.strip_userinfo(raw) != raw:
+        if _has_userinfo(raw):
             raise _EmbeddedCredentials(what)
     return Resolver._plain_url(raw, what)  # noqa: SLF001 - the one place that normalizes it
 
@@ -191,14 +211,13 @@ def _check_remote(probe: _Probe, repo_id: str) -> Item:
     budget = probe.remaining()
     if budget < MIN_CALL_S:
         return _item(fields, SKIPPED, "deadline")
-    notes: list[str] = []
     auth = prepare_network_auth(
         cfg,
         url,
         environ=os.environ,
         gateway=probe.ctx.gateway,
-        warn=notes.append,
-        command_timeout=max(MIN_CALL_S, min(TOKEN_COMMAND_TIMEOUT, budget)),
+        warn=lambda _note: None,
+        token_for=probe.token,  # the token_command already ran (or runs now) once per host
     )
     budget = probe.remaining()
     if budget < MIN_CALL_S:
@@ -266,6 +285,28 @@ def _family(
     return items
 
 
+def _raise_exit(signum: int, _frame: Any) -> None:
+    raise SystemExit(128 + signum)
+
+
+@contextmanager
+def _terminating() -> Iterator[None]:
+    """SIGTERM and SIGHUP end the probe by unwinding (git child and private directory are
+    cleaned up), as in ``browse``; the previous handlers come back afterwards."""
+    previous: dict[int, Any] = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            if signal.getsignal(sig) == signal.SIG_IGN:  # nohup: stay ignored
+                continue
+            previous[sig] = signal.signal(sig, _raise_exit)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            if handler is not None:  # None: a non-Python handler we cannot reinstall
+                signal.signal(sig, handler)
+
+
 def run_probe(ctx: Context, git_bin: str) -> tuple[dict[str, Any], list[Warning_]]:
     """The ``probe`` object and its warnings. Never raises for a failing check."""
     cfg = ctx.config
@@ -274,6 +315,7 @@ def run_probe(ctx: Context, git_bin: str) -> tuple[dict[str, Any], list[Warning_
     repo_ids = sorted(cfg.repos)
     hosts = sorted(cfg.hosts)
     stack = ExitStack()
+    stack.enter_context(_terminating())
     try:
         work = stack.enter_context(private_dir())  # wtctl's own tmp area; removed on exit
         home = str(tmp_root())
@@ -285,6 +327,7 @@ def run_probe(ctx: Context, git_bin: str) -> tuple[dict[str, Any], list[Warning_
                 "message": "wtctl's private temporary directory is not usable; nothing probed",
             }
         )
+        stack.close()
         skipped = "workdir_unavailable"
         return {
             "clones": [{"repo": i, "status": SKIPPED, "reason": skipped} for i in clone_ids],

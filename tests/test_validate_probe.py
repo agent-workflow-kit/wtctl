@@ -13,12 +13,14 @@ import http.server
 import json
 import os
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,7 +44,7 @@ class Srv:
     port: int
     cert: Path
     advert: bytes
-    mode: str = "open"  # open | token | stall | redirect | garbage | error
+    mode: str = "open"  # open | token | stall | redirect | garbage | error | notfound | ratelimit
     requests: list[dict[str, str]] = field(default_factory=list)
     release: threading.Event = field(default_factory=threading.Event)
 
@@ -81,7 +83,20 @@ def srv(tmp_path: Path, private_home: Path) -> Iterator[Srv]:
         env={"PATH": "/usr/bin:/bin", "HOME": str(private_home), "GIT_CONFIG_NOSYSTEM": "1"},
     ).stdout  # fmt: skip
     cap = Srv(0, cert, _pkt(b"# service=git-upload-pack\n") + b"0000" + adv)
+    with _serving(cap, key):
+        yield cap
 
+
+@pytest.fixture
+def srv2(srv: Srv) -> Iterator[Srv]:
+    """A second loopback server (same certificate, other port): it must never see a token."""
+    key = srv.cert.with_name("k.pem")
+    with _serving(Srv(0, srv.cert, srv.advert), key) as cap:
+        yield cap
+
+
+@contextmanager
+def _serving(cap: Srv, key: Path) -> Iterator[Srv]:
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             cap.requests.append(
@@ -106,6 +121,11 @@ def srv(tmp_path: Path, private_home: Path) -> Iterator[Srv]:
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if cap.mode in ("notfound", "ratelimit"):
+                self.send_response(404 if cap.mode == "notfound" else 429)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if cap.mode == "error":
                 self.send_response(500)
                 self.send_header("Content-Length", "0")
@@ -128,7 +148,7 @@ def srv(tmp_path: Path, private_home: Path) -> Iterator[Srv]:
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(cert, key)
+    ctx.load_cert_chain(cap.cert, key)
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
     cap.port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -142,26 +162,59 @@ def srv(tmp_path: Path, private_home: Path) -> Iterator[Srv]:
         thread.join(timeout=10)
 
 
+_NETWORK_COMMANDS = {"ls-remote", "fetch", "clone", "pull", "push"}
+_GUARDS: list[Any] = []
+
+
 class Guard:
-    """A gateway that trusts the test certificate and refuses every non-loopback URL."""
+    """A gateway that trusts the test certificate and refuses every non-loopback URL.
+
+    Any network git command (ls-remote, fetch, clone, pull, push) with an argument that looks like
+    a URL but is not ``https://127.0.0.1:`` is refused and recorded in ``violations``; the
+    ``guards_clean`` fixture fails the test at teardown if there is any.
+    """
 
     def __init__(self, cert: Path | None) -> None:
         self.cert = cert
-        self.urls: list[str] = []
-        self.refused: list[str] = []
+        self.urls: list[str] = []  # the URLs of ls-remote calls (not --get-url)
+        self.violations: list[list[str]] = []
+        self.calls: list[tuple[list[str], float | None]] = []  # (argv tail, timeout) of every call
+        self.argvs: list[list[str]] = []  # full argv of every ls-remote network call
+        self.envs: list[dict[str, str]] = []  # the environment of each of those calls
+        self.gate: Callable[[list[str]], GitResult | None] | None = None
+        _GUARDS.append(self)
 
-    def gateway(self) -> Gateway:
+    def gateway(self, clock: Any = None) -> Gateway:
         def runner(argv: list[str], *, env: dict[str, str], **kw: Any) -> GitResult:
-            if "ls-remote" in argv and "--get-url" not in argv:
-                url = argv[argv.index("--") + 1]
-                self.urls.append(url)
-                if not url.startswith("https://127.0.0.1:"):
-                    self.refused.append(url)
+            self.calls.append((argv, kw.get("timeout")))
+            local_only = "--get-url" in argv
+            if _NETWORK_COMMANDS & set(argv) and not local_only:
+                if "ls-remote" in argv:
+                    urls = [argv[argv.index("--") + 1]] if "--" in argv else []
+                    self.urls += urls
+                    self.argvs.append(argv)
+                    self.envs.append(dict(env))
+                else:
+                    urls = [a for a in argv if "://" in a or "::" in a]
+                if not urls or any(not u.startswith("https://127.0.0.1:") for u in urls):
+                    self.violations.append(argv)
                     return GitResult(128, b"", b"fatal: refused by the test guard\n")
+                if self.gate is not None and (fake := self.gate(argv)) is not None:
+                    return fake
             extra = {"GIT_SSL_CAINFO": str(self.cert)} if self.cert else {}
             return run_git(argv, env={**env, **extra}, **kw)
 
-        return Gateway(git_runner=runner)
+        if clock is None:
+            return Gateway(git_runner=runner)
+        return Gateway(git_runner=runner, clock=clock)
+
+
+@pytest.fixture(autouse=True)
+def guards_clean() -> Iterator[None]:
+    _GUARDS.clear()
+    yield
+    bad = [v for g in _GUARDS for v in g.violations]
+    assert bad == [], "a git network call left loopback"
 
 
 @pytest.fixture(autouse=True)
@@ -387,6 +440,7 @@ def test_unsafe_remote_urls_are_never_contacted(
         f"{base}/org/ssh": {"clone_url": "ssh://git@127.0.0.1:2/org/ssh"},
         f"{base}/org/local": {"clone_url": "/some/local/path"},
         f"{base}/org/opt": {"clone_url": "--upload-pack=touch /tmp/x"},
+        f"{base}/org/http": {"clone_url": f"http://{base}/org/http"},
     }
     g = Guard(srv.cert)
     r = probe(capsys, config(tmp_path, repos=repos), g)
@@ -397,11 +451,12 @@ def test_unsafe_remote_urls_are_never_contacted(
         i["repo"].rsplit("/", 1)[1]: (i["status"], i["reason"]) for i in data["probe"]["remotes"]
     }
     assert got["creds"] == ("failed", "embedded_credentials")
-    assert got["ext"][0] == "failed"
-    assert got["file"][0] in ("failed", "skipped")
+    assert got["ext"] == ("failed", "invalid_url")
+    assert got["file"] == ("skipped", "local_remote")
     assert got["ssh"] == ("skipped", "ssh_not_probed")
     assert got["local"] == ("skipped", "local_remote")
-    assert got["opt"][0] == "failed"
+    assert got["opt"] == ("failed", "invalid_url")
+    assert got["http"] == ("failed", "invalid_url")
     assert g.urls == [] and srv.requests == []
     assert "pw@" not in r.out + r.err and ":pw" not in r.out + r.err
 
@@ -471,22 +526,23 @@ def test_host_without_a_token_source_is_skipped(
 
 
 def test_clone_checks(
-    capsys: pytest.CaptureFixture[str], tmp_path: Path, private_home: Path
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, private_home: Path, srv: Srv
 ) -> None:
     good, bad, gone = tmp_path / "good", tmp_path / "bad", tmp_path / "gone"
+    base = f"127.0.0.1:{srv.port}"
     for d, url in (
-        (good, "https://example.test/org/good.git"),
-        (bad, "https://example.test/org/elsewhere.git"),
+        (good, f"https://{base}/org/good.git"),
+        (bad, f"https://{base}/org/elsewhere.git"),
     ):
         d.mkdir()
         plain_git(["init", "-q", str(d)], cwd=tmp_path, home=private_home)
         plain_git(["remote", "add", "origin", url], cwd=d, home=private_home)
     repos = {
-        "example.test/org/good": {"clone": str(good)},
-        "example.test/org/bad": {"clone": str(bad)},
-        "example.test/org/gone": {"clone": str(gone)},
+        f"{base}/org/good": {"clone": str(good)},
+        f"{base}/org/bad": {"clone": str(bad)},
+        f"{base}/org/gone": {"clone": str(gone)},
     }
-    g = Guard(None)
+    g = Guard(srv.cert)
     r = probe(capsys, config(tmp_path, repos=repos), g)
     assert r.code == 0
     data = r.json()
@@ -503,8 +559,9 @@ def test_clone_checks(
         "probe_clone_failed"
     ]
     assert not gone.exists()  # a missing clone is not created
-    # these remotes are https on a non-loopback name: the guard must have stopped every call
-    assert g.urls and set(g.refused) == set(g.urls)
+    local = [t for argv, t in g.calls if any(a.startswith("--git-dir=") for a in argv)]
+    # calls that name no timeout get LOCAL_GIT_S (15); verify_clone itself asks 30 for a few
+    assert 15.0 in local and set(local) <= {15.0, 30}
 
 
 # ---------------------------------------------------------------- read-only, private, bounded
@@ -614,3 +671,320 @@ def test_dry_run_is_still_a_usage_error(capsys: pytest.CaptureFixture[str]) -> N
     code = main(["validate", "--probe", "--dry-run"], runtime=Runtime(stdin_isatty=False))
     capsys.readouterr()
     assert code == 2
+
+
+# ---------------------------------------------------------------- review round 1
+
+
+def _token_script(tmp_path: Path, log: Path) -> Path:
+    script = tmp_path / "tok.sh"
+    script.write_text(f"#!/bin/sh\necho run >> '{log}'\nprintf '%s\\n' '{TOKEN}'\n")
+    script.chmod(0o755)
+    return script
+
+
+def test_token_command_runs_once_per_host(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv
+) -> None:
+    srv.mode = "token"
+    log = tmp_path / "runs.log"
+    base = f"127.0.0.1:{srv.port}"
+    cfg = config(
+        tmp_path,
+        repos={f"{base}/org/a": {}, f"{base}/org/b": {}, f"{base}/org/c": {}},
+        hosts={base: {"token_command": [str(_token_script(tmp_path, log))]}},
+    )
+    r = probe(capsys, cfg, Guard(srv.cert))
+    assert r.code == 0
+    data = r.json()
+    assert [i["status"] for i in data["probe"]["remotes"]] == ["ok", "ok", "ok"]
+    assert only(data, "tokens")["status"] == "ok"
+    assert log.read_text().splitlines() == ["run"]
+
+
+def test_remote_without_a_usable_token_sends_none(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv
+) -> None:
+    srv.mode = "token"
+    bad = tmp_path / "bad.sh"
+    bad.write_text("#!/bin/sh\nexit 3\n")
+    bad.chmod(0o755)
+    base = f"127.0.0.1:{srv.port}"
+    cfg = config(tmp_path, repos={srv.repo_id: {}}, hosts={base: {"token_command": [str(bad)]}})
+    r = probe(capsys, cfg, Guard(srv.cert))
+    item = only(r.json(), "remotes")
+    assert (item["status"], item["reason"]) == ("failed", "auth_required")
+    assert all("authorization" not in q for q in srv.requests)
+
+
+@pytest.mark.parametrize("scheme", ["Https", "HTTPS"])
+def test_uppercase_scheme_is_not_embedded_credentials(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv, scheme: str
+) -> None:
+    repos = {srv.repo_id: {"clone_url": f"{scheme}://127.0.0.1:{srv.port}/org/repo"}}
+    g = Guard(srv.cert)
+    r = probe(capsys, config(tmp_path, repos=repos), g)
+    assert r.code == 0
+    assert only(r.json(), "remotes")["status"] == "ok"
+    assert g.urls == [f"https://127.0.0.1:{srv.port}/org/repo"]
+
+
+@pytest.mark.parametrize("userinfo", ["tok@", "u:p@", "Https-not:x@"])
+def test_userinfo_is_embedded_credentials_whatever_its_shape(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv, userinfo: str
+) -> None:
+    scheme = "Https" if userinfo.startswith("Https") else "https"
+    repos = {srv.repo_id: {"clone_url": f"{scheme}://{userinfo}127.0.0.1:{srv.port}/org/repo"}}
+    g = Guard(srv.cert)
+    r = probe(capsys, config(tmp_path, repos=repos), g)
+    assert r.code == 0
+    item = only(r.json(), "remotes")
+    assert (item["status"], item["reason"]) == ("failed", "embedded_credentials")
+    assert g.urls == [] and srv.requests == []
+    assert "tok@" not in r.out + r.err and "u:p" not in r.out + r.err
+
+
+def test_a_crashing_check_is_an_internal_error_entry(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("boom-secret")
+
+    monkeypatch.setattr(validate_probe, "verify_clone", boom)
+    monkeypatch.setattr(validate_probe, "_check_remote", boom)
+    monkeypatch.setattr(validate_probe, "_check_token", boom)
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    cfg = config(
+        tmp_path,
+        repos={"example.test/org/r": {"clone": str(clone)}},
+        hosts={"example.test": {"token_env": "PROBE_TOKEN"}},
+    )
+    r = probe(capsys, cfg, Guard(None))
+    assert r.code == 0
+    data = r.json()
+    validate("wtctl/cli/validate.json", data)
+    for family in ("clones", "tokens", "remotes"):
+        item = only(data, family)
+        assert (item["status"], item["reason"]) == ("failed", "internal_error")
+    keys = {w["code"]: w["key"] for w in data["warnings"]}
+    assert keys == {
+        "probe_clone_failed": "repos.example.test/org/r",
+        "probe_token_failed": "hosts.example.test",
+        "probe_remote_failed": "repos.example.test/org/r",
+    }
+    assert "boom-secret" not in r.out + r.err
+
+
+def test_a_crashing_clone_verification_is_an_internal_error(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(validate_probe, "verify_clone", boom)
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    cfg = config(
+        tmp_path,
+        repos={
+            "example.test/org/r": {"clone": str(clone), "clone_url": "ssh://git@example.test/org/r"}
+        },
+    )
+    r = probe(capsys, cfg, Guard(None))
+    assert r.code == 0
+    item = only(r.json(), "clones")
+    assert (item["status"], item["reason"]) == ("failed", "internal_error")
+
+
+def test_long_ids_validate_against_the_schema(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    long_id = "example.test/org/" + "a" * 400
+    cfg = config(tmp_path, repos={long_id: {"clone_url": f"ssh://git@example.test/{long_id}"}})
+    r = probe(capsys, cfg, Guard(None))
+    assert r.code == 0
+    data = r.json()
+    assert only(data, "remotes")["repo"] == long_id
+    validate("wtctl/cli/validate.json", data)
+    data["probe"]["tokens"] = [{"host": "h" * 400, "status": "skipped", "reason": "deadline"}]
+    validate("wtctl/cli/validate.json", data)
+
+
+def test_signal_handlers_are_installed_during_the_probe_and_restored(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sigs = (signal.SIGTERM, signal.SIGHUP)
+    before = {s: signal.getsignal(s) for s in sigs}
+    during: list[dict[signal.Signals, Any]] = []
+    real = validate_probe._check_remote
+
+    def watching(p: Any, repo_id: str) -> Any:
+        during.append({s: signal.getsignal(s) for s in sigs})
+        return real(p, repo_id)
+
+    monkeypatch.setattr(validate_probe, "_check_remote", watching)
+    r = probe(capsys, remote_cfg(tmp_path, srv), Guard(srv.cert))
+    assert r.code == 0
+    (seen,) = during
+    for s in sigs:
+        assert seen[s] not in (before[s], signal.SIG_DFL, signal.SIG_IGN)
+        assert signal.getsignal(s) == before[s]
+    handler = seen[signal.SIGTERM]
+    with pytest.raises(SystemExit):
+        handler(signal.SIGTERM, None)
+
+
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    [("notfound", "repository_not_found"), ("ratelimit", "rate_limited")],
+)
+def test_remote_failure_causes_are_classified(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv, mode: str, reason: str
+) -> None:
+    srv.mode = mode
+    r = probe(capsys, config(tmp_path, repos={srv.repo_id: {}}), Guard(srv.cert))
+    assert r.code == 0
+    item = only(r.json(), "remotes")
+    assert (item["status"], item["reason"]) == ("failed", reason)
+
+
+def test_a_token_env_that_is_not_a_valid_token_is_unavailable(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PROBE_TOKEN", "abc\ndef")
+    cfg = config(tmp_path, hosts={"example.test": {"token_env": "PROBE_TOKEN"}})
+    r = probe(capsys, cfg, Guard(None))
+    item = only(r.json(), "tokens")
+    assert (item["status"], item["reason"]) == ("failed", "token_unavailable")
+    assert "abc" not in r.out + r.err
+
+
+def test_a_token_that_cannot_make_a_header_is_token_invalid(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # config validation makes this unreachable with a real config; the branch is still covered
+    def refuse(*a: object, **k: object) -> None:
+        raise ValueError("invalid token_user")
+
+    monkeypatch.setenv("PROBE_TOKEN", TOKEN)
+    monkeypatch.setattr(validate_probe, "token_header", refuse)
+    cfg = config(tmp_path, hosts={"example.test": {"token_env": "PROBE_TOKEN"}})
+    r = probe(capsys, cfg, Guard(None))
+    item = only(r.json(), "tokens")
+    assert (item["status"], item["reason"]) == ("failed", "token_invalid")
+    assert TOKEN not in r.out + r.err
+
+
+def test_token_header_is_scoped_to_its_host_and_port(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    srv: Srv,
+    srv2: Srv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    srv.mode = "token"
+    monkeypatch.setenv("PROBE_TOKEN", TOKEN)
+    cfg = config(
+        tmp_path,
+        repos={srv.repo_id: {}, srv2.repo_id: {}},
+        hosts={f"127.0.0.1:{srv.port}": {"token_env": "PROBE_TOKEN"}},
+    )
+    g = Guard(srv.cert)
+    r = probe(capsys, cfg, g)
+    assert r.code == 0
+    by_port = {i["host"]: i["status"] for i in r.json()["probe"]["remotes"]}
+    assert by_port == {f"127.0.0.1:{srv.port}": "ok", f"127.0.0.1:{srv2.port}": "ok"}
+    assert srv.requests and all(q.get("authorization") == f"Basic {BASIC}" for q in srv.requests)
+    assert srv2.requests and all("authorization" not in q for q in srv2.requests)
+    keys = [
+        v
+        for env in g.envs
+        for k, v in env.items()
+        if k.startswith("GIT_CONFIG_KEY_") and "extraheader" in v.lower()
+    ]  # git takes the header as config from the environment
+    assert keys == [f"http.https://127.0.0.1:{srv.port}/.extraHeader"]  # scoped, not http.*
+
+
+def test_the_limits_are_the_documented_ones() -> None:
+    assert validate_probe.MAX_TOTAL_S == 300.0
+    assert validate_probe.MAX_CALL_S == 60.0
+    assert validate_probe.LOCAL_GIT_S == 15.0
+    assert validate_probe.MAX_ITEMS == 20
+
+
+def test_network_timeout_is_capped_at_sixty_seconds(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv
+) -> None:
+    g = Guard(srv.cert)
+    cfg = config(tmp_path, network_timeout="10m", repos={srv.repo_id: {}})
+    r = probe(capsys, cfg, g)
+    assert r.code == 0
+    (timeout,) = [t for argv, t in g.calls if argv in g.argvs]
+    assert timeout == 60.0
+
+
+def test_the_real_total_budget_ends_the_probe(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def now(self) -> Any:
+            return SystemClockNow()
+
+        def monotonic(self) -> float:
+            return self.t
+
+    from wtctl.gateway import SystemClock as SystemClockNow  # noqa: N814
+
+    clock = FakeClock()
+    g = Guard(None)
+
+    def slow(argv: list[str]) -> GitResult:
+        clock.t += 150.0  # each network call "takes" 150 s of the unpatched 300 s budget
+        return GitResult(0, b"0123456789012345678901234567890123456789\tHEAD\n", b"")
+
+    g.gate = slow
+    base = "127.0.0.1:9"
+    cfg = config(tmp_path, repos={f"{base}/org/{n}": {} for n in "abc"})
+    rt = Runtime(stdin_isatty=False, me_name="alice", gateway=g.gateway(clock=clock))
+    code = main(["validate", "--probe", "--json", "--config", cfg], runtime=rt)
+    data = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert [(i["status"], i.get("reason")) for i in data["probe"]["remotes"]] == [
+        ("ok", None),
+        ("ok", None),
+        ("skipped", "deadline"),
+    ]
+    assert "probe_deadline" in {w["code"] for w in data["warnings"]}
+
+
+def test_entries_are_sorted_by_id(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    ids = ["z.test/org/a", "m.test/org/a", "a.test/org/a"]
+    cfg = config(
+        tmp_path,
+        repos={i: {"clone_url": f"ssh://git@{i}"} for i in ids},
+        hosts={h: {} for h in ("z.test", "m.test", "a.test")},
+    )
+    data = probe(capsys, cfg, Guard(None)).json()
+    assert [i["repo"] for i in data["probe"]["remotes"]] == sorted(ids)
+    assert [i["host"] for i in data["probe"]["tokens"]] == ["a.test", "m.test", "z.test"]
+
+
+def test_only_the_https_scheme_reaches_git(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, srv: Srv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    schemes: list[object] = []
+    real = validate_probe._BoundedGit.run
+
+    def spy(self: Any, args: Any, **kw: Any) -> Any:
+        if "ls-remote" in args and "--get-url" not in args:
+            schemes.append(kw.get("scheme"))
+        return real(self, args, **kw)
+
+    monkeypatch.setattr(validate_probe._BoundedGit, "run", spy)
+    r = probe(capsys, config(tmp_path, repos={srv.repo_id: {}}), Guard(srv.cert))
+    assert r.code == 0
+    assert schemes == ["https"]

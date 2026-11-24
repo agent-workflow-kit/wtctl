@@ -323,6 +323,7 @@ def prepare_network_auth(
     gateway: Gateway,
     warn: Warn,
     command_timeout: float = TOKEN_COMMAND_TIMEOUT,
+    token_for: Callable[[str], Secret | None] | None = None,
 ) -> NetworkAuth:
     """Credentials for one network call to ``url`` (the URL actually used, in fetch form: https
     without userinfo, ssh with at most a plain user name).
@@ -333,6 +334,10 @@ def prepare_network_auth(
 
     Raises ``WtctlError`` (``remote_mismatch``) for a URL :func:`fetch_target` refuses; the
     message never contains the URL, which could carry a secret.
+
+    ``token_for`` (default: none, the token is resolved here) is a caller that already resolved
+    the host's token (``validate --probe`` runs a ``token_command`` once per host): it is called
+    with the host and port instead of :func:`resolve_token`.
     """
     try:
         target = fetch_target(url)
@@ -345,14 +350,17 @@ def prepare_network_auth(
         return NetworkAuth("ssh")
     if target.scheme != "https" or target.hostport is None:
         return NetworkAuth(target.scheme)
-    token = resolve_token(
-        cfg,
-        target.hostport,
-        environ=environ,
-        gateway=gateway,
-        warn=warn,
-        command_timeout=command_timeout,
-    )
+    if token_for is not None:
+        token = token_for(target.hostport)
+    else:
+        token = resolve_token(
+            cfg,
+            target.hostport,
+            environ=environ,
+            gateway=gateway,
+            warn=warn,
+            command_timeout=command_timeout,
+        )
     if token is None:
         return NetworkAuth("https", hostport=target.hostport)
     try:
