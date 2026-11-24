@@ -177,6 +177,10 @@ def _cron_install(p: argparse.ArgumentParser) -> None:
     p.add_argument("--env-file", metavar="FILE")
 
 
+def _validate(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--probe", action="store_true", help="also run live checks (network, tokens)")
+
+
 # --- the table --------------------------------------------------------------------------------
 
 COMMANDS: tuple[Command, ...] = (
@@ -229,9 +233,9 @@ COMMANDS: tuple[Command, ...] = (
     Command(
         "validate",
         ("validate",),
-        "check the config and environment (offline, read-only)",
+        "check the config and environment (offline, read-only; --probe: live checks)",
         "#93",
-        _none,
+        _validate,
     ),
     Command("export", ("export",), "print audit or log records", "#5", _export),
     Command(

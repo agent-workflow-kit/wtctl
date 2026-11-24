@@ -588,7 +588,7 @@ Removes a worktree ([Remove order](#remove-order)) or a throwaway ([Throwaway re
 
 ### `validate`
 
-`wtctl validate` checks the configuration and the environment without changing anything. It is **offline and read-only**: no network call, no prompt, no `state.db` (it is not opened, so on a fresh home it creates nothing), no lease or compare-and-set, no write to `audit.jsonl`, `log.jsonl`, `root` or any other path, and no hook. The only process it starts is `git --version`. It accepts no flags of its own (`--dry-run` exits 2). It has no live checks: there is no `--probe`.
+`wtctl validate` checks the configuration and the environment without changing anything. It is **offline and read-only**: no network call, no prompt, no `state.db` (it is not opened, so on a fresh home it creates nothing), no lease or compare-and-set, no write to `audit.jsonl`, `log.jsonl`, `root` or any other path, and no hook. The only process it starts is `git --version`. Its one flag is `--probe` ([below](#validate-probe)); `--dry-run` exits 2. Everything in this section up to [Probe](#validate-probe) describes the command **without** `--probe`, whose output and exit codes are unchanged by it.
 
 In [check order](#check-order) it runs stage 1 (usage and config) and stage 2 (git version) and nothing else:
 
@@ -601,7 +601,19 @@ In [check order](#check-order) it runs stage 1 (usage and config) and stage 2 (g
 
 Config values are untrusted text: in messages and human output they are escaped like all human output ([Check order](#check-order), Human output) and cut to 200 characters; `--json` output is ASCII. Nothing from the config is executed.
 
-Exit 0, 1, 2, 12.
+<a id="validate-probe"></a>
+
+**`--probe`** (additive; `awkit doctor --probe` runs it) adds live checks after the offline ones. If the offline checks fail the command exits as above and probes nothing. A probe never changes the exit code: a failing check is an entry with `status: failed` and a [warning](#validate) (exit 0); only the offline checks exit non-zero. It never prompts, writes no `state.db`, audit, log or lease, runs no hook, and works with no credentials configured (nothing to check is `skipped`). Its one write is a private directory below wtctl's own tmp area (`<state dir>/tmp/p-*`, created if needed, removed on exit); if that cannot be made, every check is `skipped` with reason `workdir_unavailable` and one `probe_unavailable` warning is added. At most 20 entries per family are probed (`probe_truncated` warning for more), and the whole probe has a 300 second budget: when it runs out the rest is `skipped` with reason `deadline` (`probe_deadline` warning). Entries are sorted by id.
+
+`--json` gains a `probe` member **only with the flag**: `{"clones": [...], "tokens": [...], "remotes": [...]}`, each entry `{"repo" or "host", "status": "ok" | "failed" | "skipped", "reason"?}` (`remotes` entries also have `host`, the URL's host with a non-default port; it is absent on an entry skipped before its URL was read). Without `--json` the summary gains `probe: N ok, M failed, K skipped`.
+
+- **`clones`**: every `repos.<id>` with a `clone`: the directory is verified as `locate` does ([Clone resolution](#clone-resolution), hardened git, local calls of at most 15 seconds, nothing written). `ok`; `skipped` / `missing` (the directory does not exist, it is not created); `failed` / `not_a_clone` (not a directory, not a clone, or its remote does not name the repo).
+- **`tokens`**: every `hosts.<host>`. A host with neither `token_env` nor `token_command` is `skipped` / `no_token_source`. Otherwise the token is resolved as for a network call (`token_command` **is run**, with its usual 10 second limit; the one place `validate` executes a configured command) and must be usable in a header: `ok`, or `failed` with `token_unavailable` (empty, invalid, command failed or timed out) or `token_invalid`. The token and the command's output are never printed, stored or put in any message.
+- **`remotes`**: every `repos.<id>`: its fetch URL (`clone_url`, else the host's template, as [clone](#clone) uses it) answers `git ls-remote -- <url> HEAD`: hardened git outside any repository, protocols allow-list `https`, redirects off, the host's token (if any) as a header scoped to that host, no prompt, a wall-clock limit of `network_timeout` capped at 60 seconds. `ok`; `failed` with `auth_required` (no token was sent), `token_rejected` (one was), `timeout`, `network_unreachable`, `repository_not_found`, `rate_limited`, `git_failed` (any other failure), `invalid_url` (the URL does not normalize or has an unusable scheme such as `ext::`) or `embedded_credentials` (the configured URL carries userinfo; it is refused, not stripped, and git is not run); `skipped` with `ssh_not_probed` (an ssh remote: `validate` makes no ssh connection and a token never goes over ssh) or `local_remote` (a path or `file:` URL). A host with no configured repo has nothing to list and is not probed for reachability. Git's output and messages are classified and never shown.
+
+Warning codes added (only with `--probe`): `probe_clone_failed`, `probe_token_failed`, `probe_remote_failed` (each with `key` `repos.<id>` or `hosts.<host>`), `probe_truncated`, `probe_deadline`, `probe_unavailable`.
+
+Exit 0, 1, 2, 12 (`--probe` adds no exit code).
 
 ### `cron install` / `cron uninstall`
 

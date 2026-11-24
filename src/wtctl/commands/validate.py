@@ -157,12 +157,25 @@ def run(ctx: Context) -> Result:
 
     git = _check_git(ctx, cfg.git_bin)
 
-    data = {
+    data: dict[str, Any] = {
         "checks": {"root": root, "search_roots": search, "git": git},
         "warnings": warnings,
     }
+    probe_line = None
+    if getattr(ctx.args, "probe", False):
+        from ..validate_probe import run_probe  # live checks: only with --probe
+
+        data["probe"], probe_warnings = run_probe(ctx, git["path"])
+        warnings.extend(probe_warnings)
+        items = [i for fam in data["probe"].values() for i in fam]
+        counts = {s: sum(1 for i in items if i["status"] == s) for s in ("ok", "failed", "skipped")}
+        probe_line = (
+            f"probe: {counts['ok']} ok, {counts['failed']} failed, {counts['skipped']} skipped"
+        )
     human = ["wtctl: configuration and environment are usable"]
     human.append(f"root: {shown(root['path'])}")
     human.append(f"git: {git['version']} ({shown(git['path'])})")
+    if probe_line:
+        human.append(probe_line)
     stderr = "\n".join(f"warning: {w['key']}: {w['message']}" for w in warnings)
     return Result(data, human="\n".join(human), stderr=stderr)
