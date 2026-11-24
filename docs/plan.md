@@ -173,5 +173,5 @@ Declared:
 
 Next:
 
-- **1.x** (additive; #30 to #33 shipped before 1.0): recursive submodule checks (#30, done: removing worktrees with initialized submodules without `--force`), sparse-checkout support (#31, done: `create --sparse`, cone only), a `browse` TUI (#32, done: read-only `curses` view, no new dependency), more fetch-error classifications (#33, done), an offline read-only `validate` command (#93, done; live `--probe` checks are a separate follow-up).
+- **1.x** (additive; #30 to #33 shipped before 1.0): recursive submodule checks (#30, done: removing worktrees with initialized submodules without `--force`), sparse-checkout support (#31, done: `create --sparse`, cone only), a `browse` TUI (#32, done: read-only `curses` view, no new dependency), more fetch-error classifications (#33, done), an offline read-only `validate` command (#93, done; `validate --probe` live checks: #95, done).
 - **2.0**: reserved for a breaking interface change.

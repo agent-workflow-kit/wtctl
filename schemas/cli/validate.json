@@ -20,7 +20,10 @@
             }
           },
           "additionalProperties": false,
-          "required": ["path", "exists"]
+          "required": [
+            "path",
+            "exists"
+          ]
         },
         "search_roots": {
           "type": "array",
@@ -33,11 +36,19 @@
                 "$ref": "../defs.json#/$defs/abs_path"
               },
               "status": {
-                "enum": ["ok", "missing", "not_directory", "unreadable"]
+                "enum": [
+                  "ok",
+                  "missing",
+                  "not_directory",
+                  "unreadable"
+                ]
               }
             },
             "additionalProperties": false,
-            "required": ["path", "status"]
+            "required": [
+              "path",
+              "status"
+            ]
           }
         },
         "git": {
@@ -57,11 +68,19 @@
             }
           },
           "additionalProperties": false,
-          "required": ["path", "version", "minimum"]
+          "required": [
+            "path",
+            "version",
+            "minimum"
+          ]
         }
       },
       "additionalProperties": false,
-      "required": ["root", "search_roots", "git"]
+      "required": [
+        "root",
+        "search_roots",
+        "git"
+      ]
     },
     "warnings": {
       "type": "array",
@@ -70,7 +89,18 @@
         "type": "object",
         "properties": {
           "code": {
-            "enum": ["search_root_missing", "search_root_unusable", "search_roots_truncated"]
+            "enum": [
+              "search_root_missing",
+              "search_root_unusable",
+              "search_roots_truncated",
+              "probe_clone_failed",
+              "probe_token_failed",
+              "probe_remote_failed",
+              "probe_truncated",
+              "probe_deadline",
+              "probe_unavailable"
+            ],
+            "description": "The probe_* codes only appear with --probe."
           },
           "message": {
             "type": "string",
@@ -84,10 +114,147 @@
           }
         },
         "additionalProperties": false,
-        "required": ["code", "message"]
+        "required": [
+          "code",
+          "message"
+        ]
       }
+    },
+    "probe": {
+      "type": "object",
+      "description": "Only with --probe: live checks. A failed entry is also a warning; the exit code is not changed.",
+      "properties": {
+        "clones": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "Each configured repos.<id>.clone is a clone whose remote names the repo.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "failed",
+                  "skipped"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "missing",
+                  "not_a_clone",
+                  "deadline",
+                  "workdir_unavailable",
+                  "internal_error"
+                ]
+              },
+              "repo": {
+                "type": "string",
+                "description": "From the validated config."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "repo",
+              "status"
+            ]
+          }
+        },
+        "tokens": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "Each hosts.<host> token source yields a usable token (never shown).",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "failed",
+                  "skipped"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "no_token_source",
+                  "token_unavailable",
+                  "token_invalid",
+                  "deadline",
+                  "workdir_unavailable",
+                  "internal_error"
+                ]
+              },
+              "host": {
+                "type": "string",
+                "description": "From the validated config."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "host",
+              "status"
+            ]
+          }
+        },
+        "remotes": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "Each configured repo's HTTPS remote answers ls-remote.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "failed",
+                  "skipped"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "auth_required",
+                  "token_rejected",
+                  "timeout",
+                  "network_unreachable",
+                  "repository_not_found",
+                  "rate_limited",
+                  "git_failed",
+                  "invalid_url",
+                  "embedded_credentials",
+                  "ssh_not_probed",
+                  "local_remote",
+                  "deadline",
+                  "workdir_unavailable",
+                  "internal_error"
+                ]
+              },
+              "repo": {
+                "type": "string",
+                "description": "From the validated config."
+              },
+              "host": {
+                "type": "string",
+                "description": "The host (with a non-default port) the URL names; absent on an entry skipped before its URL was read."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "repo",
+              "status"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "clones",
+        "tokens",
+        "remotes"
+      ]
     }
   },
   "additionalProperties": false,
-  "required": ["checks", "warnings"]
+  "required": [
+    "checks",
+    "warnings"
+  ]
 }
